@@ -1,0 +1,46 @@
+\begin{tikzpicture}[
+  root/.style={rectangle, rounded corners=6pt, draw=techblue, fill=techbluebg, line width=1.2pt, text width=3.8cm, minimum height=0.9cm, align=center, font=\small\bfseries},
+  method/.style={rectangle, rounded corners=3pt, draw=techgray!60, fill=white, text width=2.8cm, minimum height=0.55cm, align=left, font=\scriptsize, inner sep=3pt},
+  edge/.style={draw=techgray!70, line width=0.6pt, -{stealth[length=4pt]}},
+]
+\node[root] (root) {3DGS 场景编辑与操控};
+
+% Category nodes with explicit colors
+\node[rectangle, rounded corners=4pt, draw=techblue, fill=techbluebg, line width=0.8pt, text width=2.8cm, minimum height=0.7cm, align=center, font=\footnotesize\bfseries, below left=1.2cm and 6.4cm of root] (sem) {语义/文本引导};
+\node[rectangle, rounded corners=4pt, draw=techgreen, fill=techgreenbg, line width=0.8pt, text width=2.8cm, minimum height=0.7cm, align=center, font=\footnotesize\bfseries, below left=1.2cm and 3.2cm of root] (inter) {交互式操控};
+\node[rectangle, rounded corners=4pt, draw=techorange, fill=techorangebg, line width=0.8pt, text width=2.8cm, minimum height=0.7cm, align=center, font=\footnotesize\bfseries, below left=1.2cm and 0cm of root] (style) {风格化};
+\node[rectangle, rounded corners=4pt, draw=techpurple, fill=techpurplebg, line width=0.8pt, text width=2.8cm, minimum height=0.7cm, align=center, font=\footnotesize\bfseries, below right=1.2cm and 3.2cm of root] (inpaint) {场景修复};
+\node[rectangle, rounded corners=4pt, draw=techgray, fill=techbg, line width=0.8pt, text width=2.8cm, minimum height=0.7cm, align=center, font=\footnotesize\bfseries, below right=1.2cm and 6.4cm of root] (deform) {几何变形};
+
+\foreach \n in {sem,inter,style,inpaint,deform} {
+  \draw[edge] (root.south) -- (\n.north);
+}
+
+% Semantic sub-methods
+\node[method, below=0.3cm of sem.south west, anchor=north west] (s1) {\textbf{SDS 优化}: GSEdit, DreamCatalyst};
+\node[method, below=0.08cm of s1] (s2) {\textbf{IDU}: GaussianEditor, DGE, TIGER};
+\node[method, below=0.08cm of s2] (s3) {\textbf{渐进定位}: ProEdit, GSEditPro};
+\node[method, below=0.08cm of s3] (s4) {\textbf{架构创新}: VF-Editor, DisCo3D};
+
+% Interactive sub-methods
+\node[method, below=0.3cm of inter.south west, anchor=north west] (i1) {\textbf{语义解耦}: 3DitScene, GaussianBlock};
+\node[method, below=0.08cm of i1] (i2) {\textbf{分割操控}: Point'n Move, iSegMan};
+\node[method, below=0.08cm of i2] (i3) {\textbf{颜色编辑}: ReCoGS, VIRGi};
+
+% Stylization sub-methods
+\node[method, below=0.3cm of style.south west, anchor=north west] (st1) {\textbf{优化式}: StylizedGS, StyleSplat};
+\node[method, below=0.08cm of st1] (st2) {\textbf{分布匹配}: WaSt-3D};
+\node[method, below=0.08cm of st2] (st3) {\textbf{前馈/零样本}: FPGS, AnyStyle};
+\node[method, below=0.08cm of st3] (st4) {\textbf{多风格}: CLIPGaussian};
+
+% Inpainting sub-methods
+\node[method, below=0.3cm of inpaint.south west, anchor=north west] (p1) {\textbf{特征传播}: GScream, 3DGIC};
+\node[method, below=0.08cm of p1] (p2) {\textbf{多视角扩散}: MVInpainter};
+\node[method, below=0.08cm of p2] (p3) {\textbf{效率}: HOMER, GOR-IS};
+
+% Deformation sub-methods
+\node[method, below=0.3cm of deform.south west, anchor=north west] (d1) {\textbf{笼式}: GSDeformer, CAGE-GS};
+\node[method, below=0.08cm of d1] (d2) {\textbf{网格代理}: Mani-GS, D-MiSo};
+\node[method, below=0.08cm of d2] (d3) {\textbf{拖拽式}: DYG, ARAP-GS};
+
+\end{tikzpicture}

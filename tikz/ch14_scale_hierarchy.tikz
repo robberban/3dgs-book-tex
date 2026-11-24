@@ -1,0 +1,19 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (h0) at (3.1, 8.1) {全局场景(城市级)};
+  \node[box=techgreen] (h1) at (3.1, 5.6) {区域划分(街区级)};
+  \node[box=techorange] (h2) at (3.1, 3.1) {局部细节(建筑级)};
+  \node[box=techpurple] (h3) at (3.1, 0.6) {LOD渲染(视距自适应)};
+  \draw[arr] (h0) -- (h1);
+  \draw[arr] (h1) -- (h2);
+  \draw[arr] (h2) -- (h3);
+  \draw[darr] (h3) to[bend right=30] node[midway, font=\scriptsize, text=techgray] {核外调度} (h1);
+\end{tikzpicture}

@@ -1,0 +1,22 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (gs) at (3.7, 0.6) {3DGS球谐编码(外观=颜色)};
+  \node[box=techblue] (r1) at (11.0, 0.6) {反射与镜面建模};
+  \node[box=techgreen] (r2) at (17.3, 0.6) {材质分解与逆渲染};
+  \node[box=techorange] (r3) at (22.5, 0.6) {重光照};
+  \node[box=techpurple] (r4) at (27.6, 0.6) {HDR与光照变化};
+  \node[box=techorange] (r5) at (33.7, 0.6) {物理渲染与光照};
+  \draw[arr] (gs) -- (r1);
+  \draw[arr] (r1) -- (r2);
+  \draw[arr] (r2) -- (r3);
+  \draw[arr] (r3) -- (r4);
+  \draw[arr] (r4) -- (r5);
+\end{tikzpicture}

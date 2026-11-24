@@ -1,0 +1,41 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (34.8, 5.6) {安全水印与隐私方法分类};
+  \node[route=techblue] (b0) at (12.4, 3.1) {数字水印};
+  \node[method=techblue] (b0_l0) at (2.0, 0.6) {基础水印框架\\{\tiny 3D-GSW, WATER-GS, GaussianMarker, GuardSplat}};
+  \node[method=techblue] (b0_l1) at (6.8, 0.6) {高容量与可泛化\\{\tiny BitC-3DGS, GS-Marker, MarkSplatter}};
+  \node[method=techblue] (b0_l2) at (12.4, 0.6) {生成水印与压缩鲁棒\\{\tiny GaussianSeal, CompMarkGS}};
+  \node[method=techblue] (b0_l3) at (18.2, 0.6) {统一保护与鲁棒性\\{\tiny GuardMarkGS, RDSplat}};
+  \node[route=techgreen] (b1) at (30.2, 3.1) {对抗攻击与防御};
+  \node[method=techgreen] (b1_l0) at (23.3, 0.6) {重建质量攻击\\{\tiny CopyRNeRF, GaussianSteal}};
+  \node[method=techgreen] (b1_l1) at (28.2, 0.6) {下游检测器攻击\\{\tiny Adv3D, BadGS}};
+  \node[method=techgreen] (b1_l2) at (32.5, 0.6) {防御方法\\{\tiny DEGauss, WatermarkDefense}};
+  \node[route=techorange] (b2) at (37.4, 3.1) {隐写与信息隐藏};
+  \node[method=techorange] (b2_l0) at (37.4, 0.6) {耦合特征与对比学习\\{\tiny X-SG²S, StegaNeRF-GS}};
+  \node[method=techorange] (b2_l1) at (42.7, 0.6) {频域加密隐写\\{\tiny FreqStego-GS, DualStream-GS}};
+  \node[route=techpurple] (b3) at (47.5, 3.1) {其他安全};
+  \node[method=techpurple] (b3_l0) at (47.5, 0.6) {篡改检测与验证\\{\tiny TamperDetect-GS}};
+  \node[method=techpurple] (b3_l1) at (52.6, 0.6) {版权与隐私保护\\{\tiny CopyRight-GS, PrivacyGS}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b0) -- (b0_l3);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b1) -- (b1_l2);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+\end{tikzpicture}

@@ -1,0 +1,45 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (30.0, 5.6) {分割与场景理解方法分类};
+  \node[route=techblue] (b0) at (11.0, 3.1) {3D分割};
+  \node[method=techblue] (b0_l0) at (1.5, 0.6) {特征蒸馏\\{\tiny Gaussian Grouping, SAGA, FlashSplat, COB-GS, GradiSeg}};
+  \node[method=techblue] (b0_l1) at (5.1, 0.6) {开放词汇\\{\tiny LangSplat, OpenGaFF, SCOUP, ReferSplat, PanoGS}};
+  \node[method=techblue] (b0_l2) at (9.0, 0.6) {交互式/点击\\{\tiny Click-Gaussian, GaussianCut, ArtisanGS, B$^3$-Seg}};
+  \node[method=techblue] (b0_l3) at (13.0, 0.6) {全景分割\\{\tiny PLGS, PanopticSplatting, OnlinePG, PanSt3R}};
+  \node[method=techblue] (b0_l4) at (16.6, 0.6) {前馈泛化\\{\tiny RT-GS2, SemGS, SegSplat, OVGaussian}};
+  \node[route=techgreen] (b1) at (26.2, 3.1) {目标检测与场景图};
+  \node[method=techgreen] (b1_l0) at (20.5, 0.6) {3D目标检测\\{\tiny 3DGS-DET, Gaussian-Det, GVSynergy-Det}};
+  \node[method=techgreen] (b1_l1) at (24.7, 0.6) {场景图生成\\{\tiny GaussianGraph, DynamicGSG}};
+  \node[method=techgreen] (b1_l2) at (28.6, 0.6) {场景补全\\{\tiny VG3S, GaussRender, SplatSSC, GS-Occ3D}};
+  \node[route=techorange] (b2) at (34.2, 3.1) {特征蒸馏};
+  \node[method=techorange] (b2_l0) at (32.3, 0.6) {CLIP蒸馏\\{\tiny Feature 3DGS, LangSplat, CLIP-GS, FAST-Splat}};
+  \node[method=techorange] (b2_l1) at (36.2, 0.6) {DINO蒸馏\\{\tiny LUDVIG, econSG, SLAG}};
+  \node[method=techorange] (b2_l2) at (40.1, 0.6) {SAM融合\\{\tiny CUS-GS, CF3, FHGS, Quantile Rendering}};
+  \node[route=techpurple] (b3) at (43.8, 3.1) {其他};
+  \node[method=techpurple] (b3_l0) at (43.8, 0.6) {变化检测\\{\tiny GD-DIFF, 3DGS-CD}};
+  \node[method=techpurple] (b3_l1) at (47.4, 0.6) {异常检测\\{\tiny SplatPose, SplatPose+, GS-MoE}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b0) -- (b0_l3);
+  \draw[arr] (b0) -- (b0_l4);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b1) -- (b1_l2);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b2) -- (b2_l2);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+\end{tikzpicture}

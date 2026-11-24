@@ -1,0 +1,55 @@
+% 图4.1: 从高斯到表面的五条技术路线
+\begin{tikzpicture}[
+  node distance=0.8cm and 1.2cm,
+  block/.style={rectangle, rounded corners=3pt, draw=techgray, fill=techbg,
+    text width=3.0cm, minimum height=1.0cm, align=center, font=\small},
+  route/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!10,
+    text width=2.6cm, minimum height=0.8cm, align=center, font=\small\bfseries},
+  arr/.style={-{Stealth[length=5pt]}, thick, techgray},
+  label/.style={font=\scriptsize\color{techlightgray}, align=center},
+]
+
+% Central node
+\node[block, text width=3.5cm, minimum height=1.2cm, draw=techblue, fill=techbluebg, font=\normalsize\bfseries] (gs)
+  {3DGS 高斯基元\\（体积元素）};
+
+% Five routes
+\node[route=techblue, above left=1.5cm and 2.5cm of gs] (r1)
+  {§4.1 深度与法线\\正则化};
+\node[route=techgreen, above right=1.5cm and 2.5cm of gs] (r2)
+  {§4.2 SDF 与\\隐式表面引导};
+\node[route=techorange, left=3.0cm of gs] (r3)
+  {§4.3 多视角几何\\与平面约束};
+\node[route=techpurple, right=3.0cm of gs] (r4)
+  {§4.4 网格提取\\与优化};
+\node[block, below=1.5cm of gs, text width=3.5cm, draw=techorange, fill=techorangebg, font=\normalsize\bfseries] (r5)
+  {§4.5 其他\\几何重建方法};
+
+% Arrows from center to routes
+\draw[arr, techblue] (gs.north west) -- (r1.south east)
+  node[label, midway, above left] {外部先验约束};
+\draw[arr, techgreen] (gs.north east) -- (r2.south west)
+  node[label, midway, above right] {隐式表面引导};
+\draw[arr, techorange] (gs.west) -- (r3.east)
+  node[label, midway, above] {多视图一致性};
+\draw[arr, techpurple] (gs.east) -- (r4.west)
+  node[label, midway, above] {显式 mesh};
+\draw[arr, techgray] (gs.south) -- (r5.north)
+  node[label, midway, right] {修剪/PDE/特殊模态};
+
+% Sub-labels for each route
+\node[label, below=0.2cm of r1] {27篇\\不改变基元};
+\node[label, below=0.2cm of r2] {16篇\\双分支联合};
+\node[label, below=0.2cm of r3] {15篇\\MVS+平面};
+\node[label, below=0.2cm of r4] {34篇\\Poisson/混合};
+\node[label, below=0.2cm of r5] {24篇\\信息论/物理};
+
+% Right side: converging arrow to "surface"
+\node[block, right=5.5cm of gs, text width=2.8cm, minimum height=1.2cm, draw=techgreen, fill=techgreenbg, font=\normalsize\bfseries] (surface)
+  {精确表面\\（mesh/SDF）};
+
+\draw[arr, dashed, techgreen] (r2.east) -| ([xshift=0.3cm]surface.north);
+\draw[arr, dashed, techpurple] (r4.east) -- (surface.west);
+\draw[arr, dashed, techblue] (r1.east) -| ([xshift=-0.3cm]surface.north);
+
+\end{tikzpicture}

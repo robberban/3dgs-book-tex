@@ -1,0 +1,45 @@
+\begin{tikzpicture}[
+  event/.style={rectangle, rounded corners=2pt, draw=#1, fill=#1!10, line width=0.5pt, minimum height=0.6cm, align=center, font=\scriptsize, inner sep=2pt},
+  milestone/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!20, line width=0.8pt, minimum height=0.65cm, align=center, font=\scriptsize\bfseries, inner sep=3pt},
+]
+\draw[thick, -{stealth[length=5pt]}, draw=techgray] (0, 0) -- (14, 0)
+  node[right, font=\scriptsize] {时间};
+
+% Year markers
+\foreach \x/\y in {1/2024.0, 4/2024.5, 7/2025.0, 10/2025.5, 13/2026.0} {
+  \draw[techgray] (\x, -0.1) -- (\x, 0.1);
+  \node[below, font=\scriptsize, text=techgray] at (\x, -0.15) {\y};
+}
+
+% Phase bands
+\fill[techblue!5] (0.5, 0.3) rectangle (3.5, 3.2);
+\fill[techgreen!5] (3.5, 0.3) rectangle (7.5, 3.2);
+\fill[techorange!5] (7.5, 0.3) rectangle (10.5, 3.2);
+\fill[techpurple!5] (10.5, 0.3) rectangle (13.5, 3.2);
+
+\node[font=\scriptsize\bfseries, text=techblue] at (2, 3.4) {优化式};
+\node[font=\scriptsize\bfseries, text=techgreen] at (5.5, 3.4) {分布匹配};
+\node[font=\scriptsize\bfseries, text=techorange] at (9, 3.4) {零样本/前馈};
+\node[font=\scriptsize\bfseries, text=techpurple] at (12, 3.4) {统一框架};
+
+% Events - Optimization era (3 rows: y=0.7, 1.5, 2.3)
+\node[milestone=techblue] at (1.5, 2.3) {StylizedGS};
+\node[event=techblue] at (2.8, 1.5) {StyleSplat, G-Style};
+\node[event=techblue] at (1.5, 0.7) {InstantStyleGS};
+
+% Distribution matching
+\node[milestone=techgreen] at (4.5, 2.3) {WaSt-3D};
+\node[event=techgreen] at (5.8, 1.5) {ReGS, ArtNVG};
+\node[event=techgreen] at (4.8, 0.7) {SGSST};
+
+% Zero-shot / Feed-forward
+\node[milestone=techorange] at (8.5, 2.3) {FPGS, 4DStyleGS};
+\node[event=techorange] at (9.5, 1.5) {Stylos};
+\node[event=techorange] at (8.5, 0.7) {AnyStyle};
+
+% Unified frameworks
+\node[milestone=techpurple] at (12, 2.3) {CLIPGaussian};
+\node[event=techpurple] at (12, 1.5) {SSGaussian, M2StyleGS};
+\node[event=techpurple] at (12, 0.7) {ABC-GS};
+
+\end{tikzpicture}

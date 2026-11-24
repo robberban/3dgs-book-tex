@@ -1,0 +1,22 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (p1) at (3.2, 0.6) {输入(视频/单图/多视角)};
+  \node[box=techgreen] (p2) at (11.6, 0.6) {3DMM参数估计(FLAME/BS)};
+  \node[box=techorange] (p3) at (20.9, 0.6) {高斯化身绑定(面部/头发/牙齿)};
+  \node[box=techpurple] (p4) at (29.4, 0.6) {表情驱动(blendshapes)};
+  \node[box=techblue] (p5) at (37.4, 0.6) {实时渲染(可控表情/姿态)};
+  \node[font=\scriptsize, text=techgray] at (11.6, -0.6) {中性脸建模};
+  \node[font=\scriptsize, text=techgray] at (20.9, -0.6) {逐顶点高斯};
+  \draw[arr] (p1) -- (p2);
+  \draw[arr] (p2) -- (p3);
+  \draw[arr] (p3) -- (p4);
+  \draw[arr] (p4) -- (p5);
+\end{tikzpicture}

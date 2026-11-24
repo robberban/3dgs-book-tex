@@ -1,0 +1,51 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=2.8cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (37.7, 5.6) {文本/图像到3D生成路线};
+  \node[route=techblue] (b0) at (12.4, 3.1) {文本到3D生成};
+  \node[method=techblue] (b0_l0) at (1.5, 0.6) {SDS蒸馏\\{\tiny DreamGaussian, MicroDreamer, GaussianDreamer, LucidDreamer, ConsDreamer}};
+  \node[method=techblue] (b0_l1) at (5.7, 0.6) {前馈快速生成\\{\tiny Turbo3D, GradeADreamer, Dreamer XL}};
+  \node[method=techblue] (b0_l2) at (10.0, 0.6) {多视角扩散\\{\tiny CSD, 3D-Adapter, TD-Attn, VIST3A}};
+  \node[method=techblue] (b0_l3) at (14.7, 0.6) {大规模/高斯原生\\{\tiny MGM, TexGaussian, DirectTriGS, DreamPolisher}};
+  \node[method=techblue] (b0_l4) at (19.4, 0.6) {场景级生成\\{\tiny DreamScene360, HoloDreamer, FastScene, CompGS, LayoutDreamer}};
+  \node[route=techgreen] (b1) at (31.7, 3.1) {图像到3D生成};
+  \node[method=techgreen] (b1_l0) at (23.2, 0.6) {前馈重建\\{\tiny LeanGaussian, GSD, DiffusionGS, DSplats}};
+  \node[method=techgreen] (b1_l1) at (27.1, 0.6) {优化式重建\\{\tiny LiftImage3D, GSV3D, Hi3D, Vista3D}};
+  \node[method=techgreen] (b1_l2) at (31.7, 0.6) {大规模基础模型\\{\tiny MVGamba, 3D-Adapter}};
+  \node[method=techgreen] (b1_l3) at (36.2, 0.6) {高质量重建\\{\tiny GS-RGBN, PhyCAGE, GaussianZoom}};
+  \node[route=techorange] (b2) at (43.7, 3.1) {3D生成模型/GAN};
+  \node[method=techorange] (b2_l0) at (40.1, 0.6) {3D GAN\\{\tiny GS Decoder, GSGAN, F3D-Gaus}};
+  \node[method=techorange] (b2_l1) at (43.7, 0.6) {扩散模型\\{\tiny DiffGS, DiffSplat, GGS}};
+  \node[method=techorange] (b2_l2) at (47.7, 0.6) {自回归/VAE\\{\tiny ARGS, LTM3D, UVGS, Can3Tok}};
+  \node[method=techorange] (b2_l3) at (51.9, 0.6) {蒸馏/适配器\\{\tiny DD3G, 3D-Adapter, Zero-1-to-G}};
+  \node[route=techpurple] (b3) at (57.7, 3.1) {4D动态生成};
+  \node[method=techpurple] (b3_l0) at (55.9, 0.6) {扩散蒸馏\\{\tiny DreamGaussian4D, Diffusion4D, STP4D}};
+  \node[method=techpurple] (b3_l1) at (59.5, 0.6) {时空重建\\{\tiny EG4D, PLA4D, 4DSTR}};
+  \node[method=techpurple] (b3_l2) at (63.2, 0.6) {角色/化身\\{\tiny CharacterShot, GenMOJO}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b0) -- (b0_l3);
+  \draw[arr] (b0) -- (b0_l4);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b1) -- (b1_l2);
+  \draw[arr] (b1) -- (b1_l3);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b2) -- (b2_l2);
+  \draw[arr] (b2) -- (b2_l3);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+  \draw[arr] (b3) -- (b3_l2);
+\end{tikzpicture}

@@ -1,0 +1,22 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (n1) at (2.8, 0.6) {3DGS场景(已建图)};
+  \node[box=techgreen] (n2) at (9.7, 0.6) {场景理解(语义/目标)};
+  \node[box=techorange] (n3) at (16.5, 0.6) {路径规划(A*/RRT)};
+  \node[box=techpurple] (n4) at (23.3, 0.6) {运动控制(避障/导航)};
+  \node[box=techblue] (n5) at (29.8, 0.6) {执行(移动/抓取)};
+  \node[font=\scriptsize, text=techgray] at (9.7, 1.8) {LLM指令};
+  \draw[arr] (n1) -- (n2);
+  \draw[arr] (n2) -- (n3);
+  \draw[arr] (n3) -- (n4);
+  \draw[arr] (n4) -- (n5);
+  \draw[darr] (n5) to[bend right=30] node[midway, font=\scriptsize, text=techgray] {在线更新} (n1);
+\end{tikzpicture}

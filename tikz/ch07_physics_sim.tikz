@@ -1,0 +1,23 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (g1) at (3.9, 0.6) {3D高斯参数(位置/协方差/SH)};
+  \node[box=techgreen] (g2) at (13.0, 0.6) {物理代理构建(网格/粒子/凸包)};
+  \node[box=techorange] (g3) at (21.9, 0.6) {物理引擎(SPH/FEM/PBD)};
+  \node[box=techpurple] (g4) at (30.3, 0.6) {约束求解(碰撞/形变/断裂)};
+  \node[box=techblue] (g5) at (38.9, 0.6) {高斯参数更新(位置/旋转/形变)};
+  \node[font=\scriptsize, text=techgray] at (13.0, 1.8) {黑盒引擎集成};
+  \node[font=\scriptsize, text=techgray] at (21.9, -0.6) {材料属性估计};
+  \draw[arr] (g1) -- (g2);
+  \draw[arr] (g2) -- (g3);
+  \draw[arr] (g3) -- (g4);
+  \draw[arr] (g4) -- (g5);
+  \draw[darr] (g5) to[bend right=30] node[midway, font=\scriptsize, text=techgray] {循环迭代} (g2);
+\end{tikzpicture}

@@ -1,0 +1,50 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.3cm, align=center, font=\small, minimum height=0.85cm},
+  biglabel/.style={font=\bfseries\small, #1},
+  arr/.style={-{Stealth[length=5pt]}, thick, #1},
+  note/.style={font=\scriptsize, techgray, align=center},
+  >=Stealth
+]
+  % === 左列: NeRF ===
+  \node[biglabel=techblue] at (-4, 3.8) {NeRF};
+  \node[box=techblue] (n1) at (-4, 3) {相机射线};
+  \node[box=techblue] (n2) at (-4, 1.8) {射线步进\\(采样 $N$ 个点)};
+  \node[box=techblue] (n3) at (-4, 0.4) {MLP 查询\\($\sigma_i, \mathbf{c}_i$)};
+  \node[box=techblue] (n4) at (-4, -1) {数值积分\\$C = \sum T_i(1{-}e^{-\sigma_i \delta_i})\mathbf{c}_i$};
+  \node[box=techblue] (n5) at (-4, -2.4) {像素颜色};
+
+  \draw[arr=techblue] (n1) -- (n2);
+  \draw[arr=techblue] (n2) -- (n3);
+  \draw[arr=techblue] (n3) -- (n4);
+  \draw[arr=techblue] (n4) -- (n5);
+
+  \node[note, text width=3.3cm] at (-4, -3.4) {查询数: 数百万/帧\\时间: $\sim$30秒/帧};
+
+  % === 右列: 3DGS ===
+  \node[biglabel=techgreen] at (4, 3.8) {3DGS};
+  \node[box=techgreen] (g1) at (4, 3) {3D高斯基元};
+  \node[box=techgreen] (g2) at (4, 1.8) {投影到2D\\(局部仿射近似)};
+  \node[box=techgreen] (g3) at (4, 0.4) {GPU基数排序\\(按深度)};
+  \node[box=techgreen] (g4) at (4, -1) {$\alpha$-混合\\$C = \sum c_k \alpha_k T_k$};
+  \node[box=techgreen] (g5) at (4, -2.4) {像素颜色};
+
+  \draw[arr=techgreen] (g1) -- (g2);
+  \draw[arr=techgreen] (g2) -- (g3);
+  \draw[arr=techgreen] (g3) -- (g4);
+  \draw[arr=techgreen] (g4) -- (g5);
+
+  \node[note, text width=3.3cm] at (4, -3.4) {高斯数: $10^5{\sim}10^6$\\时间: \textgreater{}100 FPS};
+
+  % === 中间等价性标注 ===
+  \draw[thick, techgray, dashed] (0, 3.8) -- (0, -3.6);
+
+  % 等价性双箭头
+  \node[draw=techgray, fill=techbg, rounded corners, font=\small,
+    text width=4cm, align=center] at (0, -1) {
+    \textbf{数学形式等价}\\[3pt]
+    令 $\alpha_i = 1 - e^{-\sigma_i \delta_i}$\\
+    则 $T_i = \prod_{j<i}(1-\alpha_j)$\\[2pt]
+    $\Rightarrow$ 两公式\textbf{完全相同}
+  };
+\end{tikzpicture}

@@ -1,0 +1,55 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (39.9, 5.6) {物理仿真与动力学方法分类};
+  \node[route=techblue] (b0) at (10.0, 3.1) {物理仿真集成};
+  \node[method=techblue] (b0_l0) at (1.9, 0.6) {紧耦合MPM\\{\tiny PhysGaussian, i-PhysGaussian, GaussianFluent, PhysMorph-GS}};
+  \node[method=techblue] (b0_l1) at (6.2, 0.6) {松耦合代理\\{\tiny GASP, MaGS, PhysTalk}};
+  \node[method=techblue] (b0_l2) at (10.0, 0.6) {属性感知\\{\tiny Sim Anything, PUGS, PhysGS, PIXIE, FastPhysGS}};
+  \node[method=techblue] (b0_l3) at (14.2, 0.6) {连续介质/功能\\{\tiny PIDG, PG-3DGS, ReconPhys, PIG, Mirage2Matter}};
+  \node[route=techgreen] (b1) at (25.1, 3.1) {流体与粒子};
+  \node[method=techgreen] (b1_l0) at (18.9, 0.6) {无网格求解器\\{\tiny Gaussian Fluids, LagrangianSplats}};
+  \node[method=techgreen] (b1_l1) at (23.0, 0.6) {流体重建\\{\tiny FluidGaussian, FLUIDSPLAT}};
+  \node[method=techgreen] (b1_l2) at (27.1, 0.6) {流体资产提取\\{\tiny 3D Dynamic Fluid Assets}};
+  \node[route=techorange] (b2) at (39.9, 3.1) {可变形体/布料};
+  \node[method=techorange] (b2_l0) at (32.1, 0.6) {弹簧-质点/端到端\\{\tiny PhysTwin, NeuMA, 3DGSim}};
+  \node[method=techorange] (b2_l1) at (37.4, 0.6) {混合动力学/单目\\{\tiny Particle-Grid, MonoPhysics, PhysConvex}};
+  \node[method=techorange] (b2_l2) at (42.4, 0.6) {布料/细长几何\\{\tiny CloDS, Cloth-Splatting, SketchRodGS}};
+  \node[method=techorange] (b2_l3) at (47.0, 0.6) {4D参数优化\\{\tiny PhysFlow, NGFF, PEGS}};
+  \node[route=techpurple] (b3) at (53.8, 3.1) {声音与多物理场};
+  \node[method=techpurple] (b3_l0) at (51.5, 0.6) {声场重建/合成\\{\tiny AudioGS, SonicGauss}};
+  \node[method=techpurple] (b3_l1) at (56.1, 0.6) {火焰/降雨/风\\{\tiny FlameGS, FieryGS, RainyGS, DiffWind}};
+  \node[method=techpurple] (b3_l2) at (60.6, 0.6) {物理场可视化\\{\tiny GS-Surrogate}};
+  \node[route=techgray] (b4) at (66.9, 3.1) {其他物理方法};
+  \node[method=techgray] (b4_l0) at (65.0, 0.6) {哈密顿力学\\{\tiny NeHaD}};
+  \node[method=techgray] (b4_l1) at (68.8, 0.6) {拓扑推断\\{\tiny TopoGaussian, DynamicTree}};
+  \node[method=techgray] (b4_l2) at (72.8, 0.6) {VR/系统集成\\{\tiny LIVE-GS}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (root) -- (b4);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b0) -- (b0_l3);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b1) -- (b1_l2);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b2) -- (b2_l2);
+  \draw[arr] (b2) -- (b2_l3);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+  \draw[arr] (b3) -- (b3_l2);
+  \draw[arr] (b4) -- (b4_l0);
+  \draw[arr] (b4) -- (b4_l1);
+  \draw[arr] (b4) -- (b4_l2);
+\end{tikzpicture}

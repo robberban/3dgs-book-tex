@@ -1,0 +1,24 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (s1) at (4.1, 0.6) {传感器输入(RGB-D/单目/IMU)};
+  \node[box=techgreen] (s2) at (12.2, 0.6) {前端跟踪(帧间配准)};
+  \node[box=techorange] (s3) at (19.7, 0.6) {局部建图(高斯优化/ADC)};
+  \node[box=techpurple] (s4) at (27.8, 0.6) {后端优化(位姿图/全局BA)};
+  \node[box=techblue] (s5) at (35.3, 0.6) {闭环检测(场景匹配)};
+  \node[box=techgreen] (s6) at (41.9, 0.6) {全局地图(高斯场)};
+  \draw[arr] (s1) -- (s2);
+  \draw[arr] (s2) -- (s3);
+  \draw[arr] (s3) -- (s4);
+  \draw[arr] (s4) -- (s5);
+  \draw[arr] (s5) -- (s6);
+  \draw[darr] (s5) to[bend right=30] (s4);
+  \draw[darr] (s6) to[bend right=30] node[midway, font=\scriptsize, text=techgray] {地图$\rightarrow$跟踪} (s2);
+\end{tikzpicture}

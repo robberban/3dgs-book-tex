@@ -1,0 +1,2229 @@
+\chapter{几何与表面重建}
+\label{ch:04}
+
+\paragraph*{本章阅读锚点}
+本章的锚点是从“能渲染”走向“有表面”。原始 3DGS 的高斯是体积椭球，不天然给出三角网格；本章方法都在回答如何用深度、法线、SDF、2DGS 或 mesh 约束把高斯压回真实表面。
+
+
+3D Gaussian Splatting 将场景表示为一组 3D 高斯基元，每个基元是一个体积性的 3D 椭球。这种体积表示天然适合基于 $\alpha$-混合 的光栅化渲染：沿每条射线累积多个高斯的颜色和不透明度，形成平滑的图像。然而，体积性也是 3DGS 的核心几何缺陷。高斯基元没有明确的表面概念，不存在”内””外”之分，无法直接回答”射线击中表面了吗？”或”这个点在表面的哪一侧？”这类基本的几何查询。
+
+这一缺陷带来三个实际问题。第一，无法直接从 3DGS 表示中提取 mesh 或 CAD 模型，限制了 3DGS 在工程、仿真、游戏等需要明确几何的应用场景中的使用。第二，高斯基元可以”漂浮”在远离表面的位置（称为 floaters，即漂浮伪影），也可以在表面附近堆积过多（称为冗余高斯），这些都源于缺乏表面约束。第三，在稀疏视角条件下，缺乏几何先验的高斯容易退化为模糊的体积，而非收敛到正确的表面位置。
+
+本章围绕”如何从高斯基元获得精确表面”这一核心问题，系统梳理五条技术路线（图~\ref{fig:04_routes}）。第~\ref{sec:04_1}~节讨论\textbf{深度与法线正则化}，通过外部几何先验（深度图、法线图）约束高斯基元对齐表面，不改变基元本身。第~\ref{sec:04_2}~节讨论\textbf{SDF 与隐式表面引导}，引入隐式 SDF 场与 3DGS 联合优化，让高斯沿 SDF 零水平集排列。第~\ref{sec:04_3}~节讨论\textbf{多视角几何与平面约束}，利用多视角一致性、平面先验和结构化表示提升几何精度。第~\ref{sec:04_4}~节讨论\textbf{网格提取与优化}，涵盖从高斯中提取 mesh 的各类方法，包括 Poisson 重建、可微渲染和混合表示。第~\ref{sec:04_5}~节讨论\textbf{其他几何重建方法}，包括高斯修剪、边缘/曲线重建、PDE（Partial Differential Equation，偏微分方程）优化和特殊模态。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.95\textwidth}{!}{\input{tikz/ch04_geometry_routes.tikz}}
+\caption{从高斯基元到精确表面的五条技术路线。§4.1--§4.3 通过正则化和约束改善高斯的几何分布，§4.4 从高斯中提取 mesh，§4.5 从其他角度丰富几何重建工具箱。}
+\label{fig:04_routes}
+\end{figure}
+
+%=====================================================================
+\section{深度与法线正则化}
+\label{sec:04_1}
+
+\subsection{问题背景：体积基元缺乏表面约束}
+
+标准 3DGS 的损失函数仅包含光度项（$\mathcal{L}_1$ 和 D-SSIM），完全没有几何约束。这意味着高斯中心只需满足”从各视角看颜色正确”，而不需要位于任何特定的几何表面上。在训练过程中，高斯可能分散到空间中各处，只要它们的 $\alpha$-混合 结果与参考图像匹配即可。这种”体积自由度”在视角充足时可以产生视觉上可接受的渲染结果，但提取出的几何（如通过深度图融合）往往充满噪声、孔洞和 floater（漂浮伪影）。
+
+深度与法线正则化是最直接的改进路线：利用预训练的单目深度/法线估计器或多视角立体匹配提供几何先验，将这些先验作为额外的正则化项加入 3DGS 的训练过程。核心假设是：如果高斯基元被约束在正确的表面位置附近，则从中提取的几何也将更准确。本节按正则化类型组织：先讨论纯深度先验方法（\S\ref{subsec:04_1_2}），再讨论法线先验方法（\S\ref{subsec:04_1_3}），然后讨论深度-法线联合正则化方法（\S\ref{subsec:04_1_4}），最后讨论透明物体等特殊表面（\S\ref{subsec:04_1_5}）以及光照等特殊条件下的正则化（\S\ref{subsec:04_1_6}）。
+
+\subsubsection{深度先验正则化}
+\label{subsec:04_1_2}
+
+本路线介绍利用单目深度估计等深度先验信息约束高斯空间位置，从而提升几何重建精度的方法。
+
+\paragraph{置信度加权深度正则化}
+
+CDGS（2025.02）~\cite{2502_14684} 在原始 3DGS 的训练环节引入置信度感知的深度正则化，用像素级置信度加权深度损失替代均匀深度监督，同时根据深度对齐质量自适应调节正则化权重，光度损失保持不变。这一设计解决了一个核心矛盾：单目深度估计（如 ZoeDepth、Depth Anything V2）虽能提供稠密几何先验，但深度值仅具有相对精度（尺度 $s$ 和平移 $t$ 未知），且在不同区域的可靠性差异悬殊——纹理丰富区域估计较为可靠，无纹理/弱纹理区域则可能严重偏离。3DGS baseline 通常直接用 $\mathcal{L}_1$ 约束渲染深度与单目深度一致，忽视了这种区域间的可靠性差异，导致低质量区域的错误深度信号误导高斯位置的优化。
+
+CDGS 分两阶段解决上述问题。第一阶段是\textbf{深度精炼与对齐}。先利用 SfM（Structure from Motion，运动恢复结构）稀疏点云提供几何锚点。直观来说，稀疏点云就像分布在地形上的"海拔基准桩"——单目深度估计的整体形状可能偏差，但只要用这些基准桩做对齐校正，就能恢复正确的绝对尺度。对每个像素 $p$，将 COLMAP 稀疏点 $P$ 投影到图像平面，得到目标深度：
+
+\begin{equation}
+D_{\text{target}}(p) = [\mathbf{K}(\mathbf{R}P + \mathbf{T})]_z
+\end{equation}
+
+其中 $\mathbf{K}$ 为相机内参矩阵，$\mathbf{R}, \mathbf{T}$ 为外参，$[\cdot]_z$ 取投影点的 $z$ 分量。然后通过求解优化问题，将单目深度 $D_{\text{init}}$ 与稀疏深度对齐：寻找最优尺度 $s^*$ 和平移 $t^*$，使得变换后的深度 $D_{\text{trans}}(p) = s \cdot D_{\text{init}}(p) + t$ 尽可能匹配 $D_{\text{target}}$，同时正则化项 $\mathcal{R}(D) = \sum_p (\min(0, -D(p)))^2$ 惩罚负深度值以保证物理有效性。对齐后的均方误差即为对齐损失 $\ell_a$，它定量刻画了该视角下深度估计的整体质量。
+
+第二阶段是\textbf{置信度感知深度正则化}。直觉上，不是所有像素的深度估计都同等可靠——纹理丰富的墙面更可信，无纹理的天空容易出错。CDGS 因此构建像素级置信度图 $C$，融合三类互补特征：
+
+\begin{equation}
+C = w_e C_e + w_t C_t + w_g C_g
+\end{equation}
+
+其中 $C_e = 1 - E(I)/255$ 通过 Canny 边缘检测捕获边缘感知置信度（边缘区域深度不连续，置信度降低）；$C_t = 1 - |\nabla^2 I| / \max(|\nabla^2 I|)$ 用 Laplacian 算子度量纹理丰富度（纹理越强，单目深度越可信）；$C_g = 1 / (|\nabla D| + \epsilon)$ 用深度梯度评估空间一致性（梯度突变处往往是深度噪声）。权重满足 $w_t > w_g > w_e$，强调纹理可靠性的主导作用。简言之，最终损失将标准光度损失与置信度加权的深度损失相加，而深度损失的全局权重根据对齐质量自适应调节：
+
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\text{image}} + \lambda_d(\ell_a) \cdot \mathcal{L}_{\text{depth}}
+\end{equation}
+
+其中深度监督项 $\mathcal{L}_{\text{depth}} = \frac{1}{|\Omega|}\sum_{p \in \Omega} C(p) \cdot |D_{\text{render}}(p) - D_{\text{est}}(p)|$ 用置信度对每个像素加权，使监督聚焦于可靠区域。全局权重 $\lambda_d(\ell_a) = \lambda_{\max} e^{-k \ell_a}$ 以指数衰减方式根据对齐质量自适应调节深度监督的强度：对齐好（$\ell_a$ 小）时监督强，对齐差时自动退让，避免错误信号主导训练。
+
+\paragraph{自举式深度监督}
+
+CDGS 用外部单目深度作为几何先验，但单目深度本身并不总是可用或可靠的。Self-Evolving GS（2024.09）~\cite{2409_07456} 走了一条截然不同的路线：在原始 3DGS 的训练环节引入自进化深度监督，用 GS 自身渲染的图像对经立体匹配生成深度先验，替代外部单目深度估计器，光度损失保持不变。其核心观察是，3DGS baseline 在稀疏视角下面临严重的几何退化：仅靠光度损失无法约束高斯在视角间未覆盖区域的位置，导致渲染出的深度图充满噪声和伪影。引入外部单目深度估计器是常见补救手段，但单目深度与 GS 表示之间存在域差异——单目深度是相对的、跨数据集泛化有限的，且需要额外的尺度对齐步骤。Self-Evolving GS 提出一种自举（bootstrapping）策略来绕开上述困难。其核心观察是，尽管 GS 的底层几何不准确，它渲染的图像却已经具备了多视角光度一致性。这意味着我们可以在 GS 渲染的图像对上运行传统立体视觉算法来获得远比 GS 自身深度更准确的深度先验。具体做法是，对训练集中的每个相机位姿 $P_i$，通过一个人工设定的水平基线 $b$ 构造虚拟右相机位姿：
+
+\begin{equation}
+R_i = \begin{pmatrix} \mathbf{I} & \mathbf{t} \\ \mathbf{0}^T & 1 \end{pmatrix} P_i, \quad \mathbf{t} = \begin{pmatrix} b & 0 & 0 \end{pmatrix}^T
+\end{equation}
+
+即仅在水平方向平移 $b$，形成一个标准的立体视觉构型。然后用当前 GS 模型渲染右视图 $I_i^r$，再用预训练的立体匹配网络 $S$ 估计视差图 $S(I_i, I_i^r)$，最后通过三角化得到深度：
+
+\begin{equation}
+D_{\text{self}}(I_i) = \frac{b \cdot f}{S(I_i, I_i^r)}
+\end{equation}
+
+其中 $f$ 为相机焦距。$D_{\text{self}}$ 随后作为深度监督信号用于 GS 的后续训练。
+
+这一方法有几个关键设计决策值得注意。第一，选择立体视觉而非 MVS（Multi-View Stereo，多视角立体匹配）的理由是：立体对是获取深度所需的最少信息量（仅需两帧），且只需调节一个参数 $b$（而非 6-DoF 相机位姿），同时 SOTA 立体网络在域泛化方面表现优异。第二，训练策略上，自监督仅在训练进行 $T$ 步后才启用，因为模型需要先学会渲染足够质量的图像，立体匹配才能可靠工作。第三，为平衡计算开销与深度质量，视差图在首次计算后被缓存，每隔 $\Delta$ 步才重新渲染立体对并更新视差先验。这种”先学渲染、再自我监督”的渐进策略使方法无需任何外部深度数据即可持续改善几何。
+
+\paragraph{光流匹配先验与虚拟相机采样}
+
+Self-Evolving GS 利用立体匹配生成深度先验，但立体匹配至少需要两幅图像才能工作，且依赖虚拟基线的设定。FDS（2025.02）~\cite{2502_07615} 选择了另一条路径：在原始 3DGS 的训练环节引入光流匹配先验，用预训练匹配网络的稠密光流替代深度图作为几何监督信号，同时采样虚拟相机扩大约束覆盖，光度损失保持不变。
+
+所谓”辐射光流”（Radiance Flow），是指根据 GS 当前几何状态计算出的像素级跨视角位移向量，可以理解为”GS 认为像素应该在哪里”。稀疏视角（如仅 3--6 张输入图像）下，3DGS 的标准训练目标 $\mathcal{L} = (1-\lambda)\mathcal{L}_1 + \lambda \mathcal{L}_{\text{D-SSIM}}$ 容易过拟合：少量视角提供的光度约束不足以约束高斯的空间位置，模型倾向于将高斯集中在相机附近来”欺骗”光度损失，导致新视角渲染时出现严重伪影。FDS 的核心思路是：利用预训练的匹配网络所提供的稠密对应关系作为额外的几何约束，从全新角度弥补视角数量的不足。
+
+Flow Distillation Sampling (FDS)（2025.02）~\cite{2502_07615} 引入“辐射光流”（Radiance Flow）的概念。给定两视角 $m, n$，FDS 先用当前 GS 模型渲染出像素 $x = (u_1, v_1)$ 在视角 $m$ 的深度 $D^m(x)$，再通过相机间相对变换 $\mathbf{T}_{m \to n}$ 将其投影到视角 $n$，从而计算 GS 模型隐含的像素级光流：
+
+\begin{equation}
+\mathbf{f}^{m \to n}(x) = \begin{pmatrix} u_2 - u_1 \\ v_2 - v_1 \end{pmatrix}
+\end{equation}
+
+这个光流反映了 GS 当前几何状态下像素的跨视角对应关系，但在训练早期（高斯位置不准时）是高度不准确的。与此同时，FDS 在训练过程中\textbf{采样未观测的虚拟相机}：在训练视角附近添加微小水平平移扰动，并用深度自适应采样半径 $r_t = \bar{D}_i \cdot \delta / f$ 确保所有视角的光流幅度一致（其中 $\bar{D}_i$ 为该图像的平均深度，$f$ 为焦距，$\delta$ 为控制光流大小的超参数）。对于每个输入视角 $i$ 和其采样视角 $s$，FDS 用预训练匹配网络 $M_\theta$ 计算\textbf{先验光流} $\hat{\mathbf{F}}^{i \to s} = M_\theta(I^i, \hat{I}^s)$，其中 $I^i$ 为 GT 图像，$\hat{I}^s$ 为渲染图像。选择用 GT 图像而非两张渲染图来生成先验光流，是因为 GT 图像的边缘更清晰，能帮助消除渲染图像中的浮点伪影。
+
+FDS 损失的核心思想是让 GS 的辐射光流向更鲁棒的先验光流靠拢，实现两种流的\textbf{互蒸馏精炼}：
+
+\begin{equation}
+\mathcal{L}_{\text{fds}} = \| \hat{\mathbf{F}}^{i \to s} - \mathbf{f}^{i \to s} \|_2
+\end{equation}
+
+在反向传播时，先验光流 $\hat{\mathbf{F}}^{i \to s}$ 被从计算图中 detach（断开梯度），只将梯度传递到高斯位置参数。这一设计既避免了通过匹配网络回传梯度的高额计算开销，又防止了不可靠的辐射光流污染匹配网络的先验。总体训练损失为：
+
+\begin{equation}
+\mathcal{L} = \frac{1}{B}\sum_{i=1}^{B} \big[(1-\lambda)\mathcal{L}_1 + \lambda \mathcal{L}_{\text{D-SSIM}}\big] + \lambda_{\text{normal}} \mathcal{L}_n + \lambda_{\text{fds}} \mathcal{L}_{\text{fds}}
+\end{equation}
+
+其中 $\lambda_{\text{fds}}$ 控制 FDS 损失的权重。这一方法特别适用于稀疏视角条件，因为预训练匹配网络提供的稠密跨视角对应关系，有效弥补了训练视角不足带来的几何约束缺失。
+
+\paragraph{像素对齐的 1 自由度深度精炼}
+
+前述方法都在标准 3DGS 的自由形式优化框架上添加正则化项。PAGaS（2026.04）~\cite{2604_22129} 走了更激进的一步：修改了原始 3DGS 的高斯参数化方式，将每个高斯的 59 个自由度压缩为 1 个（仅深度值），将高斯中心严格约束在像素反投影射线上，渲染流程保持不变。PAGaS 的出发点是：标准 3DGS 为每个高斯优化 59 个参数（48 个球谐系数 + 3 个位置 + 4 个旋转四元数 + 3 个尺度 + 1 个不透明度），高斯可以在三维空间中自由移动以满足所有视角的约束。这虽然灵活，却使多视角立体的深度精细化问题变得严重欠约束。PAGaS 采取了截然相反的策略：为每个像素分配一个高斯，并将其中心严格约束在该像素反投影射线上，唯一可学习的参数只有深度值 $d$：
+
+\begin{equation}
+    \boldsymbol{\mu} = \mathbf{o} + d \cdot \mathbf{d}
+\end{equation}
+
+其中 $\mathbf{o}$ 是相机中心，$\mathbf{d}$ 是像素的射线方向。更关键的是，所有其他参数都不再独立优化，而是由深度 $d$ 解析确定。高斯采用各向同性球形（$s = s\mathbf{I}$），尺度 $s$ 根据欧氏深度 $d_e$ 自动设置，使高斯在图像平面上恰好覆盖一个像素：
+
+\begin{equation}
+    d_e = d \left(\left(\frac{u - c_x}{f_x}\right)^2 + \left(\frac{v - c_y}{f_y}\right)^2 + 1\right)^{-1/2}, \quad s = \frac{d_e}{2\sqrt{f_x f_y}}
+\end{equation}
+
+颜色固定为目标视图的像素颜色（零阶球谐），不透明度设为完全不透明，旋转设为单位矩阵。直观地说，每个高斯就像穿在射线上的"珠子"，只能在射线上前后滑动，不能偏离射线半步。这种设计将优化参数从 59 个压缩到仅 1 个，同时防止高斯通过调整不透明度或颜色来"欺骗"光度损失，迫使高斯只能沿射线移动到正确的几何位置。PAGaS 以逐视图方式工作：每次只优化一个目标视图的深度图，由 $N$ 个邻域上下文视图提供多视角光度约束，损失函数为光度一致性损失 $L_c$ 和法线平滑损失 $L_s$ 之和。PAGaS 的本质是一种基于高斯泼溅的多视角立体方法。它不追求全局自由形式优化，而是将 3DGS 重新定位为轻量级的深度图精炼框架，从基线方法（如 2DGS）提供的粗略全局几何出发，逐视图注入高频几何细节。
+
+\paragraph{体素层级不确定性深度约束}
+
+PAGaS 通过极端的参数约束来保障几何质量，但这种方法只适用于深度图精炼而非全局优化。GeoSVR（2025.09）~\cite{2509_18090} 回到正则化路线，但换了一个底层表示：建立在稀疏体素光栅化（Sparse Voxel Rasterization, SVRaster）之上。SVRaster 用八叉树组织稀疏体素，每个体素在八个角点存储密度值，通过三线性插值建模体内部的连续密度场。与 3DGS 基于高斯泼溅的表示不同，SVRaster 的体素具有极强的局部性：单个体素只通过少数角点与邻居连接，缺乏全局结构约束，优化过程容易产生严重的几何畸变。此外，之前基于 SDF 或 3DGS 的方法能从结构化的初始化（如零水平集或 SfM 点云）中受益，而 SVRaster 采用常量初始化，几乎没有任何先验约束，几何收敛面临更大挑战。GeoSVR 针对这两个问题，提出了基于体素层级的几何不确定性建模。直觉是：粗糙体素（低分辨率）覆盖大范围空间但精度低，应更多依赖外部深度先验；精细体素（高分辨率）已有足够细节，应更多信任自身优化结果。核心观察是：体素的不确定性与八叉树层级 $l$ 紧密耦合。分辨率越低（$l$ 越小）的体素，其几何建模精度越受限；而在优化过程中被细化的层级也反映了纹理约束的丰富程度。据此，GeoSVR 为体素 $v$ 定义了几何不确定性：
+
+\begin{equation}
+    U_{\text{base}}(l) = \alpha(l + l_0), \quad U_{\text{geom}}(v) = U_{\text{base}}(l) \cdot (1 - e^{-\sigma(v)})
+\end{equation}
+
+其中 $\alpha$ 是缩放因子，$l_0$ 是起始层级，$\sigma(v)$ 是体素的体积密度。这意味着低层级（粗糙）、低密度的体素具有最高的不确定性。GeoSVR 将此不确定性转化为像素级调制权重，用于约束单目深度的引入强度。具体地，在渲染时同步输出八叉树层级图 $\bar{l}$，计算归一化的不确定性权重 $\omega_{\text{unc}} = \min(1, \sigma(\bar{l} - \bar{l}_{\min}))$，并将其应用于 patch-wise 深度损失：$L_{D\text{-unc}} = \omega_{\text{unc}} \cdot L_{D\text{-patch}}$。效果是：对不确定性低的区域（几何已有把握），几乎不施加外部深度约束，信任光度约束本身；对不确定性高的区域（几何模糊），则增强深度监督的权重，借助外部先验解决歧义。
+
+\textbf{表面正则化。}在表面正则化方面，GeoSVR 还提出了体素丢弃（Voxel Dropout）策略：在计算全尺度深度和法线时，以随机比率 $[r, 1]$ 对体素进行间隔采样，迫使保留下来的体素响应更大范围的几何一致性，而非仅在小邻域内自洽。此外，表面矫正（Surface Rectification）正则化通过惩罚密度场的入射点、鼓励出射点密度，将渲染权重与体素密度对齐，解决三线性插值导致的表面偏移问题。总损失为 $L = L_{\text{photo}} + L_{D\text{-unc}} + L_{\text{NCC}} + \lambda_1 R_{\text{rect}} + \lambda_2 R_{\text{dist}}$，权重设为 $\lambda = 0.1$、$0.01$、$\lambda_1 = 10^{-5}$、$\lambda_2 = 10^{-6}$。
+
+\paragraph{LoD 体素替代 SfM 初始化}
+
+GeoSVR 从正则化角度改善几何，而初始化质量同样关键。Advancing Structured Priors（2026.01）~\cite{2601_17720} 修改了原始 3DGS 的初始化环节，用基础视觉模型生成的 LoD 体素替代 SfM 稀疏点云作为高斯起点，训练流程保持不变。其核心改进是用层次细节（Level-of-Detail, LoD）体素初始化替代标准 3DGS 的 SfM 点云初始化。标准 3DGS 依赖 COLMAP 等工具从 SfM 恢复的稀疏点云初始化高斯位置和尺度，但 SfM 点云分布不均匀——纹理丰富的区域点密，弱纹理区域点稀甚至缺失——且含有噪声和离群点。Advancing Structured Priors 改用基础视觉模型（Foundation Vision Model, VGGT）为每个视角估计伪深度图和置信度图，再通过 LoD 反投影算法生成多分辨率体素。对每个像素 $p=(u,v)$，利用伪深度 $\tilde{D}(u,v)$ 将其反投影到三维空间，并通过采样像素中心和四个半偏移邻域计算其三维足迹面积 $A_{i,p}$，据此确定体素层级：
+
+\begin{equation}
+    l_{i,p} = \max\, l \;\vert\; s_l^2 \leq A_{i,p}, \quad s_l = S/2^l
+\end{equation}
+
+其中 $S$ 是场景尺寸，$s_l$ 是层级 $l$ 的体素边长。三维足迹越大的像素对应越粗糙的体素（低 $l$ 值），足迹越小的像素获得越精细的体素（高 $l$ 值），实现分辨率与空间覆盖的自适应匹配。生成每视图八叉树后，通过拓扑对齐融合算法将 $N$ 个八叉树合并为全局八叉树：对同一空间区域，若某视图已细分到更精细层级，其他视图的粗糙体素也递归细分为八个子体素，属性从父节点继承。融合后的体素属性（球谐系数）通过对所有贡献视图取均值聚合。
+
+最后，引入不确定性感知的不透明度分配：利用置信度加权的 TSDF（Truncated Signed Distance Function，截断符号距离函数）融合计算符号距离场 $F(x_j)$，再通过参数化 sigmoid 函数 $\sigma(F) = 1/(1+e^{-\beta F})$ 映射为体素不透明度，斜率 $\beta$ 根据截断距离校准（使得 $F=-0.1$ 处不透明度达到 0.9）。不透明度低于阈值 $\sigma_{\text{prune}}$ 的体素被剪枝移除。在优化阶段，Advancing Structured Priors 进一步提出精炼深度几何监督：对每个像素在渲染深度附近生成候选深度集（空间邻域 + 随机扰动），通过多视角 NCC 评分选择最优深度，以 $L_1$ 损失直接约束几何，权重设为 $\lambda_{\text{photo}} = 0.1$、$\lambda_{\text{reg}} = 1.0$、$\lambda_{\text{refD}} = 0.05$。
+
+\subsubsection{法线先验正则化}
+\label{subsec:04_1_3}
+
+本路线介绍利用预训练法线估计器生成的法线先验约束高斯朝向和形状，弥补深度先验无法约束表面朝向的不足。
+
+\paragraph{深度与法线联合先验}
+
+纯深度先验只约束高斯的位置，不约束其朝向和形状。法线先验填补了这一空白。DN-Splatter（2024.03）~\cite{2403_17822} 在原始 3DGS 的训练环节引入深度与法线联合先验，利用预训练单目深度/法线估计器为每个视角生成伪标注，并将其作为几何正则化项加入训练，光度损失保持不变。
+
+\textbf{动机。} 标准 3DGS 仅靠光度损失无法约束高斯的几何形状，导致高斯退化成飘浮在空中的椭球而非贴合表面的扁平薄片——深度约束位置、法线约束朝向，两者缺一不可。DN-Splatter 是最早将深度和法线先验系统引入 3DGS 的方法之一，也是本节的里程碑工作。DN-Splatter 的核心思路是利用预训练的单目深度估计器（如 ZoeDepth、DepthAnything）和法线估计器（Omnidata）为每个训练视角生成伪深度图和法线图，将它们作为几何正则化项加入训练。
+
+\textbf{深度正则化。}在 DN-Splatter 中，深度正则化的实现方式是以标准 $\alpha$-混合 方式渲染深度图 $\hat{D} = \sum_{i \in N} d_i \alpha_i \prod_{j=1}^{i-1}(1-\alpha_j)$，其中 $d_i$ 是第 $i$ 个高斯在视图空间中的 $z$ 深度。然后用梯度感知的深度损失将渲染深度与估计深度对齐：
+
+\begin{equation}
+\mathcal{L}_{\hat{D}} = g_{\text{rgb}} \frac{1}{|\hat{D}|} \sum \log(1 + \|\hat{D} - D\|_1),
+\end{equation}
+
+其中 $g_{\text{rgb}} = \exp(-\nabla I)$ 是由当前 RGB 图像梯度驱动的边缘感知权重。直观来说，在图像梯度大的区域（物体边缘），深度监督被自动削弱；在平坦无纹理区域，深度监督被增强，因为这些区域仅靠光度损失很难约束几何。此外，对数惩罚 $\log(1+\cdot)$ 比线性或二次惩罚产生更平滑的重建。对于没有传感器深度的数据集，DN-Splatter 通过将单目深度与稀疏 SfM 点对齐来消除尺度歧义：对每帧求解线性回归 $\hat{a}, \hat{b} = \operatorname{argmin}_{a,b} \sum_{ij} \|(a \cdot D_{\text{mono},ij} + b) - D_{\text{sparse},ij}\|_2^2$。
+
+\textbf{法线正则化。}DN-Splatter 的法线直接从高斯的几何参数推导。在优化过程中，高斯应逐渐变平：三个缩放轴中最短的那个即为法线方向。具体地，给定高斯的旋转矩阵 $R$（由四元数 $q$ 转换而来）和缩放系数 $\boldsymbol{s} = (s_1, s_2, s_3)$，法线定义为 $\hat{\boldsymbol{n}}_i = R \cdot \text{OneHot}(\operatorname{argmin}(s_1, s_2, s_3))$，即旋转矩阵乘以一个在最小缩放分量位置为 1、其余为 0 的单位向量。法线图同样通过 $\alpha$-混合 渲染：$\hat{\boldsymbol{N}} = \sum_{i \in N} \hat{\boldsymbol{n}}_i \alpha_i T_i$。这种设计的优势在于法线完全由高斯的旋转和缩放参数决定，反向传播时对协方差矩阵的梯度更新直接改善法线估计，无需引入额外的可学习参数。法线监督使用 Omnidata 预测的法线图 $\boldsymbol{N}$，损失为 $\mathcal{L}_{\hat{N}} = \frac{1}{|\hat{N}|} \sum \|\hat{\boldsymbol{N}} - \boldsymbol{N}\|_1$，另加法线图的总变差平滑先验 $\mathcal{L}_{\text{smooth}} = \sum_{i,j}(|\nabla_i \hat{\boldsymbol{N}}_{i,j}| + |\nabla_j \hat{\boldsymbol{N}}_{i,j}|)$。为迫使高斯变扁平，还引入缩放正则化 $\mathcal{L}_{\text{scale}} = \sum_i \|\operatorname{argmin}(\boldsymbol{s}_i)\|_1$，持续压缩最短缩放轴。
+
+\textbf{联合训练。}深度约束高斯的绝对位置，法线约束高斯的空间朝向，两者互补使高斯更紧密地贴合表面。总损失为 $\mathcal{L} = \mathcal{L}_{\hat{C}} + \lambda_d \mathcal{L}_{\hat{D}} + \mathcal{L}_{\text{scale}} + \lambda_n \mathcal{L}_{\hat{N}} + \lambda_s \mathcal{L}_{\text{smooth}}$，实验中取 $\lambda_d = 0.2$，$\lambda_n = 0.1$，$\lambda_s = 0.1$。训练完成后，DN-Splatter 将渲染的深度图和法线图反投影为带方向的点集，通过 Poisson 表面重建直接提取 mesh，在室内场景的重建质量上显著优于标准 3DGS。
+
+\paragraph{封闭形式精确深度与法线渲染}
+
+DN-Splatter 使用标准 $\alpha$-混合 渲染深度和法线，但"期望深度"本身就有问题。RaDe-GS（2024.06）~\cite{2406_01467} 修改了原始 3DGS 的深度/法线渲染方式，用精确的封闭形式公式替代期望深度的近似计算，训练流程保持不变。其核心贡献在于提出了精确的高斯深度和法线光栅化方法，揭示了标准 3DGS 深度渲染的固有缺陷并给出封闭形式的修正方案。
+
+\textbf{问题：期望深度忽略了高斯的体积分布。}标准 3DGS 只渲染颜色和不透明度，深度图通常通过 $\alpha$-混合 的期望深度 $\hat{z} = \sum_i \omega_i z_i$ 近似计算，其中 $\omega_i = \alpha_i \prod_{j=1}^{i-1}(1-\alpha_j)$ 是混合权重，$z_i$ 是第 $i$ 个高斯中心的深度。RaDe-GS 指出这种做法将每个高斯基元视为一个”点”：只用其中心深度代表整个基元，完全忽略了高斯在三维空间中的体积分布。实际上，不同像素的视线射线与同一个高斯基元相交于不同深度，因此深度应该是像素位置的函数，而非常数。
+
+\textbf{精确的深度光栅化。}简单来说，RaDe-GS 发现射线穿过高斯时，不同像素位置看到的”表面”深度其实不同——就像一个椭球气球，从不同位置看气球表面，深度各不相同。RaDe-GS 的关键洞察是：在 3DGS 采用的局部仿射投影模型下，射线与高斯基元的”交点”（定义为使高斯值最大的点）的深度可以封闭形式地计算。具体推导在”光线空间”（ray space）中完成。3DGS 将每个高斯从世界坐标系通过仿射变换投影到屏幕空间，得到 2D 高斯协方差 $\boldsymbol{\Sigma}' = \mathbf{J}\mathbf{W}\boldsymbol{\Sigma}\mathbf{W}^\top\mathbf{J}^\top$，其中 $\mathbf{W}$ 是世界到相机的旋转矩阵，$\mathbf{J}$ 是透视变换的雅可比矩阵（Jacobian Matrix）。RaDe-GS 进一步在光线空间中考虑第三个坐标维度 $t$（点到相机的距离），定义一个 $1\times 3$ 常数向量：
+
+\begin{equation}
+\hat{\mathbf{q}} = \frac{{\mathbf{v}'}^\top \boldsymbol{\Sigma}'^{-1}}{{\mathbf{v}'}^\top \boldsymbol{\Sigma}'^{-1} \mathbf{v}'},
+\end{equation}
+
+其中 $\mathbf{v}'=(0,0,1)^\top$ 是光线空间中的射线方向常数。对每个高斯，$\hat{\mathbf{q}}$ 可预计算。像素 $(u,v)$ 处的精确深度则为：
+
+\begin{equation}
+d = z_c + \mathbf{p} \begin{pmatrix}\Delta u \\ \Delta v\end{pmatrix},
+\end{equation}
+
+其中 $z_c$ 是高斯中心的深度，$\Delta u = u_c - u$，$\Delta v = v_c - v$ 是像素到高斯中心的偏移，$\mathbf{p}$ 是从 $\hat{\mathbf{q}}$ 导出的 $1\times 2$ 向量。直观地说，第一项 $z_c$ 是高斯中心的深度，第二项 $\mathbf{p}(\Delta u, \Delta v)^\top$ 是根据像素偏离高斯中心的程度所做的深度修正——越偏离中心，深度变化越大，且变化方向由高斯的协方差形状决定。这个公式可以像颜色渲染一样在 CUDA 光栅化器中高效并行计算。
+
+\textbf{从深度到法线。}RaDe-GS 进一步证明，在光线空间中，所有射线与一个高斯基元的交点构成一个平面——因此可以直接取该平面的法线作为高斯投影的法线。光线空间中的平面法线为 $\mathbf{n}' = -(\mathbf{q}, 1)^\top$（其中 $\mathbf{q}$ 是 $\hat{\mathbf{q}}$ 的前两个分量），再通过仿射变换变回相机坐标系：$\mathbf{n} = \mathbf{J}^\top \mathbf{n}'$，归一化后即得到每个像素处的表面法线。这意味着法线也可以像颜色和深度一样光栅化渲染，无需额外的前向传播。
+
+\textbf{损失函数与效果。}RaDe-GS 在标准光度损失 $\mathcal{L}_c$ 之上增加了两项几何正则化：深度扭曲损失 $\mathcal{L}_d = \sum_{i,j}\omega_i\omega_j(d_i-d_j)^2$，鼓励同一条射线上不同高斯的深度尽量集中；法线一致性损失 $\mathcal{L}_n = \sum_i \omega_i(1-\mathbf{n}_i^\top \tilde{\mathbf{n}})$，确保光栅化法线与从深度图有限差分得到的法线方向一致。总损失为 $\mathcal{L} = \mathcal{L}_c + w_d \mathcal{L}_d + w_n \mathcal{L}_n$。这种精确的深度/法线渲染不仅提升了正则化质量，也直接改善了基于深度融合的网格提取精度——在 DTU 数据集上，RaDe-GS 的 Chamfer 距离误差已与 Neuralangelo 等 NeRF 方法相当，同时保持了 3DGS 原有的计算效率。
+
+\paragraph{SDF 梯度推导法线正则化}
+
+RaDe-GS 改进了深度/法线的渲染方式，但法线的来源仍是从高斯协方差的最小特征向量推导——这种做法在数学上并不严格。3D Gaussian Splatting with Normal Information（2025.01）~\cite{2501_08370} 在 DN-Splatter 的基础上进一步深化了法线正则化，转而借助 SDF 梯度推导法线。该方法的核心问题是：3DGS 本身并不直接提供表面法线，而此前工作（如 DN-Splatter）从高斯协方差矩阵的最小特征向量推导法线，这种做法虽然直觉合理，但在数学上并不严格——高斯的协方差描述的是概率分布的形状，而非几何表面的朝向。
+
+该方法借鉴了 SuGaR（2023.11）~\cite{2311_12775} 的 SDF 框架，将场景中每个点的 SDF 值定义为该点深度与从训练视角渲染的深度图之差：$\hat{\phi}(p) = z(p) - D(\pi(p))$，其中 $z(p)$ 是点 $p$ 的深度，$D(\pi(p))$ 是深度图上对应像素的渲染深度。直观地说，如果点恰好在表面上，SDF 值为零；偏离表面越远，SDF 绝对值越大。然后对 SDF 求梯度即可得到法线方向：$\nabla \hat{\phi}(p)$。这一梯度通过 GS 光栅化器高效渲染到像素空间，再与预训练法线估计器（如 Omnidata 或 MiDaS）提供的伪法线对齐。具体正则化项为 SDF 梯度与伪法线之间的余弦相似度：
+
+\begin{equation}
+    \mathcal{R}(\Theta) = \sum_{p \in \mathcal{P}} \left(1 - \frac{|\mathbf{f}_p \cdot \mathbf{n}_p|}{\|\mathbf{f}_p\| \|\mathbf{n}_p\|}\right)
+\end{equation}
+
+其中 $\mathbf{f}_p$ 是光栅化的 SDF 梯度，$\mathbf{n}_p$ 是预训练法线，$\mathcal{P}$ 是训练图像中的像素集合。该正则化项的直觉含义是：SDF 梯度的方向应与法线一致，否则产生惩罚。总损失为 $L = L_1 + \lambda_{\text{DSSIM}} L_{\text{DSSIM}} + \lambda_r \mathcal{R}(\Theta)$，其中 $\lambda_{\text{DSSIM}} = 0.2$，$\lambda_r$ 根据场景在 $[0.1, 0.4]$ 范围内调整。此外，该方法还引入了短期熵正则化来推动不透明度趋近二值（0 或 1），避免半透明高斯影响表面提取。相比直接从协方差推导法线，基于 SDF 梯度的法线在数学上有明确的等值面含义，在几何精度上也更高。
+
+\paragraph{广义指数分布锐化高斯边界}
+
+前述方法通过正则化损失改善法线质量。SolidGS（2024.12）~\cite{2412_15400} 则从高斯核函数本身出发，修改了原始 3DGS 的高斯分布形式，用广义指数高斯分布（Generalized Exponential Gaussian, GES）替代标准高斯分布，使核函数边界更锐利，训练流程保持不变。
+
+\textbf{动机。} 标准高斯分布的”软”边界导致同一高斯在不同视角下渲染出不同的深度值——两条射线穿过同一高斯得到不同的”表面”，这种不一致性在优化中引入噪声，严重干扰表面重建。具体而言，标准高斯分布 $G_i(\mathbf{x}) = e^{-\frac{1}{2}(\mathbf{x}-\boldsymbol{\mu}_i)^T \boldsymbol{\Sigma}_i^{-1}(\mathbf{x}-\boldsymbol{\mu}_i)}$ 的不透明度从中心向外平缓衰减，这意味着同一条射线在高斯内部不同交点处的 alpha 值差异巨大。在 $\alpha$-混合 渲染深度时，两条从不同视角穿过同一高斯的射线会得到不同的深度值，这种不一致性在优化中引入噪声，严重干扰表面重建。
+
+SolidGS 提出用广义指数高斯分布（Generalized Exponential Gaussian, GES）替代标准高斯分布：
+
+\begin{equation}
+    G_i^{\text{solid}}(\mathbf{x}) = e^{-\frac{1}{2}\left((\mathbf{x}-\boldsymbol{\mu}_i)^T \boldsymbol{\Sigma}_i^{-1}(\mathbf{x}-\boldsymbol{\mu}_i)\right)^{s_g/2}}
+\end{equation}
+
+其中 $s_g$ 是一个全局共享的“固体度”参数，控制分布边界的锐利程度。当 $s_g$ 较小时，分布接近标准高斯，边界柔软模糊；当 $s_g$ 增大时，分布趋近于区间 $[\boldsymbol{\mu}_i - \mathbf{s}_i, \boldsymbol{\mu}_i + \mathbf{s}_i]$ 内的均匀分布，边界变得锐利。论文观察到当 $s_g = 20$ 时，高斯在其有效区域内已基本具有统一的 alpha 值，不同视角渲染出的深度趋于一致。关键的是，$s_g$ 无需显式约束——在训练过程中，几何正则化自然驱动 $s_g$ 持续增大，使高斯自动变“固体”。在稀疏视角（仅 3 个视角）条件下，SolidGS 配合法线一致性损失 $\mathcal{L}_{nc} = \sum_i \sqrt{1 - \hat{n}_i^T \bar{n}_i}$、深度畸变损失以及来自 Metric3D 的单目法线先验，实现了高质量的表面重建。
+
+\paragraph{脉冲神经元抑制低不透明度高斯}
+
+SolidGS 从核函数形状入手改善几何，Spiking GS（2024.10）~\cite{2410_07266} 则从另一个角度切入：在原始 3DGS 的训练环节引入脉冲神经元机制，用可学习阈值自动"熄灭"低不透明度高斯和高斯尾部，渲染流程保持不变。该方法从脉冲神经网络（Spiking Neural Network, SNN）汲取灵感，针对标准 3DGS 的一个结构性问题：高斯的低不透明度区域会产生大量冗余和伪影。标准 3DGS 通过定期剪枝（移除不透明度低于阈值 $\tau_{\alpha}$ 的高斯）和不透明度重置（将高斯的不透明度重置为低值 $\alpha_{\text{reset}}$）来控制高斯密度，但这种启发式策略难以有效管理表面附近漂浮的低不透明度高斯（Low-Opacity Gaussians, LOGs）以及高斯尾部重叠（LOTs）问题。
+
+Spiking GS 引入了两种 FIF（Fast-Sigmoid Integrate-and-Fire）脉冲神经元。第一种是全局 FIF 神经元，作用于不透明度：
+
+\begin{equation}
+    \alpha_i^{\text{out}} = \begin{cases} 0 & \alpha_i < \tau^{\alpha} \\ \alpha_i & \alpha_i \geq \tau^{\alpha} \end{cases}
+\end{equation}
+
+其中 $\tau^{\alpha}$ 是所有高斯共享的可学习阈值，在训练中通过正则化项 $L_{\alpha} = \lambda_{\alpha} \cdot \frac{1}{\tau^{\alpha}}$ 被逐步推高（$\lambda_{\alpha} = 2 \times 10^{-5}$）。直觉上，随着阈值升高，越来越多低不透明度的高斯被“熄灭”并随后剪枝，LOGs 被自动清理。Spiking GS 还将不透明度重置值从原来的 $\alpha_{\text{reset}}$ 替换为更高的 $\tau^{\alpha}$，间接引导 3DGS 生成更少低不透明度高斯。第二种是局部 FIF 神经元，作用于高斯的表示函数本身：
+
+\begin{equation}
+    G_i^{\text{spike}}(\mathbf{x}) = \begin{cases} 0 & G_i(\mathbf{x}) < \tau_i^p \\ e^{-\frac{1}{2}(\mathbf{x}-\boldsymbol{\mu}_i)^T \boldsymbol{\Sigma}_i^{-1}(\mathbf{x}-\boldsymbol{\mu}_i)} & G_i(\mathbf{x}) \geq \tau_i^p \end{cases}
+\end{equation}
+
+其中每个高斯拥有独立的可学习截断阈值 $\tau_i^p$，通过 $L_p = \lambda_p \cdot \frac{1}{\bar{\tau}^p}$ 正则化（$\lambda_p = 2 \times 10^{-5}$）。这一机制将高斯尾部截断为零，消除了相邻高斯尾部重叠导致的渲染偏差。此外，Spiking GS 还引入了尺度损失 $L_s$ 来约束高斯的尺寸，并在盲区（约束不足区域）设计了基于尺度的克隆策略来补充高斯。总损失为 $L = L_c + L_d + L_N + \lambda_{\alpha} L_{\alpha} + \lambda_p L_p + \lambda_s L_s + \lambda_t L_t$，其中 $\lambda_s = 5 \times 10^{-4}$，$\lambda_t = 1.0$。这种脉冲神经元机制使最终表示更加紧凑，同时改善了表面对齐质量。
+
+\subsubsection{深度-法线联合正则化}
+\label{subsec:04_1_4}
+
+本路线介绍同时利用深度和法线先验进行联合正则化的方法，打通法线监督到高斯位置更新的梯度通路。
+
+\paragraph{交点深度打通法线-位置梯度通路}
+
+单独的深度或法线正则化各有盲点：深度约束位置但不约束朝向，法线约束朝向但梯度无法传到位置。联合正则化旨在打通这两个维度。VCR-GauS（2024.06）~\cite{2406_05774} 在原始 3DGS 的训练环节引入"交点深度"替代高斯中心深度，使法线监督的梯度能够传导到高斯位置参数，光度损失保持不变。
+
+\textbf{动机。} 法线仅与高斯旋转参数相关，法线监督无法有效更新高斯位置——即"知道表面朝向不对"却"无法移动高斯到正确位置"，需要一座桥梁打通法线与位置的梯度通路。所谓"交点深度"，是指将扁平高斯视为平面、求光线与平面的交点深度。它同时依赖于高斯的法线（决定平面朝向）和位置（决定平面在哪里），因此法线监督的梯度可以"顺道"推动位置更新。VCR-GauS 指出 3DGS 中仅监督法线不足以驱动表面重建，原因是法线仅与高斯的旋转参数相关，法线监督无法有效更新高斯的位置。NeuS-based 方法能将法线正则化传导至位置更新（法线即 SDF 的梯度），但 3DGS 缺乏这种机制。
+
+为此，VCR-GauS 提出交点深度（intersection depth）替代高斯中心深度：先将高斯挤压为扁平形状（通过尺度正则化 $\mathcal{L}_s = \|(s_1, s_2, s_3)\|_1$ 使最小尺度分量趋零），再将扁平高斯视为平面 $(p, n)$，求光线与平面的交点深度 $d(n, p) = r_z \cdot (n \cdot p) / (n \cdot r)$，其中 $r$ 为光线方向、$r_z$ 为其 $z$ 分量。交点深度同时依赖于法线 $n$ 和位置 $p$，从而打通了法线监督到位置更新的梯度通路。简言之，以前法线梯度只能更新高斯的旋转，现在通过"交点深度"这个桥梁，法线梯度也能推动高斯移动到正确位置。在此基础上，VCR-GauS 定义 D-Normal（深度法线）：将渲染深度图反向投影为三维点云，对每个点用水平/垂直邻域差分做叉积计算法线 $\hat{n}_d(n, p) = \frac{\nabla_v d \times \nabla_h d}{\|\nabla_v d \times \nabla_h d\|}$，再用预训练模型预测的法线先验 $N$ 监督：$\mathcal{L}_{dn} = \|\hat{n}_d - N\|_1 + (1 - \hat{n}_d \cdot N)$。由于 D-Normal 是 $n$ 和 $p$ 的函数，该正则化可同时优化高斯的旋转和位置。
+
+此外，\textbf{置信度加权：}预训练法线先验在多视角间存在不一致性，VCR-GauS 引入置信度项 $w = \exp(-(\hat{N}_d \cdot N - 1) / \sigma)$ 衡量渲染法线与预测法线的一致程度：高一致区域权重更大、低一致区域（预测可能出错）权重衰减，最终损失为 $\mathcal{L}_{dn} = w \cdot (\|\hat{n}_d - N\|_1 + (1 - \hat{n}_d \cdot N))$，$\sigma$ 为控制衰减速率的超参数。总训练损失为 $\mathcal{L}_{total} = \mathcal{L}_{RGB} + \lambda_1 \mathcal{L}_s + \lambda_2 \mathcal{L}_n + \lambda_3 \mathcal{L}_{dn}$，其中 $\mathcal{L}_n$ 为直接法线监督、$\mathcal{L}_s$ 为尺度正则化。
+
+\paragraph{深度-法线一致性过滤与自适应监督}
+
+VCR-GauS 用法线-深度一致性来过滤低质量监督信号。AGS-Mesh（2024.11）~\cite{2411_19271} 沿着类似方向前进，但聚焦于消费级设备的特殊挑战：传感器噪声大、相机标定不精确。该方法在原始 3DGS 的训练环节引入自适应几何先验过滤，通过深度-法线一致性检查筛选高置信度监督区域，光度损失保持不变。AGS-Mesh 针对智能手机等消费级设备采集数据的实际挑战（图像分辨率低、相机标定不精确、深度传感器噪声大），提出两阶段自适应监督策略。
+
+\textbf{深度-法线一致性过滤。}第一阶段为深度-法线一致性过滤（Depth Normal Consistency, DNC）。消费级深度传感器在平坦表面较准确，但在边缘和远处物体上噪声显著；而预训练单目法线模型恰好相反，在物体边界清晰但绝对尺度不可靠。AGS-Mesh 利用两者互补：先将深度图反投影为三维点云，对每个点用 KNN（K-Nearest Neighbors，K 近邻，$k=200$）找到邻域点并做协方差矩阵特征分解，取最大特征值对应的特征向量作为深度法线估计 $N_d$；再与预训练法线 $N_p$ 做方向一致性检查 $\theta_d = \arccos(N_d \cdot N_p / \|N_d\| \|N_p\|)$，仅当夹角 $\theta_d < \theta_d^*$ 时保留该深度值作为监督信号，即 $D_f = D$（保留）或 $0$（过滤）。渲染深度 $\hat{D}$ 的监督损失据此自适应切换：$\mathcal{L}_D = \|\hat{D} - D\|_1$（未过滤区域）或 $\|\hat{D} - D_f\|_1$（DNC 过滤后区域），使监督集中在深度-法线一致的高置信度区域。
+
+\textbf{自适应法线正则化。}第二阶段为自适应法线正则化（Adaptive Normal Regularization, ANR）。预训练法线 $N_p$ 本身也存在多视角不一致的问题，直接全量监督会引入矛盾梯度。
+
+ANR 同样通过角度阈值 $\theta_N$ 比较渲染法线 $\hat{N}$ 与 $N_p$，当偏差 $\theta_n > \theta_N$ 时认为预测不可靠，改用过滤后的法线 $N_f$（即与渲染法线一致的子集）进行温和监督；当偏差较小时使用完整的 $N_p$ 监督。法线损失写作 $\mathcal{L}_N = \|\hat{N} - N_p\|_1$（$\theta_n < \theta_N$）或 $\|\hat{N} - N_f\|_1$（$\theta_n \geq \theta_N$），实现训练初期强约束、后期弱约束的渐进式策略。最终总损失为 $\mathcal{L} = \mathcal{L}_{rgb} + \lambda_d \mathcal{L}_D + \lambda_n \mathcal{L}_N$。此外，AGS-Mesh 还提出深度感知的 IsoOctree meshing 策略：截断距离随深度线性缩放（近处小截断距离保留细节、远处大截断距离容忍噪声），并结合渲染法线图对反投影帧做方向一致性加权，体素宽度为 $h$ 的节点仅在包含至少 $N_e = 50$ 个反投影点时才细分，使网格密度自适应匹配点云密度（即场景到相机的距离）。
+
+\paragraph{跨视角距离重投影与法线一致性}
+
+AGS-Mesh 的过滤策略以单视图为主。Multi-view Normal and Distance Guidance GS（2025.08）~\cite{2508_07701} 则将正则化扩展到多视角维度，在原始 3DGS 的训练环节引入跨视角距离和法线重投影一致性约束，光度损失保持不变。该方法基于 PGSR 的单视角正则化框架，指出其核心缺陷：PGSR 通过距离图除以法线图获得无偏深度估计，但同一表面在不同视角下的相机距离不同，导致距离估计跨视角不一致。为解决这一问题，该方法提出两个互补模块。第一个是多视角距离重投影正则化：对参考视角 $E_1$ 中的像素 $p_r$，先沿射线方向乘以深度值反投影到相机坐标系得到三维坐标 $P_{r_i} = R_{r_i} \cdot D_{r_i}$，再通过相机外参将其变换到邻近视角 $E_2$ 的坐标系得到 $P_{r \to n}$，将该向量与对应像素法线 $\nu$ 做点积得到重投影距离 $d_{r \to n}$，并与 $E_2$ 原始渲染距离 $d_n$ 构建损失
+\begin{equation}
+\mathcal{L}_{dist} = \frac{1}{V} \sum_{(D_1, D_2)} \| d_{r \to n} - d_n \|_2^2
+\end{equation}
+
+这一损失要求同一三维点在任意两个视角下的渲染距离保持一致，从根本上消除了因相机-表面距离差异导致的偏差。第二个是多视角法线增强模块：对参考视角深度图 $D_1$ 中的像素 $p_r$，采样四个邻域点反投影到三维空间拟合局部平面，得到法线方向 $N_{D_1}(p_r)$；对邻近视角 $E_2$ 的对应像素 $p_n$ 做同样处理得到 $N_{D_2}(p_n)$，然后构建增强损失
+\begin{equation}
+\mathcal{L}_{nor} = \frac{1}{W_p} \sum_W | \nabla I |^5 \| N_{D_1}(p_r) R_{r \to n} - N_{D_2}(p_n) \|
+\end{equation}
+
+其中 $|\nabla I|^5$ 以图像梯度的五次方作为权重，使高纹理区域（通常也是几何细节丰富区域）获得更强的法线对齐约束。该模块强制不同视角的局部几何特征收敛到统一的几何流形上，显著提升了法线估计的跨视角一致性。最终损失 $\mathcal{L} = \lambda_{svgeo}\mathcal{L}_{svgeo} + \lambda_{mvrgb}\mathcal{L}_{mvrgb} + \lambda_{dist}\mathcal{L}_{dist} + \lambda_{nor}\mathcal{L}_{nor}$ 将 PGSR 原有的单视角约束与上述两个多视角模块联合优化。
+
+\paragraph{边缘感知梯度与多视角对齐约束}
+
+MVN-DG 关注多视角几何一致性，但未针对光照变化做特殊处理。VA-GS（2025.10）~\cite{2510_11473} 在原始 3DGS 的训练环节引入视图对齐策略，同时添加边缘感知梯度监督和多视角光度/特征对齐约束，光度损失保持不变。VA-GS 指出现有 3DGS 表面重建方法在两个层面存在不足：单视角层面，标准颜色重建损失 $\mathcal{L}_1 + \lambda_{\text{D-SSIM}}\mathcal{L}_{\text{D-SSIM}}$ 虽然能保证整体图像质量，但在物体边界处过度平滑、丢失高频细节；多视角层面，光照变化导致同一表面点在不同视角下颜色不同，基于像素的光度一致性不可靠。为此，VA-GS 在单视角和多视角两个维度分别设计约束。单视角方面包含三项损失：边缘感知图像重建损失在标准 $\mathcal{L}_1$ + D-SSIM 基础上加入图像梯度监督项 $\lambda_2 \mathcal{L}_1(\nabla \hat{I} - \nabla I_{gt})$，显式约束渲染图像与真实图像的梯度一致，从而保留物体轮廓和边界细节；边缘感知法线一致性损失用边缘衰减权重 $\omega = (1 - |\nabla I|)^2$ 降低图像梯度较大区域（即几何边缘）的法线约束强度，避免边缘处法线方向模糊导致跨表面误差传播：
+
+\begin{equation}
+\mathcal{L}_{nc} = \frac{1}{|I|} \sum_{p \in I} \omega \| \hat{N} - \tilde{N} \|_1
+\end{equation}
+
+法线平滑损失则对平坦无纹理区域施加局部法线连续性约束，用阈值 $\tau$ 区分真实几何边缘与噪声伪影，仅在法线差值超过 $\tau$ 且非边缘处施加惩罚。多视角方面包含两项损失：光度对齐损失利用单应矩阵将参考视角的局部面片 $P_r$（由法线 $n_r$ 和距离 $d_r$ 定义）扭曲到源视角得到 $P_s$，通过归一化互相关 $C(\cdot)$ 衡量面片间的一致性，并引入遮挡感知权重 $\psi(p_r) = 1/\exp(\epsilon(p_r))$（$\epsilon$ 为重投影误差）剔除被遮挡像素的干扰：
+
+\begin{equation}
+\mathcal{L}_p = \sum_{I_s} \frac{1}{V} \sum_{p_r} \nu_{rs} \psi(p_r) (1 - C(P_r, P_s))
+\end{equation}
+
+特征对齐损失用预训练网络提取的特征图代替原始 RGB 图，以余弦相似度度量跨视角特征一致性，增强了光照变化和低纹理场景下的鲁棒性。最终损失为五项的加权和 $\mathcal{L} = \mathcal{L}_I + \lambda_1 \mathcal{L}_{nc} + \lambda_2 \mathcal{L}_{ns} + \lambda_3 \mathcal{L}_p + \lambda_4 \mathcal{L}_f$。
+
+\paragraph{纹理感知分区正则化}
+
+VA-GS 用边缘感知策略处理物体边界，但无纹理区域的几何模糊仍是普遍问题。GSM-GS（2026.02）~\cite{2602_12796} 在原始 3DGS 的训练环节引入纹理感知的分区正则化，将场景动态划分为纹理丰富区和无纹理区，分别施加深度-法线正交约束和颜色加权全变分平滑，光度损失保持不变。GSM-GS 指出 PGSR 的单视角法线约束使用图像梯度的五次方加权，在无纹理区域梯度趋近于零，法线约束贡献衰减，导致几何模糊和浮动物体。为解决这一问题，GSM-GS 从单视图和多视角两个维度进行改进。单视图方面，GSM-GS 首先通过两种深度图（渲染深度 $D$ 与无偏深度 $\tilde{D}$）的差异构建置信度权重 $W(i,j) = 1 - \Delta D(i,j)/\|\Delta \tilde{D}\|_{\infty}$，并以此筛选高置信度的信任区域 $H = \{(i,j) \mid W(i,j) \geq \theta\}$；同时利用 Sobel 算子计算图像梯度 $G(i,j) = \sqrt{G_x^2 + G_y^2}$，以梯度分布的 75\% 分位数作为阈值 $\tau$ 将场景动态划分为纹理丰富区域 $R$ 和无纹理区域 $B$。在纹理丰富的信任区域中，除常规法线一致性约束外，GSM-GS 引入深度梯度与法线方向的正交约束 $\mathcal{L}_{cross} = \frac{1}{|I_{R \cap H}|} \sum_{i,j \in I_{R \cap H}} |(\nabla \tilde{D})_x N_y - (\nabla \tilde{D})_y N_x|$，确保深度梯度的切线方向与法线垂直。在无纹理区域中，采用颜色相似性加权的全变分正则化来平滑法线：
+
+\begin{equation}
+TV_{normal} = \frac{1}{|B|} \sum_{(i,j) \in B} \sigma(i,j) \cdot e^N_{i,j}
+\end{equation}
+
+其中 $e^N_{i,j}$ 是相邻像素法线差的平方和，权重 $\sigma(i,j) = \exp(-|I_{i,j} - I_{i-1,j}|)$ 根据颜色差异自适应调节平滑强度——颜色相似的区域施加更强的平滑，颜色突变处保留几何边缘。单视角总损失为 $\mathcal{L}_{svgeo} = \mathcal{L}_{svn} + \lambda_2 TV_{normal}$，其中 $\lambda_1 = 0.05$、$\lambda_2 = 0.01$。多视角方面，GSM-GS 融合当前视角和邻近视角的置信度权重 $W_{avg} = W_c + 0.5 \cdot W_n$，以此为引导对高置信度三维点云进行采样，通过 PCA（Principal Component Analysis，主成分分析）计算各局部面片的法线向量，并以基于曲率的指数衰减权重 $w^i_{curv} = \exp(-10 \cdot \lambda^i_c)$（$\lambda^i_c = \lambda^3_c / \sum_{k=1}^3 \lambda^k_c$）构建跨视角法线一致性损失：
+
+\begin{equation}
+\mathcal{L}_{mvgeo} = \frac{1}{|K|} \sum_{i}^{|K|} w^i_{curv} (1 - |{n_c^{i}}^T n_n^i|)
+\end{equation}
+
+曲率越大的局部面片几何估计越不稳定，因此权重越低；曲率小的平坦区域法线估计更可靠，获得更强的对齐约束。最终损失 $\mathcal{L} = \mathcal{L}_{rgb} + \mathcal{L}_{svgeo} + \lambda_3 \mathcal{L}_{mvgeo}$，$\lambda_3 = 0.001$。
+
+\paragraph{曲率引导的全流程几何正则化}
+
+GSM-GS 通过分区策略处理不同纹理区域，而 GeoSplat（2025.09）~\cite{2509_05075} 则从更高阶的几何信息出发，在原始 3DGS 的初始化、优化和致密化三个阶段全面引入曲率先验，光度损失保持不变。GeoSplat 的出发点是：标准 3DGS 在初始化、优化和致密化三个阶段均忽略了高阶几何先验（曲率、主方向），仅依赖光度损失驱动高斯属性更新，导致高斯形状与底层表面不对齐。具体而言，标准 3DGS 将协方差矩阵的旋转部分随机初始化、尺度部分简单设为各向同性 $S^i = (s^i_{\text{nbr}} / 2)\,I$（$s^i_{\text{nbr}}$ 为到最近邻的平均距离），完全不利用场景的几何结构信息。GeoSplat 将低阶先验（法线）和高阶先验（主曲率 $\kappa_1, \kappa_2$、主方向 $w_1, w_2$）融入训练全流程的三个阶段。这里"主曲率"描述表面在某点的最大/最小弯曲程度，"主方向"则是对应的弯曲方向——就像球面上每点在所有方向都等曲弯曲，而圆柱面上沿母线方向不弯曲、沿周向最大弯曲。
+
+\textbf{曲率引导的初始化。}GeoSplat 首先用几何先验“热启动”协方差矩阵。旋转矩阵的一列设为法线方向 $r_3^i = n^i_3$，对应尺度设为极小值 $s^i_3 = \epsilon_{\min}$，使高斯沿法线方向被压扁而紧贴表面；另外两个旋转方向则对齐到主方向 $r_d^i = w^i_{3-d}$（$d=1,2$）。直觉上，高斯在弯曲方向上应该"窄"（覆盖范围小），在平坦方向上应该"宽"（覆盖范围大），因此施加曲率-尺度约束：
+
+\begin{equation}
+    s^i_1 / s^i_2 = |\kappa_2^i|^{-1} / |\kappa_1^i|^{-1}
+\end{equation}
+
+直觉是：低曲率方向上的点分布更分散（高方差），高曲率方向上更集中（低方差）。再加一个面积不变约束 $s^i_1 s^i_2 = (s^i_{\text{nbr}})^2 / 4$（保证投影到切平面的一倍标准差区域面积恒定），可解出 $s^i_1 = \frac{s^i_{\text{nbr}}}{2}\sqrt{|\kappa_1^i / \kappa_2^i|}$，$s^i_2 = \frac{s^i_{\text{nbr}}}{2}\sqrt{|\kappa_2^i / \kappa_1^i|}$。这样，协方差矩阵 $\Sigma^i = R^i (S^i)^2 (R^i)^\top$ 在训练开始前就被完整赋予了法线和曲率信息。
+
+\textbf{形状约束的优化。}标准 3DGS 中，梯度更新不受约束，高斯可能偏离表面成为漂浮伪影；同时某些高斯退化为针状（协方差秩为 1），对表面覆盖不足。GeoSplat 提出两个修正。第一是截断梯度更新——将位置梯度分解为切向分量和法向分量，对法向分量进行截断：
+
+\begin{equation}
+    \mu^i \leftarrow \mu^i - \eta\left((\nabla^i\mathcal{L})^\top + \min\left(\epsilon_{\min} / \|(\nabla^i\mathcal{L})^\perp\|, 1\right)(\nabla^i\mathcal{L})^\perp\right)
+\end{equation}
+
+其中 $(\cdot)^\top$ 和 $(\cdot)^\perp$ 分别是到切平面和法线方向的投影。法向分量被钳制在 $\epsilon_{\min}$ 以内，防止高斯因激进梯度更新而远离表面。第二是铰链式尺度正则化，防止次尺度 $s^i_2$ 过小导致秩退化：
+
+\begin{equation}
+    \mathcal{L}_{\text{scale}} = \max\left(0, \frac{s^i_1}{s^i_2} - \frac{|\kappa_1^i|}{|\kappa_2^i|} - \epsilon_{\min}\right) + (s^i_3)^2
+\end{equation}
+
+右侧第二项约束高斯秩不超过 2，保持表面贴合。旋转矩阵也有对应的对齐正则化 $\mathcal{L}_{\text{rot}} = \sum_{d=1}^{3}(1 - r_d^i \cdot w^i_d)^2$。
+
+\textbf{曲率正则化的致密化。}标准 split/clone 操作容易将新高斯放置在远离表面的位置。GeoSplat 在平坦区域（平均绝对曲率 $\mu^i = (\sum_d |\kappa_d^i|) / D_M < \mu_{\min}$）用中点插值添加新高斯：$\mu^{i'} = (\mu^i + \mu^j) / 2$，$j \in \text{KNN}(i)$，因为平坦区域线性插值不会偏离表面。对于 split 操作，新位置沿主方向偏移：$\mu^{i'} = \mu^i + (\delta_2 / \kappa_2^i) w^i_2 + (\delta_1 / \kappa_1^i) w^i_1 + \delta_3 \epsilon_{\min} n^i_3$（$\delta \sim \mathcal{N}(0, I)$），曲率越大偏移越小，使采样偏向稀疏区域。clone 操作则沿用截断梯度位移，确保新高斯不会沿法线方向飘移。GeoSplat 还提出基于流形和变分两种噪声鲁棒的曲率估计方法（利用切核矩阵和弱第二基本形式的特征分解），在训练中周期性更新几何先验，使先验随高斯密度增长保持准确。
+
+\paragraph{自举 TSDF 自约束距离场}
+
+前述方法都依赖外部几何先验（预训练深度/法线模型）。GSPrior（2026.03）~\cite{2603_19682} 则追求完全自举，在原始 3DGS 的训练环节引入自约束距离场，用 3DGS 自身渲染深度的 TSDF 融合结果作为几何先验来约束后续优化，外部模型保持不变。GSPrior 的核心问题是：现有 3DGS 表面重建方法（如 2DGS、GaussianSurf）依赖外部几何先验（预训练法线模型、单目深度估计器），这些先验不仅引入额外计算开销，而且在特定域（如室外、非 Lambertian 场景）可能不可靠。GSPrior 的思路是”自举”：从 3DGS 自身渲染的多视角深度图中融合出 TSDF 体素网格，再将该网格作为几何先验反过来约束高斯的优化。即使初始深度不够精确，多视角融合后的 TSDF 零等值面仍能捕获场景的大尺度几何，并随着训练迭代不断更新和收窄。
+
+\textbf{自约束距离场的构建。}在训练迭代 $t$，GSPrior 先用当前高斯集合渲染所有训练视角的深度图 $d_i'$，然后通过 TSDF 融合操作 $F$ 将它们融合为一个距离场 $f^t = F(\{d_i'(t)\})$。距离场在零等值面附近定义一个窄带 $[-1, 1]$，截断距离阈值 $\tau^t$ 控制窄带宽度。随着训练推进，$\tau^t$ 逐步缩小，使约束从粗到细地收紧。具体而言，对每个高斯 $g_j$，GSPrior 用三线性插值从 $f^t$ 中读取其中心 $\mu_j$ 处的有符号距离 $s_j = f^t(\mu_j)$，据此将高斯分为三类并施加不同约束。
+
+\textbf{三类约束。}第一是离群点移除：若 $|s_j|$ 达到窄带边界（即 $s_j = \pm 1$），说明该高斯远离表面估计，直接从集合中删除。第二是不透明度约束——直观来说，离表面近的高斯应该“实心”（高不透明度），离表面远的应该“透明”（低不透明度）。为此将窄带内的高斯分为“表面子集” $N_{\text{on}} = \{g_j \mid |s_j| \leq \tau^t\}$ 和“离面子集” $N_{\text{off}} = \{g_j \mid \tau^t < |s_j| < 1\}$，分别施加不同方向的不透明度驱动：
+
+\begin{equation}
+    \mathcal{L}_{\text{SCP}} = \frac{1}{M}\left(\sum_{g_k \in N_{\text{on}}} w_k (o_k - 1)^2 + \sum_{g_{k'} \in N_{\text{off}}} w_{k'} o_{k'}^2\right)
+\end{equation}
+
+其中权重 $w_j = 1 / (1 + |s_j|)^2$，距表面越近权重越大。表面上的高斯不透明度被推向 1（不透明），远离表面的被推向 0（透明），使渲染深度主要由紧贴表面的高斯贡献。第三是位置投影——不通过梯度优化，而是直接将高斯拉向表面：对每个高斯 $g_j$，用有限差分计算距离场梯度 $\nabla f^t(\mu_j)$（步长 $\Delta = 10^{-4}$），然后更新位置 $\mu_j \leftarrow \mu_j - s_j \cdot \nabla f^t(\mu_j)$。这一投影操作在每次致密化之后、离群点移除之前执行，确保新产生的高斯先被拉回表面，再判断是否仍在窄带外。
+
+\textbf{调度与总损失。}距离场 $f^t$ 以固定间隔更新（用最新渲染深度重新融合），不透明度约束在每个训练迭代施加，投影和离群点移除在每次致密化后执行。总损失为 $\mathcal{L} = \mathcal{L}_{\text{RGB}} + \lambda_1 \mathcal{L}_{\text{Depth}} + \lambda_2 \mathcal{L}_{\text{NS}} + \lambda_3 \mathcal{L}_{\text{NM}} + \lambda_4 \mathcal{L}_{\text{SCP}}$，其中 $\lambda_1 = 0.01$，$\lambda_2 = 0.1$，$\lambda_3 = 0.1$，$\lambda_4 = 0.01$。$\mathcal{L}_{\text{Depth}}$ 是沿射线的深度分布方差（鼓励同射线上各高斯深度集中），$\mathcal{L}_{\text{NS}}$ 是渲染法线与从深度图有限差分推导的法线之间的 $L_1$ 一致性，$\mathcal{L}_{\text{NM}}$ 是基于单应矩阵的跨视角几何一致性约束。GSPrior 使用平面高斯（planar Gaussians，即 $s_3$ 被约束为极小值）作为基线表示，更适合几何重建。
+
+\paragraph{特征值形状指标约束高斯几何}
+
+GSPrior 通过自举 TSDF 提供全局几何约束，但对单个高斯的形状缺乏直接约束。FeatureGS（2025.01）~\cite{2501_17655} 在原始 3DGS 的训练环节引入三维点云分析中的形状特征损失，用平面度、全方差、特征熵等指标约束高斯协方差和邻域分布，光度损失保持不变。
+
+\textbf{动机。} 标准 3DGS 的光度损失仅约束高斯的投影外观，完全不约束其在三维空间中的形状——许多高斯呈现球状而非贴合表面的扁平盘状，因为球状高斯在投影上同样能"骗过"光度损失。FeatureGS 从一个基本观察出发：标准 3DGS 的光度损失 $\mathcal{L}_{\text{photometric}} = (1-\lambda)\mathcal{L}_1 + \lambda \mathcal{L}_{\text{D-SSIM}}$ 仅约束高斯的投影外观，完全不约束高斯在三维空间中的形状。这导致许多高斯呈现球状（三个尺度相近）而非扁平的盘状——后者才对齐于表面。FeatureGS 的关键思路是将三维点云分析中的形状特征（planarity、omnivariance、eigenentropy）转化为可微损失项，从两个层面约束高斯的几何质量。
+
+\textbf{高斯自身的平面度损失。}几何直觉是：贴合表面的高斯应该是扁平的"煎饼"而非圆滚滚的"土豆"。每个高斯的协方差矩阵有三个尺度参数 $s_1 \geq s_2 \geq s_3 > 0$，归一化后 $s'_i = s_i / \sum_{j=1}^{3} s_j$。FeatureGS 定义高斯的平面度为 $\pi_{\text{Gaussian}} = (s'_2 - s'_3) / s'_1$——当 $s'_3 \to 0$ 时 $\pi \to s'_2/s'_1$（扁平盘状，平面度高），当三个尺度接近时 $\pi \to 0$（球状，平面度低）。几何损失直接惩罚低平面度：
+
+\begin{equation}
+    \mathcal{L}_{\pi,\text{Gaussian}} = \frac{1}{N}\sum_{i=1}^{N}\left(1 - \frac{s'^{i}_2 - s'^{i}_3}{s'^{i}_1}\right)
+\end{equation}
+
+最小化该损失等价于鼓励 $s'_3 \to 0$ 且 $s'_2 / s'_1 \to 1$，即高斯退化为与表面对齐的薄盘。
+
+\textbf{邻域结构损失。}仅约束单个高斯的形状还不够——高斯中心在空间中的分布也应当呈现场景的几何结构。FeatureGS 对每个高斯中心 $p_0$，取其 $k$-最近邻 $\{p_1, \ldots, p_k\}$，计算邻域的协方差矩阵 $C = \frac{1}{k+1}\sum_{i=0}^{k}(p_i - \bar{p})(p_i - \bar{p})^\top$（$\bar{p}$ 为邻域质心），对其特征分解得到归一化特征值 $\lambda'_1 \geq \lambda'_2 \geq \lambda'_3$，从中提取三个特征：（1）邻域平面度 $\pi_{\text{kNN}} = (\lambda'_2 - \lambda'_3)/\lambda'_1$，惩罚球状散布、鼓励高斯中心沿平面排列；（2）邻域全方差 $o_{\text{kNN}} = \sqrt[3]{\lambda'_1 \lambda'_2 \lambda'_3}$（三个特征值的几何均值），衡量局部体积散布程度，最小化它减少高斯在所有方向上的无序扩展；（3）邻域特征熵 $e_{\text{kNN}} = -\sum_{i=1}^{3}\lambda'_i \ln(\lambda'_i)$（类似信息熵的概念，衡量三个特征值的分布均匀性），量化局部结构的有序程度，最小化它鼓励低熵（即高度有序的平面分布），这与人造物体的曼哈顿世界假设一致。三个邻域损失分别为：
+
+\begin{align}
+    \mathcal{L}_{\pi,\text{kNN}} &= \frac{1}{N}\sum_{j=1}^{N}\left(1 - \frac{\lambda'^{j}_2 - \lambda'^{j}_3}{\lambda'^{j}_1}\right), \quad
+    \mathcal{L}_{o,\text{kNN}} = \frac{1}{N}\sum_{j=1}^{N}\sqrt[3]{\lambda'^{j}_1 \lambda'^{j}_2 \lambda'^{j}_3} \\
+    \mathcal{L}_{e,\text{kNN}} &= -\frac{1}{N}\sum_{j=1}^{N}\sum_{i=1}^{3}\lambda'^{j}_i \ln(\lambda'^{j}_i)
+\end{align}
+
+\textbf{组合损失与效果。}FeatureGS 的总损失将标准光度损失与四选一的几何损失组合：$\mathcal{L} = h_{\text{photo}} \mathcal{L}_{\text{photometric}} + \mathcal{L}_{\text{geometric}}$，其中 $h_{\text{photo}}$ 控制光度项的权重、$\mathcal{L}_{\text{geometric}} \in \{\mathcal{L}_{\pi,\text{Gaussian}}, \mathcal{L}_{\pi,\text{kNN}}, \mathcal{L}_{o,\text{kNN}}, \mathcal{L}_{e,\text{kNN}}\}$。光度损失保证渲染质量，几何损失引导三维结构趋于合理。实验表明，在引入几何损失后，高斯数量减少约 90\% 的同时几何精度提升约 30\%——因为几何损失使得大量冗余的球状高斯（原本仅靠光度损失维持）被有效地压缩为紧贴表面的扁平高斯。
+
+\subsubsection{透明物体与特殊表面的深度重建}
+\label{subsec:04_1_5}
+
+本路线介绍针对透明、反射等非朗伯表面的特殊深度重建方法，解决标准深度先验在这类表面上失效的问题。
+
+\paragraph{表面嵌入双通道透明物体重建}
+
+前述所有正则化方法都假设场景表面是不透明的——高斯的不透明度越高越好。透明物体打破了这一假设：表面的不透明度本应很低，导致标准深度渲染失效。TranSplat（2025.02）~\cite{2502_07840} 修改了原始 3DGS 的渲染通道，为每个高斯同时维护 RGB 颜色和表面嵌入两组属性，实现双通道渲染，训练流程保持不变。TranSplat 专门解决透明物体的深度重建问题。透明物体作为非朗伯表面，对光照和视角变化高度敏感，直接用 RGB 图像进行 3DGS 优化会面临两个核心困难：其一，透明表面的光度一致性在不同视角间极不可靠，导致深度图充满噪声和伪影；其二，由于透明物体“不可见”，标准 3DGS 训练中代表透明表面的高斯不透明度 $\alpha$ 会坍缩为零，深度渲染出现大量孔洞。TranSplat 的核心洞察是：既然 RGB 图像本身不可靠，就需要一种对光照和视角不敏感的替代特征来监督透明表面的重建——即表面嵌入（surface embedding）。这一思路源于 SurfEmb，后者能有效捕捉多种物体的表面特征，但 SurfEmb 依赖物体专属网络且需要 3D CAD 模型训练，无法泛化到未知物体的真实场景。
+
+TranSplat 采用两阶段流程。第一阶段用潜在扩散模型从每张 RGB 图像中提取透明物体的表面嵌入。训练时需要四种数据：输入 RGB 图像、透明物体分割掩码、物体类别的文本条件、以及由修改版 SurfEmb 网络生成的表面嵌入真值。在前向过程中，由图像掩码生成的 latent 与掩码乘以的 RGB 图像生成的 latent 在通道维度拼接，同时施加类别文本条件。生成网络采用 ControlNet 架构，以裁剪后的 RGB 图像作为输入控制——这一控制信号帮助引导生成与场景中特定物体对应的表面嵌入，尤其在多个透明物体聚集的场景中区分不同物体实例。生成的表面嵌入编码了物体表面的连续几何特征，且不受光照和视角变化的影响。为突破 SurfEmb 的物体绑定限制，TranSplat 采用类别级训练策略，使同一类别的物体共享特征空间，而非为每个物体绑定特定 CAD 模型，从而泛化到更多未见物体。
+
+第二阶段将表面嵌入融入 3DGS 的渲染与优化流程。直觉上，相当于给每个高斯装了"两副眼镜"——一副看 RGB 颜色，一副看几何特征——两组属性共享位置和形状参数，但独立渲染。标准 3DGS 仅光栅化 RGB 图像，TranSplat 则为每个高斯同时维护 RGB 颜色 $c_{\text{RGB},j}$ 和表面嵌入颜色 $c_{\text{Surf},j}$ 两组属性，实现双通道渲染：
+
+\begin{equation}
+C_{\text{RGB}} = \sum_{j=1}^{N} c_{\text{RGB},j} \alpha_j T_j, \quad C_{\text{Surf}} = \sum_{j=1}^{N} c_{\text{Surf},j} \alpha_j T_j
+\end{equation}
+
+即 RGB 图像和表面嵌入图像分别用各自的属性独立渲染，但共享同一组高斯的位置、协方差和不透明度参数。相应地，深度渲染也由标准公式给出：
+
+\begin{equation}
+D = \frac{\sum_{j=1}^{N} d_j \alpha_j T_j}{\sum_{j=1}^{N} \alpha_j T_j}
+\end{equation}
+
+其中 $d_j$ 为第 $j$ 个高斯的深度值。训练损失也相应扩展为双通道联合优化：
+
+\begin{equation}
+\mathcal{L} = \tfrac{1}{2}\mathcal{L}_{\text{RGB}} + \tfrac{1}{2}\mathcal{L}_{\text{Surf}}
+\end{equation}
+
+其中 $\mathcal{L}_{\text{RGB}} = (1-\lambda)|\hat{I}_{\text{RGB}} - I_{\text{RGB}}| + \lambda \cdot \text{D-SSIM}(\hat{I}_{\text{RGB}}, I_{\text{RGB}})$，$\mathcal{L}_{\text{Surf}}$ 具有相同形式但作用于表面嵌入图像，$\lambda = 0.2$。这一联合优化的关键作用在于：反向传播时，高斯的均值、协方差和不透明度参数在 RGB 和表面嵌入两个通道之间共享，因此表面嵌入通道为透明区域的高斯提供了稳定的梯度来源，阻止不透明度 $\alpha$ 在透明表面上坍缩为零，从而保持完整的深度重建。
+
+\paragraph{物体感知分割引导的透明重建}
+
+TranSplat 依赖扩散模型提取表面嵌入，流程较重。TRAN-D（2025.07）~\cite{2507_11069} 选择了更轻量的路线——在原始 2DGS 的基础上引入物体感知渲染通道和 3D 损失，用分割掩码替代表面嵌入作为几何引导——光度损失保持不变。TRAN-D 面向的是 cluttered 场景中透明物体的稀疏视角重建问题。标准 2DGS 在透明场景中面临两个根本性困难：SfM 无法在透明表面恢复可靠特征点，导致初始化失败；即使初始化成功，透明表面的光度不一致性使高斯的不透明度坍缩为零，透明区域变成孔洞。TRAN-D 的核心思路是：既然光度信号不可靠，就用物体级别的几何约束来引导高斯分布到正确位置。
+
+TRAN-D 采用基于 2DGS 的三模块流程。第一个模块用经过类别级 prompt 微调的 Grounded SAM 进行透明物体分割。与 TranSplat 需要扩散模型提取特征不同，TRAN-D 将所有透明物体视为同一类别，分配唯一标识符作为 category-specific prompt，确保多视角间分割掩码的一致性。第二个模块是核心的物体感知 2DGS 重建。由于 SfM 和 3D 基础模型（如 InstantSplat）均无法为透明场景提供可靠初始化，TRAN-D 直接从随机点初始化 2D 高斯，并引入三种额外渲染通道来引导优化。
+
+除了标准 RGB 渲染外，TRAN-D 同时渲染分割掩码和物体索引 one-hot 向量。分割掩码的渲染方式与颜色渲染类似：每个高斯 $G_i$ 携带物体颜色向量 $m_i \in \mathbb{R}^3$，渲染掩码 $m(x)$ 按标准 $\alpha$-混合累积：
+
+\begin{equation}
+m(x) = \sum_{i=1}^{N} m_i \, o_i \, \phi_i(u(x)) \prod_{j=1}^{i-1}(1 - o_j \, \phi_j(u(x)))
+\end{equation}
+
+其中 $o_i$ 为不透明度，$\phi_i(u(x))$ 为 2DGS 中的修改高斯函数。掩码渲染的监督损失防止透明物体上的高斯不透明度坍缩——因为掩码损失要求透明区域的高斯保持可见。对于多物体场景，每个高斯还维护 one-hot 向量 $\mathbf{o}_i \in \mathbb{R}^{N+1}$（$N$ 为物体数，额外一维表示背景），经 softmax 归一化后与 Grounded SAM 的 one-hot 标签计算 Dice 损失 $L_{\text{one-hot}}$。
+
+\textbf{物体感知 3D 损失。}第三个模块是关键的物体感知 3D 损失（object-aware loss），专门解决被遮挡区域的高斯分布问题。在稀疏视角下，许多区域从所有视角都不可见，仅靠视图空间的位置梯度无法有效优化这些区域的高斯。TRAN-D 的策略是分组约束：为每个物体选择 $n_g$ 个最远的 2D 高斯作为组中心，每个组包含其 $n_n$ 个最近邻同物体高斯。组中心间距离的方差损失 $L_d = \text{Var}(d_1, d_2, \ldots, d_{n_g})$ 鼓励可见区域的稳定距离约束不可见区域，使遮挡区域的高斯移动到合理的凸面位置；组内距离和的方差损失 $L_S = \text{Var}(S_1, S_2, \ldots, S_{n_g})$ 促进均匀密度，确保稀疏视角下未覆盖区域仍能吸引足够的高斯。由于优化从随机点开始、高斯数量动态变化，TRAN-D 采用三层级分组策略，配置分别为 $(n_g, n_n) = (16,16)$, $(32,16)$, $(64,32)$，确保优化全程损失函数始终有效。总损失为：
+
+\begin{equation}
+\mathcal{L} = a_{\text{color}} L_c + a_{\text{mask}} L_m + a_{\text{one-hot}} L_{\text{one-hot}} + \sum_{l=1}^{3}\sum_{o=1}^{N}(a_S L_S + a_d L_d)
+\end{equation}
+
+其中 $a_{\text{color}} = 0.5$, $a_{\text{mask}} = 0.5$, $a_{\text{one-hot}} = 1.0$, $a_S = 10000/3$, $a_d = 1/3$。
+
+最后，场景更新模块利用重建结果的物理仿真支持物体移除后的场景动态更新。移除物体后，用 Grounded SAM 分割该物体、删除对应高斯，将剩余高斯渲染为深度图并生成 mesh，再通过 MPM（Material-Point Method）物理仿真预测连锁反应，最后重新优化高斯以精调场景。
+
+\paragraph{三阶段解耦几何与外观的透明表面重建}
+
+TranSplat 和 TRAN-D 都在渲染环节引入额外通道，但没有专门处理”透明表面的深度渲染本身有偏”这一根本问题。TSGS（2025.04）~\cite{2504_12799} 修改了原始 3DGS 的训练流程，将优化分为几何学习、外观精调和首表面提取三个独立阶段，并在推理时用滑动窗口提取首表面深度，光度损失保持不变。TSGS 系统分析了透明表面重建中”透明-深度困境”的根源。标准 3DGS 通过 $\alpha$-混合 渲染深度 $D_{\text{standard}} = \sum_{i} T_i \alpha_i z_i$，其权重 $\alpha_i T_i$ 本质上是为外观渲染优化的——透明表面为了正确混合前后景的光线传输，需要较低的不透明度，而精确的首表面深度提取则需要不透明度在真实首表面处急剧集中。这种需求矛盾使得标准深度渲染对透明物体产生严重偏差。此前 PGSR 的无偏深度 $D_{\text{unbiased}}(u) = D(u) N_w(u) \cdot v_u$ 虽改进了标准混合深度，但其 $D$ 和 $N_w$ 仍通过 $\alpha$-混合 聚合所有相交高斯的贡献，无法隔离首表面。
+
+TSGS 提出三阶段策略来解耦几何与外观。第一阶段（Geometry-Focused Learning）的目标是在不受外观干扰的条件下学习准确几何。为此，TSGS 先对输入图像进行预处理：用 StableNormal 生成法线先验图 $I_{p\theta}$，用 StableDelight 生成去光照图像 $I_{D\theta}$，再用 Grounded-SAM 分割透明区域得到掩码 $M_T$。通过掩码混合，仅在透明区域应用去光照图像，其余区域保留原图：
+
+\begin{equation}
+I'_D = M_T \odot I_{D\theta} + (1 - M_T) \odot I_{GT}
+\end{equation}
+
+这样透明区域的镜面高光被抑制，几何学习不会受到反射和折射效果的干扰。在属性建模上，每个高斯增加可学习透明度属性 $\tau_i \in [0,1]$（$\tau_i > 0.5$ 表示透明区域），通过渲染透明度掩码并施加 BCE 损失 $L_{\text{trans}}$ 来监督。第一阶段仅用漫反射颜色（标准 SH 表示），损失函数结合去光照图像的外观损失 $L_{s1}$、透明度损失 $L_{\text{trans}}$、法线正则化 $L_n$（包含先验法线一致性损失和深度-法线一致性损失）以及 PGSR 的平坦化正则化 $L_{\text{flatten}} = \sum_i \|(\log s_{i,1}, \log s_{i,2}, \log s_{i,3})\|_1$：
+
+\begin{equation}
+L_{\text{total,s1}} = L_{s1} + \lambda_t L_{\text{trans}} + \lambda_n L_n + \lambda_f L_{\text{flatten}}
+\end{equation}
+
+其中 $\lambda_t=0.1$, $\lambda_n=0.1$, $\lambda_f=100$。法线先验损失 $L_{np} = M_n (1 - N_p^T N_r)$ 使用鲁棒掩码 $M_n = \mathbb{1}(N_p^T N_r > \theta_n)$ 来忽略渲染法线与先验严重偏离的区域，防止不准确的先验损害几何质量。
+
+第二阶段（Appearance Refinement）在固定几何基础上学习复杂的透明外观效果。关键设计是冻结第一阶段学到的不透明度参数 $o_i$，防止外观损失相对于原始图像的优化破坏已建立的几何结构。为了捕捉透明物体强烈的视角依赖性（镜面高光、透射效果），TSGS 采用各向异性球面高斯（Anisotropic Spherical Gaussians, ASG）建模镜面分量——ASG 是一种方向敏感的基函数，能集中在一个特定方向上产生高响应，正好适合表示镜面高光的尖锐分布 $c_{i,s} = \psi(f_i, \gamma(\mathbf{d}_i), \mathbf{n}_i, -\mathbf{d}_i)$，其中 $\psi$ 为小型 MLP 解码器，$f_i$ 为 $K$ 个 ASG 基元的潜在特征，$\gamma$ 为位置编码。完整颜色为 $c_{i,2} = c_{i,d} + c_{i,s}$，用原始图像 $I_{GT}$ 监督，保留相同的正则化项。
+
+第三阶段（First-Surface Depth Extraction）在推理时提取首表面深度，这是 TSGS 的核心创新。朴素最近深度 $D_{\text{nearest}}(u) = \min_i \hat{d}_i(u)$ 系统性低估且受浮游高斯（floaters）严重干扰。TSGS 的方法是利用累积透射率 $T_i$ 沿射线的变化来定位首表面。对预测为透明的像素，TSGS 沿射线限定搜索范围 $T_i \in [T_{\text{end}}, T_{\text{start}}]$（忽略近处噪声和远处已穿过区域），在该区间内用固定大小的滑动窗口 $W_j$ 统计窗口内权重和 $W_{\text{sum}}(j) = \sum_{i \in W_j} T_i \alpha_i$，选择权重最大的窗口 $W^*$ 作为首表面交互区域。首表面深度由窗口内高斯的平面深度加权平均得出：
+
+\begin{equation}
+D_{\text{first}}(u) = \frac{\sum_{i \in W^*} T_i \alpha_i \hat{d}_i(u)}{\sum_{i \in W^*} T_i \alpha_i}
+\end{equation}
+
+其中 $\hat{d}_i(u) = d_i \mathbf{n}_i \cdot v_u / (v_u \cdot v_u)$ 为每个高斯的平面深度（基于 PGSR 的无偏深度原理）。这一设计同时解决了两个问题：限制在 $W^*$ 内的平均隔离了首表面的贡献，防止背景细节透过透明表面污染深度估计；窗口内的加权平均则对浮游高斯具有鲁棒性，因为它们通常具有低的 $T_i \alpha_i$ 权重或落在 $W^*$ 之外。
+
+\paragraph{透射率概率深度的半透明多层重建}
+
+TSGS 聚焦于单层透明表面，但半透明物体（如薄纱、烟雾）存在多个表面层，深度不再唯一。TSPE-GS（2025.11）~\cite{2511_09944} 在原始 3DGS 的训练环节引入基于透射率的概率深度框架——将透射率视为深度的累积分布函数，从中提取多峰深度并通过渐进式 TSDF 逐层重建——光度损失保持不变。TSPE-GS 解决的是半透明表面的多层重建问题。半透明物体（如薄纱、烟雾）的深度不唯一——同一射线上可能有多个表面。直觉上，如果沿射线逐步前进，每次遇到一个半透明层，透射率 $T$ 就下降一些；在完全不透明的表面处 $T$ 骤降至零。因此 TSPE-GS 的核心洞察是：沿射线的透射率 $T$ 本身可以充当深度 $d$ 的累积分布函数（CDF），即 $P(d_{p,g} < d) = 1 - T_d$，对应的概率密度函数为 $p(d) = -\mathrm{d}T_d / \mathrm{d}d \approx \alpha_d T_d$——恰与体积渲染中期望深度的权重一致。在不透明场景下，该 PDF 呈单峰高斯形态，峰值即表面位置；当存在半透明层时，PDF 自然呈现多峰混合高斯形态，每个峰对应一个可见表面深度 $\{\mu_k\} = \{d \mid p'(d) = 0, \, p''(d) < 0\}$。然而期望深度 $D^{\mathrm{exp}}_p = w_1\mu_1 + w_2\mu_2$ 和中值深度都落在两个峰之间，丧失物理意义。为此，TSPE-GS 提出三步策略：（1）对透射率均匀采样 $T' \in \{k/N \mid k=1,\ldots,N\}$，每次渲染时记录满足 $T_{p,g} < T'$ 的最近高斯的深度 $d_{p,g}$，再对所有视角的采样深度做核密度估计得到 PDF；（2）在视角级平均深度序列上检测局部极大值作为峰值深度，以抑制异常高斯引起的伪峰并降低计算量；（3）采用渐进式 TSDF 融合——先重建最外层表面并冻结其体素，再逐层重建内层，避免内外层深度互相干扰。该方法是首个在 3DGS 框架下实现半透明表面多层重建的工作。
+
+\paragraph{高斯值加权的光泽表面深度修正}
+
+半透明表面以外，光泽表面（金属、镜面）也构成特殊挑战。Unbiased Depth 2DGS（2025.03）~\cite{2503_06587} 修改了原始 2DGS 的深度正则化方式——用高斯值替代不透明度作为深度收敛损失的权重，并用累积不透明度替代累积透射率作为表面判定判据——训练流程保持不变。Unbiased Depth 2DGS 发现 2DGS 在光泽表面（如金属、镜面）上常出现孔洞。作者通过可视化分析揭示了根因：光泽表面仅在特定视角产生极高亮度的高光，而球谐函数无法拟合这种急剧变化的视角相关辐射，优化过程因此将一批高斯向表面内侧凹陷放置，专门负责复现高光；这些凹陷高斯仅在高光视角可见，在其他视角则被遮挡。问题被 2DGS 的深度失真损失进一步放大——该损失以不透明度为权重约束同一射线上的高斯相互靠近，高不透明度的凹陷高斯主导了损失计算，导致高斯向内凹的“伪表面”聚集。
+
+\textbf{两项修正。}为此作者提出两项修正：（1）深度收敛损失 $\mathcal{L}_{\mathrm{converge}} = \sum_{i=2}^{n} G_i(\mathbf{x}) \cdot (d_i - d_{i-1})^2$，用高斯值 $G_i$（不参与梯度计算）代替不透明度作为权重，使低不透明度的高斯也被平等对待，该损失类似 Dirichlet 能量最小化，驱动高斯向真实表面对齐；梯度计算中还引入缩放因子 $k=1.25$ 使 $d_i$ 方向的梯度被放大，加速凹陷高斯向相机方向移动。（2）修正深度判据：2DGS 原本以累积透射率 $T_i < 0.5$ 确定表面位置，但光泽区域的高斯普遍不透明度极低，透射率迟迟无法降至阈值，导致算法错过真实表面。作者改为使用累积不透明度 $O_i = \sum_{j=1}^{i}(\alpha_j + \epsilon)\, G_j(\mathbf{x})$（$\epsilon=0.1$），当 $O_i > 0.6$ 时判定为表面——该求和形式同时考虑高斯数量和不透明度，即使大量低不透明度高斯也能触发阈值，从而在光泽区域正确定位表面。
+
+\subsubsection{光照等特殊条件下的正则化}
+\label{subsec:04_1_6}
+
+本路线介绍在光照不一致、单目输入等特殊条件下引入额外正则化约束以改善几何重建的方法。
+
+\paragraph{SDF 耦合高斯不透明度的单目重建}
+
+前几节讨论的正则化方法都假设光照条件一致。当光照不一致（如户外场景在不同时间拍摄）或只有单目输入时，额外的处理必不可少。MonoGSDF（2024.11）~\cite{2411_16898} 修改了原始 3DGS 的不透明度参数化方式，将高斯不透明度与神经 SDF 场显式耦合，通过 SDF 值自动调节不透明度，渲染流程保持不变。MonoGSDF 通过耦合 3D 高斯与神经 SDF 实现单目图像的高质量表面重建。在标准 3DGS 中，高斯的不透明度 $\alpha_i$ 通过 $\alpha$-混合 直接优化，缺乏对高斯空间分布的约束，导致高斯往往散布在真实表面两侧而非紧贴表面，几何精度有限。MonoGSDF 的核心思路是引入一个基于多分辨率哈希网格的神经 SDF 场 $f(\mathbf{x}) = \phi(\mathbf{h}(\mathbf{x}), V(\mathbf{h}(\mathbf{x})))$（其中 $\mathbf{h}$ 为坐标归一化函数，$V$ 为哈希特征网格），并将高斯的不透明度与 SDF 值显式耦合——直觉是：表面上的点（SDF=0）应该最不透明，离表面越远越透明。每个高斯中心的 SDF 值 $\sigma_i = f(\boldsymbol{\mu}_i)$ 通过一个高斯形映射函数转化为不透明度：
+
+\begin{equation}
+g(\sigma_i) = \exp(-(\beta \sigma_i)^2) \cdot \alpha_i
+\end{equation}
+
+其中 $\beta$ 为控制衰减速率的超参数。这一设计的物理含义是：SDF 值为零的点恰好在表面上，映射后不透明度最高；偏离表面的点 SDF 绝对值增大，不透明度被自动压低。此前 3DGSR 使用的钟形函数在 $\sigma_i=0$ 时仅给出 $\alpha_i=0.25$，与“表面点应具有最大不透明度”的物理直觉相矛盾。MonoGSDF 的映射函数确保表面处不透明度达到 $\alpha_i$（接近 1），且数学形式简洁、计算高效。
+
+在 SDF 场的训练方面，一个关键挑战是如何获得可靠的三维监督信号。现有方法要么依赖单目深度先验（存在尺度模糊和跨视角不一致问题），要么仅在二维渲染深度图上监督，缺乏真正的三维约束。MonoGSDF 巧妙地利用高斯渲染深度图的多视角一致性作为桥梁：从渲染深度图 $\bar{D}$ 中采样像素，沿对应射线在表面附近采样 $K_n$ 个近表面点和 $K_f$ 个自由空间点，用渲染深度作为伪真值构建三维 SDF 监督：
+
+\begin{equation}
+\mathcal{L}_{ns} = \sum_{u_j \in U} \sum_{t_k \in S_{tr}} \|\bar{s}_k - (\bar{D}(u_j) - t_k)\|_2, \quad \mathcal{L}_{fs} = \sum_{u_j \in U} \sum_{t_k \in S_{fs}} \|\bar{s}_k - 1\|_2
+\end{equation}
+
+其中 $S_{tr} = \{t_k \mid |\bar{D}(u_j) - t_k| < tr\}$ 为截断区域内的近表面采样点（$tr$ 为截断距离），$S_{fs}$ 为远离表面的自由空间点。直觉上，近表面点的 SDF 值应接近其到表面的距离（即 $\bar{D}(u_j) - t_k$），而自由空间点的 SDF 值应被推向 $+1$（表示在表面外部）。这使得高斯与 SDF 形成正向循环：高斯渲染深度提供多视角一致的三维监督来训练 SDF，SDF 又通过不透明度耦合将高斯拉回表面。此外，MonoGSDF 引入单目几何线索辅助监督：先用深度估计器生成伪视差图 $\hat{Z}$，通过可学习的尺度-位移参数对齐为伪深度 $\hat{D} = a / (s \cdot \hat{Z} + t) + b$，再从对齐深度导出伪法线 $\hat{N} = \nabla \hat{D} / \|\nabla \hat{D}\|$，分别构建深度损失 $\mathcal{L}_D$ 和法线损失 $\mathcal{L}_N = (1 - \hat{N}^\top \bar{N})$。最终总损失为 $\mathcal{L} = \mathcal{L}_p + \mathcal{L}_{geo} + \mathcal{L}_{sdf} + \lambda_d \mathcal{L}_d + \lambda_n \mathcal{L}_n$，其中 $\mathcal{L}_p = 0.8|C_l - \hat{C}_l| + 0.2 \, \text{SSIM}(C_l, \hat{C}_l)$ 为基于小波变换的多分辨率光度损失。MonoGSDF 无需 Marching Cubes 等后处理步骤，可以直接从优化后的 SDF 场提取表面，在单目输入条件下实现了高质量的隐式表面重建。
+
+\paragraph{自适应 Gamma 校正与法线补偿}
+
+MonoGSDF 通过 SDF 耦合处理单目输入，但不直接处理多视角间光照不一致的问题。GS-3I（2025.03）~\cite{2503_12335} 在原始 3DGS 的训练环节引入自适应光照调整和法线补偿——用可学习的逐像素 Gamma 校正消除光照差异，并在光照误差大的区域用预训练法线作为补偿——光度损失保持不变。GS-3I 解决一个被忽视的问题：当训练图像在不同光照条件下拍摄时（如户外场景在不同时间拍摄），3DGS 的光度损失与几何约束存在矛盾——同一表面在不同光照下呈现不同颜色，光度损失迫使高斯偏离真实几何来匹配颜色差异。GS-3I 从单视图和多视角两个层面解决这一问题。
+
+单视图层面，GS-3I 提出自适应光照调整框架，采用粗-细两阶段设计。粗阶段为每张图像学习一个可调节的 Gamma 值范围 $[\gamma_{min}, \gamma_{max}]$，其中 $\gamma_{min} = a \cdot \sigma(b)$，$\gamma_{max} = c \cdot \sigma(d)$，$a, b, c, d$ 均为可学习参数。对图像中任意像素，根据其亮度在该图像累积分布函数（CDF）中的百分位排名 $p$ 进行线性插值，得到该像素专属的 Gamma 校正值：
+
+\begin{equation}
+\gamma(p) = \gamma_{min} + p \cdot (\gamma_{max} - \gamma_{min})
+\end{equation}
+
+直觉上，暗像素（$p$ 低）获得更强的 Gamma 增强以提升暗部细节，亮像素（$p$ 高）被适度抑制以避免过曝。整个图像经逐像素 Gamma 映射后得到粗校正结果 $I_{gm}(x,y) = [I_{gt}(x,y)]^{\gamma(x,y)}$。细阶段在此基础上引入轻量级 CNN（两层 $3\times3$ 卷积，64 通道和 1 通道），提取光照权重特征图并与可学习的场景光照图 $M$ 逐元素相乘，经双线性上采样后与渲染图像融合，生成精细光照调整结果 $I_{map}$。光照调整损失为 $\mathcal{L}_{illum} = (1-\beta) \cdot \text{L1}(I_{map}, I_{gm}) + \beta \cdot \text{SSIM}(I_{map}, I_{gm})$，$\beta = 0.2$。
+
+多视角层面，GS-3I 提出法线补偿机制应对跨视角光照不一致导致的几何偏差。核心观察是：当某像素的光照误差 $\mathcal{L}_{illum}(i)$ 超过阈值 $T$ 时，说明该处渲染颜色受光照干扰严重，几何估计可能已经偏离真值。此时 GS-3I 引入预训练法线模型（StableNormal）提供的鲁棒法线先验作为补偿：
+
+\begin{equation}
+\mathcal{L}_{normal}(i) = \begin{cases} 0 & \mathcal{L}_{illum}(i) \leq T \\ \|N_i^{pred} - N_i^{SN}\|_1 & \mathcal{L}_{illum}(i) > T \end{cases}
+\end{equation}
+
+其中 $N_i^{pred}$ 为模型预测法线，$N_i^{SN}$ 为 StableNormal 生成的参考法线。仅对光照误差大的像素施加法线补偿，避免在光照一致的区域引入不必要的先验偏差。进一步，GS-3I 加入法线梯度损失 $\mathcal{L}_{gradient} = \sum_{i=1}^{n} \|\nabla N_i^{pred} - \nabla N_i^{SN}\|_1$，约束预测法线的空间梯度与参考法线一致，确保法线场局部平滑且几何细节得以保留。最终总损失为 $\mathcal{L}_{total} = \lambda_1 \mathcal{L}_{illum} + \lambda_2 \mathcal{L}_{normal} + \lambda_3 \mathcal{L}_{gradient} + \lambda_4 \mathcal{L}_{mvs}$，其中 $\lambda_1 = 1.0$、$\lambda_2 = 0.15$、$\lambda_3 = 0.0015$、$\lambda_4 = 0.03$，$\mathcal{L}_{mvs}$ 为 PGSR 的多视角立体一致性损失。GS-3I 在光照不一致条件下实现准确的表面重建。
+
+\paragraph{种子引导的室内 2DGS 重建}
+
+GS-3I 从光照维度解决正则化问题，而室内场景面临的是另一类挑战：大面积无纹理区域（白墙、地板）导致初始化和致密化失败。2DDS-Room（2024.12）~\cite{2412_03428} 修改了原始 2DGS 的初始化和致密化机制——用种子引导的高斯分布替代基于光度误差的密度控制——渲染流程保持不变。2DGS-Room 是一个面向室内场景的综合重建框架。在标准 2DGS 中，高斯的初始化和致密化完全依赖各训练视角的光度误差，忽略了场景的底层几何结构，导致高斯无法准确贴合表面，尤其在大面积无纹理区域（如白墙、地板）表现不佳。2DGS-Room 提出种子引导的 2DGS 机制来从根本上解决这一问题。
+
+种子引导的核心思想是用一组离散种子点作为高斯分布的“骨架”。初始化阶段，首先对 SfM 点云进行置信度筛选——为每个点 $p_i$ 定义置信度 $O_{p_i}$：当其关联的特征匹配数 $m \geq \tau$ 时为 1，否则为 0 并剔除——再通过体素化将筛选后的点云下采样为一组种子点 $V \in \mathbb{R}^{N \times 3}$，体素尺寸为 $\delta$。每个种子点 $v_i$ 作为基础生成 $k$ 个 2D 高斯 $\{G_{i,j}\}$，每个高斯的位置由可学习偏移量 $O_{i,j} \in \mathbb{R}^3$ 决定：
+
+\begin{equation}
+p_{i,j} = v_i + O_{i,j}
+\end{equation}
+
+这样高斯的初始分布就与场景的真实几何结构紧密对齐，而非随机散布在空间中。训练过程中，2DGS-Room 采用梯度引导的生长策略和基于贡献度的剪枝策略动态调整种子密度：当某体素内高斯在 $N_g$ 次迭代中的平均梯度 $\bar{g}_v$ 超过阈值 $\theta_g$ 时，说明该区域结构复杂度高，引入额外种子点增强表达；当某种子的关联高斯在 $N_p$ 次迭代中的累积不透明度 $\alpha_v$ 低于阈值 $\theta_p$ 时，说明该种子对场景渲染贡献微乎其微，予以剪枝。
+
+\textbf{深度与法线监督。}在几何监督方面，2DGS-Room 集成单目深度和法线先验。深度监督通过尺度-位移不变损失对齐渲染深度 $\hat{D}$ 与参考深度 $D_{ref}$：先用最优尺度 $s$ 和位移 $t$ 调整渲染深度得到 $\hat{D}_{aligned} = s\hat{D} + t$，再计算 $\mathcal{L}_d = \frac{1}{|V_d|} \|\hat{D}_{aligned} - D_{ref}\|^2 + \lambda_{grad} \mathcal{L}_{grad}$，其中 $\mathcal{L}_{grad}$ 惩罚相邻像素的深度突变，增强局部平滑性。法线监督则同时约束法线的大小和方向：$\mathcal{L}_n = \lambda_1 \cdot \frac{1}{|V_n|} |\bar{N} - \hat{N}| + \lambda_{\theta} \cdot \frac{1}{|V_n|}(1 - \frac{\hat{N}^\top N_{ref}}{\|\hat{N}\| \|N_{ref}\|})$。
+
+\textbf{多视角一致性约束。}此外，2DGS-Room 引入多视角一致性约束减少浮动伪影：对参考视角 $V_r$ 和邻域视角 $V_n$，通过单应矩阵 $H_{rn} = K_n(R_{rn} - \mathbf{t}_{rn}\mathbf{n}_r^\top / D_r)K_r^{-1}$ 做前向-后向投影，构建几何一致性损失 $\mathcal{L}_{geo} = \frac{1}{|V_e|} \sum_{p_r} \|p_r - H_{nr}H_{rn}p_r\|$，并用灰度归一化互相关（NCC）度量光度一致性 $\mathcal{L}_{pho}$。最终总损失为 $\mathcal{L} = \mathcal{L}_{rgb} + \lambda_d \mathcal{L}_d + \lambda_n \mathcal{L}_n + \mathcal{L}_{mv}$，其中 $\mathcal{L}_{mv} = \lambda_{geo}\mathcal{L}_{geo} + \lambda_{pho}\mathcal{L}_{pho}$。2DGS-Room 在室内场景的高保真几何重建上表现出色。
+
+\paragraph{单目深度初始化与聚类剪枝}
+
+2DGS-Room 用种子引导改善初始化，但仍依赖 COLMAP 点云。2D-SuGaR（2026.05）~\cite{2605_00569} 修改了原始 2DGS 的初始化来源——用单目深度估计替代 COLMAP 点云，并结合 DBSCAN 聚类剪枝移除离群高斯——训练流程保持不变。2D-SuGaR 将 SuGaR 的表面对齐思想扩展到 2DGS 框架，并引入单目深度/法线先验增强。其核心动机是解决 2DGS 对 SfM 初始化质量的强依赖：2DGS 的基线做法直接用 COLMAP 点云初始化高斯位置，在弱纹理区域（如白墙、地板）COLMAP 产生的点云稀疏且偏离真实表面，导致后续优化陷入局部最优。2D-SuGaR 的解决方案是用单目深度估计替代 SfM 初始化，并设计一组联合损失函数确保高斯对齐真实表面。
+
+具体而言，2D-SuGaR 首先用单目深度估计器预测每张图的深度图，再通过尺度校正将深度图反投影为 3D 点云，以此替代 COLMAP 点云作为高斯的初始位置。这使得即使 COLMAP 失败的区域也能获得合理的初始化。在优化阶段，2D-SuGaR 组合四项损失：
+
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_p + \lambda_c \mathcal{L}_c + \lambda_n \mathcal{L}_n + \lambda_d \mathcal{L}_d
+\end{equation}
+
+其中 $\mathcal{L}_p = 0.8 \mathcal{L}_1 + 0.2 \mathcal{L}_{\text{D-SSIM}}$ 是标准光度损失；$\mathcal{L}_c$ 是深度-法线一致性损失，约束每个高斯的法线方向 $\mathbf{n}_i$ 与渲染深度图的梯度方向 $\hat{\mathbf{N}}$ 一致；$\mathcal{L}_n = 1 - \hat{\mathbf{N}}^\top \hat{\mathbf{n}}$ 引入单目法线先验 $\hat{\mathbf{n}}$，防止渲染深度和法线同时偏移导致的退化（即深度和法线一致但都偏离真实表面）；$\mathcal{L}_d = \sum_{i,j} w_i w_j |z_i - z_j|$ 是深度畸变损失，惩罚沿射线方向的 Gaussian 分布过于分散。实验中取 $\lambda_c = 0.05$、$\lambda_n = 0.1$、$\lambda_d = 1000$——深度畸变权重远大于其他项，确保高斯紧密贴合表面。
+
+此外，2D-SuGaR 发现单目深度初始化会产生离群高斯（由深度估计误差或尺度不一致引起），而 2DGS 的自适应密度控制无法有效移除这些离群点，反而会将它们分裂成小孤岛。为此，2D-SuGaR 引入基于 DBSCAN（Density-Based Spatial Clustering of Applications with Noise，基于密度的聚类算法）的聚类剪枝策略：将高斯按空间位置聚类，保留最大簇，移除孤立岛状高斯。具体地，用 $k$-距离分布的第 90 百分位数确定 DBSCAN 半径 $\epsilon$，确保半径足够紧以区分孤岛和主簇，同时不过度剪裁边缘区域的真实几何。这一策略在训练早期移除虚假高斯，使 2D-SuGaR 对 COLMAP 点云质量和单目深度估计误差都具有鲁棒性，在多种室内外场景中以 10.5 分钟的训练时间实现了 Chamfer Distance 0.72 的高精度网格重建。
+
+\paragraph{三阶段解耦几何与外观训练}
+
+2D-SuGaR 用单目深度解决初始化问题，但法线正则化本身还有一个被忽视的副作用：强法线约束会让高斯变大变密，严重损害渲染质量。2DGS-R（2025.10）~\cite{2510_16837} 修改了原始 2DGS 的训练流程——将训练拆分为几何阶段、外观精调和定向增强三个阶段，在不同阶段选择性冻结/开放属性——渲染流程保持不变。2DGS-R 重新审视了 2DGS 中法线一致性正则化的根本矛盾：2DGS 的基线做法使用法线一致性损失 $\mathcal{L}_n = \sum_i \alpha_i(1 - \mathbf{n}_i^\top \hat{\mathbf{N}})$ 约束每个高斯法线 $\mathbf{n}_i$ 与渲染深度图梯度法线 $\hat{\mathbf{N}}$ 对齐，这虽然大幅提升了几何精度，但会导致渲染质量严重退化。2DGS-R 通过定量分析揭示了原因：法线一致性损失使高斯的空间覆盖度 $K_a = s_u \cdot s_v$（即缩放因子的乘积）和不透明度 $\alpha$ 同时增大——大而密的高斯有利于几何重建，但无法捕捉高频纹理变化（如斑点、细网格），两者对高斯属性的需求从根本上冲突。
+
+2DGS-R 的解决方案是三阶段解耦训练。第一阶段（几何阶段）使用强法线一致性正则化训练 2DGS，获得空间分布合理但外观粗糙的模型。训练完成后，计算每个高斯的颜色误差分数：
+
+\begin{equation}
+    E_i = \sum_{v=1}^{V} \sum_{i=1}^{N} \mathbb{L}(i,v) \cdot \mathbb{K}(i,v) \cdot |C_i^v - C_{gt}^v|
+\end{equation}
+
+其中 $\mathbb{L}(i,v)$ 判断高斯 $G_i$ 是否在视角 $v$ 的视锥体内，$\mathbb{K}(i,v)$ 判断对应像素是否在 $G_i$ 的投影范围内，$C_i^v$ 和 $C_{gt}^v$ 分别为渲染颜色和真值颜色。注意 $E_i$ 不考虑不透明度的影响，也不按像素数归一化——这一设计使得 $E_i$ 与 $K_a$ 正相关，更好地识别“大面积但颜色偏差高”的高斯。按 $E_i$ 降序排列后，取前 $K\%$ 为高误差高斯（HEG），其余为低误差高斯（LEG）。
+
+第二阶段（外观精调阶段）冻结所有 LEG 的全部属性，仅保留 HEG 的球谐系数可训练，且不再施加法线一致性损失。这保护了已经稳定的几何结构，同时允许高误差区域精调外观。第三阶段（定向增强阶段）针对 $K_a$ 过大、无法用颜色微调解决的区域：对 HEG 执行原位克隆（in-place clone），在相同位置生成新的小高斯，仅优化新高斯的球谐系数和不透明度。但为防止不透明度变化破坏几何，2DGS-R 采用冻结不透明度（freeze-opacity）策略——克隆时新高斯继承父高斯的不透明度并冻结，只调整球谐系数来捕捉细粒度颜色变化。这种“几何优先、外观跟进、定向增强”的渐进策略在保持几何精度的同时恢复了渲染质量。
+
+\paragraph{神经网络端到端预测 2DGS 参数}
+
+2D-SuGaR 用单目深度替代 COLMAP，但初始化后的优化仍然是传统梯度下降。QuickSplat（2025.05）~\cite{2505_05591} 则更激进：修改了原始 3DGS 的整个初始化和优化流程，用三个神经网络（初始化器、优化器、致密化器）替代 SfM + 梯度优化的传统管线，渲染流程保持不变。QuickSplat 提出用学习型初始化替代传统 SfM 初始化。其核心动机是：2DGS 的基线流程依赖 COLMAP 进行 SfM 点云重建作为初始化，但 COLMAP 在大规模室内场景中耗时极长（可达数十分钟），且在弱纹理区域（如白墙、天花板）产生的点云稀疏，直接导致表面出现孔洞。QuickSplat 的解决方案是训练三个神经网络（初始化器 $\phi_I$、优化器 $\phi_O$ 和致密化器 $\phi_D$），以端到端方式预测 2DGS 参数，从根本上绕过 COLMAP。
+
+QuickSplat 首先将场景离散化为体素网格（体素大小 $v_s$），每个体素关联一个 64 维潜特征 $f \in \mathbb{R}^{64}$，再通过小型 MLP 解码为 2DGS 基元参数。初始化器 $\phi_I$ 采用编码器-解码器的稀疏 3D 卷积架构（受 SGNN 启发），从 SfM 点云预测初始体素特征。关键设计是位置参数的参数化：高斯中心 $\mathbf{g}_c$ 定义为相对于体素中心 $\mathbf{v}$ 的偏移 $\mathbf{g}_c = \mathbf{v} + (2\sigma(\mathbf{x}) - 1) \cdot \delta$，其中 $\delta = 4v_s$ 限制偏移范围，$\sigma$ 为 sigmoid 函数。不透明度则复用最后一层上采样的占用率预测（受 PixelSplat 重参数化技巧启发），使渲染损失能反向传播到上采样层，控制哪些点被保留。初始化器的训练损失为 $\mathcal{L}(\phi_I) = \mathcal{L}_c + \mathcal{L}_o + \mathcal{L}_d + 0.01\mathcal{L}_\alpha + 10\mathcal{L}_{dist}$，其中 $\mathcal{L}_o$ 为占用率的二元交叉熵损失（利用激光扫描真值），$\mathcal{L}_d$ 为深度 L1 损失，$\mathcal{L}_\alpha$ 为法线余弦相似度损失。
+
+初始化之后，QuickSplat 进入致密化-优化循环。优化器 $\phi_O$ 是一个稀疏 3D UNet，以当前体素特征 $G_t$ 及其渲染损失梯度 $\nabla_G$ 为输入，预测更新量 $\Delta G_t$，执行 $G_{t+1} = G_t + \Delta G_t$（输出裁剪到 $[-1,1]$ 防止过冲）。致密化器 $\phi_D$ 在梯度大的区域生长新高斯，每步添加 $n(t) = s / 2^t$ 个体素（$s=20$，早期多后期少），并按占用率进行重要性采样——优先选择不透明度高的候选，因为这些“实体”高斯对表面几何贡献更大。整个循环执行 $T=5$ 步。QuickSplat 在 ScanNet++ 数据集上训练，学习到的初始化已经具有合理的几何分布，使后续优化只需少量迭代即可收敛，在大规模室内场景中避免了耗时的 COLMAP 过程，实现了 8 倍加速。
+
+\begin{takeaway}
+深度与法线正则化是最直接的几何改进路线，核心思想是利用单目深度/法线估计器或多视角匹配提供几何先验，作为额外正则化项约束高斯的空间分布。关键挑战在于先验的可靠性差异——CDGS 用置信度加权处理此问题，AmbiSuR 用球谐歧义指示器识别正则化最需要的区域。从 SfM 初始化到学习型初始化（QuickSplat）的演进则从根本上绕过了 COLMAP 瓶颈。
+\end{takeaway}
+
+%=====================================================================
+
+\subsection{近期方法脉络：几何-外观解耦}
+
+这一组近期工作延续 3DGS，主要把改动集中在扩展等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{Geometry Gaussians}
+Geometry Gaussians（2026.06）~\cite{2606_05124} 延续 3DGS 在“几何-外观解耦”上的基本设定，主要改变是：Geometry Gaussians：为每个splat增加独立geometry opacity，并可选使用transparency-curated优化流程。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：指出标准3DGS天然难以同时承载纹理和几何，提出单个额外几何不透明度参数作为简单有效的解耦机制。
+具体而言，方法在高斯属性中增加geometry opacity，用于几何监督和表面提取；appearance分支继续优化渲染质量，必要时通过透明度筛选优化减少几何/外观冲突。
+适用边界是：仍依赖几何输入或估计质量；透明度解耦对复杂半透明/薄结构可能不足。
+\section{SDF 与隐式表面引导}
+\label{sec:04_2}
+
+\subsection{问题背景：显式基元与隐式表面的鸿沟}
+
+深度与法线正则化通过外部先验约束高斯对齐表面，但高斯基元本身仍然是体积元素——它们没有被“改造”成表面元素。一个更根本的思路是引入隐式表面表示（SDF），让 SDF 定义“表面在哪里”，再引导高斯沿 SDF 的零水平集排列。
+
+SDF（Signed Distance Function）将空间中每个点映射到其到最近表面的带符号距离：表面内部为负，外部为正，表面上为零。SDF 天然提供表面位置（零水平集）、法线（梯度方向）和内外判断（符号），是理想的几何表示。然而，SDF 通常通过体渲染实现，计算开销大且难以实时渲染。3DGS 提供高效的光栅化渲染，但缺乏表面概念。
+
+SDF 与 3DGS 的融合因此成为一个自然的研究方向：能否让 SDF 的几何精度与 3DGS 的渲染效率兼得？本节的方法按融合方式分为三类：双分支联合优化（\S\ref{subsec:04_2_2}）、基于 2DGS 的隐式表面重建（\S\ref{subsec:04_2_3}）和基于牵引/对齐的 GS-SDF 融合（\S\ref{subsec:04_2_4}）。
+
+\subsubsection{3DGS-SDF 双分支联合优化}
+\label{subsec:04_2_2}
+
+本路线介绍在 3DGS 渲染分支之外引入并行 SDF 隐式场分支，通过双向引导实现高质量表面重建的方法。
+
+\paragraph{3DGS-SDF 双分支深度与法线互相引导}
+
+GSDF（2024.03）~\cite{2403_16964} 在原始 3DGS 的训练过程中引入了并行的 SDF 隐式场分支，用 NeuS + 多分辨率哈希网格作为独立的几何重建分支，与基于 Scaffold-GS 的渲染分支协同训练，光栅化渲染管线保持不变。
+
+\textbf{动机。} 单独优化 3DGS 会产生悬浮的浮动物（floaters），单独优化 SDF 会在表面留下孔洞——两种表示各有盲区，而两者恰好互补。其出发点是一个基本观察：单纯优化 3DGS 会产生悬浮在空中的浮动物（floaters），单纯优化 SDF 会在学习到的表面上留下孔洞，两种表示各有盲区。GSDF 的解决方案是构建双分支架构，3DGS 分支负责高效渲染，SDF 分支负责几何重建，两者通过三条互相引导机制协同工作。
+
+第一条机制是\textbf{深度引导的射线采样}（GS $\to$ SDF）。直觉上，SDF 分支需要知道”表面大概在哪里”才能在正确的位置密集采样，但 SDF 本身在训练初期并不准确。GSDF 的巧妙之处在于：3DGS 虽然几何不精确，但渲染的深度图至少给出了表面位置的粗略估计——这个估计”便宜”且”即时”。在标准 NeuS 中，SDF 分支需要自己预测 SDF 值来指导射线采样，这陷入了”先有鸡还是先有蛋”的困境：SDF 还没学好时采样位置不准确，采样不准又导致 SDF 学不好。GSDF 直接利用 3DGS 分支渲染的深度图来引导采样。具体地，对于从相机中心 $\mathbf{o}$ 沿方向 $\mathbf{v}$ 发出的射线，3DGS 分支渲染的深度值为
+\begin{equation}
+    D = \sum_{i=1}^{N} d_i \, \alpha_i \prod_{j=1}^{i-1}(1 - \alpha_j),
+\end{equation}
+
+其中 $N$ 是射线遇到的高斯数量，$d_i$ 是第 $i$ 个高斯到相机的距离，$\alpha_i$ 是其不透明度。虽然高斯渲染的深度不如传感器深度精确，但计算代价极低且无需任何额外硬件。获得 $D$ 后，SDF 分支不再在整个射线范围内均匀采样，而是将采样范围集中在 $\mathbf{o} + D\mathbf{v}$ 附近。采样区间根据当前位置的 SDF 预测值 $s = F_s(\mathbf{o} + D\mathbf{v})$ 自适应调整：粗采样阶段使用 $[\mathbf{o} + (D - 3|s|)\mathbf{v}, \; \mathbf{o} + (D + 3|s|)\mathbf{v}]$（系数 $k=3$，覆盖范围较宽），细采样阶段缩窄为 $k=1$，在表面附近密集采样。
+
+第二条机制是\textbf{几何感知的高斯密度控制}（SDF $\to$ GS）。直觉上，标准 3DGS 只看”渲染效果好不好”来决定是否增删高斯，而不管高斯”在几何上对不对”。SDF 场提供了一个全局一致的几何”地图”：如果一个高斯远离所有表面，它很可能是浮动物而非有用的高斯。标准 3DGS 的自适应密度控制仅依赖视图空间位置梯度和不透明度，无法区分”表面附近的高斯”和”悬浮在空中的浮动物”。GSDF 利用 SDF 零水平集提供几何先验：对位置为 $\mathbf{c}$ 的高斯查询其 SDF 值 $s = F_s(\mathbf{c})$，然后修改生长和剪枝判据。生长操作中，判定阈值为
+\begin{equation}
+    \tau_g = \bar{\tau}_g + \lambda_g \, \varphi(s), \quad \varphi(s) = \exp\!\left(-\frac{s^2}{2\sigma^2}\right),
+\end{equation}
+
+其中 $\bar{\tau}_g$ 是 Scaffold-GS 原有的基于梯度的平均阈值，$\varphi(s)$ 是一个高斯核函数将 SDF 值映射为正值因子——SDF 绝对值越小（越接近表面），$\varphi(s)$ 越大，该高斯越容易被判定为需要分裂或克隆。$\lambda_g$ 控制几何引导的强度。剪枝操作中，阈值改为
+\begin{equation}
+    \tau_p = \bar{\alpha} - \lambda_p(1 - \varphi(s)),
+\end{equation}
+
+其中 $\bar{\alpha}$ 是累积不透明度。SDF 绝对值大（远离表面）的高斯 $\varphi(s)$ 接近零，$(1-\varphi(s))$ 接近 1，剪枝阈值被拉低，更容易被剪掉。这一设计的核心思想是：不强迫高斯“变扁”（像 2DGS 那样），而是通过 SDF 信息让高斯\emph{更聪明地分布}——表面附近保留和增生，远离表面的区域清理掉。
+
+第三条机制是\textbf{双向几何监督}，确保两个分支渲染的深度和法线互相一致——如果一个分支说"这里是表面"，另一个分支不应说"这里是空白"。SDF 分支通过体渲染渲染深度图 $D_s$ 和法线图 $N_s$（法线由 SDF 梯度的体渲染累积得到），3DGS 分支同样渲染深度图 $D_g$ 和法线图 $N_g$（法线取每个高斯协方差矩阵最短轴方向，通过 $\alpha$-混合累积）。两者之间的互监督损失为
+\begin{equation}
+    \mathcal{L}_{\text{mutual}} = \lambda_d \|D_g - D_s\| + \lambda_n\left(1 - \frac{|N_g^\top N_s|}{\|N_g\|\|N_s\|}\right).
+\end{equation}
+
+最终训练总损失为 $\mathcal{L} = \mathcal{L}_g + \mathcal{L}_s + \mathcal{L}_{\text{mutual}}$，其中 GS 分支包含 $L_1$、SSIM 和体积正则化损失，SDF 分支包含 $L_1$、Eikonal 和曲率正则化损失。三条引导机制形成正向循环：3DGS 的深度引导 SDF 的射线采样 $\to$ SDF 学得更好 $\to$ SDF 零水平集更准确地引导高斯密度控制 $\to$ 3DGS 渲染的深度图更精确 $\to$ 进一步改善 SDF 训练。
+
+\paragraph{哈希网格 SDF 松耦合约束高斯位置与朝向}
+
+GSDF 的双分支设计虽然有效，但两个分支（Scaffold-GS 和 NeuS）相对独立，信息只在深度和法线层面间接交换。3DGSR（2024.04）~\cite{2404_00409} 在原始 3DGS 的优化流程中引入了一个隐式 SDF 场，用多分辨率哈希网格 + MLP 作为共享的几何表示，通过松耦合策略约束高斯的位置和朝向，3DGS 的光栅化渲染管线保持不变。其核心设计围绕一个基本矛盾展开：3DGS 擅长拟合外观但不管几何，SDF 定义了几何但需要密集监督信号。
+
+3DGSR 引入一个用多分辨率哈希网格 + 单层 MLP 实现的隐式 SDF 场 $f: \mathbb{R}^3 \to \mathbb{R}^1$，场景表面即为 SDF 的零水平集 $S = \{\mathbf{x} \in \mathbb{R}^3 \mid f(\mathbf{x}) = 0\}$。关键问题是：如何将 SDF 场与 3DGS 的不透明度连接起来？
+
+3DGSR 探索了两种耦合策略。直觉上，紧耦合相当于"几何直接决定渲染"——越靠近表面的高斯越不透明，远离表面的自动变透明；松耦合则相当于"几何只是建议渲染"——SDF 只约束高斯该朝哪里站、面朝哪个方向，但不干涉它"多亮"。
+
+\textbf{紧耦合}（tight coupling）用一个可微的 SDF-不透明度映射函数直接绑定两者。具体地，SDF 值通过一个钟形函数转化为高斯不透明度：
+
+\begin{equation}
+    \alpha_{\text{SDF}}(f(\mathbf{x})) = \frac{e^{-\beta f(\mathbf{x})}}{(1 + e^{-\beta f(\mathbf{x})})^2},
+\end{equation}
+
+其中 $\beta$ 是一个可学习参数，控制映射函数的锐度。直觉上，表面上 $f(\mathbf{x})=0$ 处不透明度最高，偏离表面的点不透明度被压低。通过最小化光度重建损失 $\mathcal{L}_c = \lambda \mathcal{L}_{\text{SSIM}} + (1-\lambda)\mathcal{L}_1$，对渲染贡献大的高斯被迫使对应位置的 SDF 值趋近于零，从而被“拉”到表面附近。然而，紧耦合在实践中有一个问题：外观的频率（纹理细节）与表面的频率（几何形状）往往不一致——一把纹理丰富的椅子可能有平坦的低频表面，需要大量非均匀分布的高斯来拟合纹理。紧耦合会在高斯密集区域强制 SDF 值为零，导致噪声表面。
+
+因此，3DGSR 默认采用\textbf{松耦合}（loose coupling）策略：不直接约束不透明度，而是从 SDF 表面出发约束高斯的位置和朝向。具体包含两个正则化项。第一，\textbf{朝向对齐}：每个高斯的方向取其协方差矩阵最短轴方向 $\mathbf{n}_g$，SDF 场在该点的法线为 $\nabla f(\mathbf{x}_g)$，最小化朝向对齐损失：
+
+\begin{equation}
+    \mathcal{L}_a = \|1 - \mathbf{n}_g^\top \nabla f(\mathbf{x}_g)\|.
+\end{equation}
+
+这使高斯的最短轴与表面法线对齐，让高斯“平躺”在表面上，但不直接压扁其形状。第二，\textbf{距离约束}：计算每个高斯在 SDF 表面上的最近点 $\mathbf{x}_{\text{nearest}} = \mathbf{x}_g + f(\mathbf{x}_g)\nabla f(\mathbf{x}_g)$，用 $L_1$ 损失最小化高斯到表面的距离。
+
+松耦合只约束方向和距离，不碰不透明度，因此不会干扰高频外观的学习。实验表明这一策略能减少 20\% 的高斯数量而不降低（甚至提升）渲染质量。
+
+然而，仅靠高斯位置的稀疏监督不足以正则化连续的 SDF 场——3DGS 的离散高斯只覆盖表面附近，自由空间中的 SDF 值缺乏约束，会产生悬浮伪影。3DGSR 的第二项关键设计是用\textbf{体渲染正则化}提供密集监督。具体地，对每条射线 $\mathbf{p}(t) = \mathbf{r}_o + t\mathbf{r}_d$，从 SDF 场出发用 NeuS 的体渲染公式累积深度和法线：
+
+\begin{equation}
+    \hat{D}(\mathbf{r}) = \sum_{i=1}^{M} T_i^\mathbf{r} \alpha_i t_i^\mathbf{r}, \quad \hat{N}(\mathbf{r}) = \sum_{i=1}^{M} T_i^\mathbf{r} \alpha_i \mathbf{n}_i^\mathbf{r},
+\end{equation}
+
+其中 $\mathbf{n}_i = \nabla f(\mathbf{x}_i)$ 是 SDF 梯度，透明度 $T_i^\mathbf{r} = \prod_{j=1}^{i-1}(1-\alpha_j)$，$\alpha_i$ 由 NeuS 的 Sigmoid 密度转换得到。然后用 3DGS 光栅化渲染的深度 $D$ 和法线 $N$ 作为伪真值监督：
+
+\begin{equation}
+    \mathcal{L}_{D} = \sum_{\mathbf{r} \in \mathcal{R}}\|D(\mathbf{r}) - \hat{D}(\mathbf{r})\|_2, \quad \mathcal{L}_{N} = \sum_{\mathbf{r} \in \mathcal{R}}\|N(\mathbf{r}) - \hat{N}(\mathbf{r})\|_1 + \|1 - N(\mathbf{r})^\top \hat{N}(\mathbf{r})\|_1.
+\end{equation}
+
+体渲染沿整条射线采样（包括自由空间），因此 SDF 场的所有区域都获得监督，消除了悬浮伪影。总损失为 $\mathcal{L} = \mathcal{L}_c + \lambda_1 \mathcal{L}_{D} + \lambda_2 \mathcal{L}_{N} + \lambda_3 \mathcal{L}_a + \lambda_4 \mathcal{L}_{\text{eik}}$，实验中 $\lambda_1=1.0, \lambda_2=0.1, \lambda_3=0.0001, \lambda_4=0.1$。值得注意的是，3DGSR 不需要颜色预测 MLP（只用几何线索监督 SDF），训练速度比纯隐式方法快 20 倍以上（30 分钟 vs. 12 小时）。
+
+\paragraph{SDF 全局致密化与单目先验的室内重建}
+
+前述方法在通用场景上取得了良好效果，但面对室内场景的特殊挑战（大面积无纹理区域如白墙、地板，以及丰富的细小结构如桌腿、椅背）仍力不从心。GaussianRoom（2024.05）~\cite{2405_19671} 在原始 3DGS 的训练过程中引入了 SDF 隐式场和单目几何先验，用 SDF 全局致密化策略在无纹理区域"凭空"生成新高斯，用边缘和法线先验弥补几何监督信号的不足，光栅化渲染管线保持不变。
+
+GaussianRoom 的 SDF 分支同样采用多分辨率哈希网格 + 单层 MLP 表示。与 GSDF 相比，GaussianRoom 的互相学习机制有显著增强。在\textbf{SDF 引导高斯分布}方面，除了 GSDF 风格的密度控制和剪枝外，GaussianRoom 新增了\textbf{全局致密化}策略。原始 3DGS 只能在已有高斯附近分裂产生新高斯，无法在完全没有高斯的区域“凭空”生成新高斯。室内场景的无纹理区域恰恰缺少初始高斯（COLMAP 难以在这些区域匹配特征点），导致表面重建出现空洞。GaussianRoom 的解决方法是：将场景空间划分为 $N^3$ 个立方体网格，计算每个网格中心的 SDF 值 $S_c$，若 $S_c < \tau_s$（接近表面）且该网格内高斯数量不足 $N_g < \tau_n$，则选取网格中心点的 $K$ 个最近邻高斯，从它们的属性分布中采样生成 $K$ 个新高斯。这一策略让 SDF 场的几何信息直接“填充”高斯稀疏区域。
+
+在已有的密度控制和剪枝方面，GaussianRoom 将"离表面多远"和"多不透明"这两个独立指标合并为一个综合判据——直觉上，一个"既远离表面又几乎透明"的高斯几乎可以确定是浮动物，应该优先剪掉：
+
+\begin{equation}
+    \omega = \alpha \cdot \exp\!\left(-\frac{S^2}{\sigma^2}\right),
+\end{equation}
+
+其中 $\alpha$ 是高斯不透明度，$S = f_g(\mathbf{x})$ 是该高斯的 SDF 值，$\sigma$ 是控制衰减速率的系数。当 $\omega$ 低于阈值 $\tau_p$ 时剪枝，高于阈值 $\tau_d$ 且视图空间梯度足够大时致密化。与 GSDF 的 $\varphi(s)$ 独立于梯度的设计不同，GaussianRoom 的 $\omega$ 将 SDF 距离和不透明度相乘，使得远离表面\emph{且}不透明度低的高斯被优先剪除，避免在高梯度纹理区域误删有效高斯。
+
+在\textbf{高斯引导 SDF 采样}方面，GaussianRoom 沿用了 GSDF 的深度引导思路，但采样区间定义为 $r = [\mathbf{o} + (D(\mathbf{p}) - \lambda|S|)\mathbf{v}, \; \mathbf{o} + (D(\mathbf{p}) + \lambda|S|)\mathbf{v}]$，其中 $\lambda$ 是控制采样范围宽度的超参数。
+
+GaussianRoom 的独特贡献在于引入两类\textbf{单目几何先验}。第一类是\textbf{边缘先验}（edge prior）：用预训练的边缘检测网络生成边缘图，在边缘密集区域增加射线采样权重。具体地，对图像 $I_i$，计算其边缘像素占比权重 $\mu_i = N_{\text{edge}}^i / (H \times W)$，采样时 $\mu_i \cdot q$ 条射线来自边缘区域，$(1-\mu_i) \cdot q$ 条来自随机区域。同时，光度损失中也用 Sigmoid 映射的边缘值加权 $w_p = 2\sigma(e_p)$，让细小结构在优化中获得更大的梯度信号。第二类是\textbf{法线先验}（normal prior）：用单目法线估计器生成伪法线图，同时监督 SDF 分支和 3DGS 分支渲染的法线图，为无纹理的大平面（墙壁、地板）提供可靠的几何约束。总损失为 $\mathcal{L} = \mathcal{L}_{\text{gs}} + \mathcal{L}_{\text{sdf}}$，其中 GS 分支损失为 $\lambda_1 \mathcal{L}_c + (1-\lambda_1)\mathcal{L}_{\text{D-SSIM}} + \lambda_2 \mathcal{L}_{\text{normal}}$，SDF 分支损失为 $\mathcal{L}_c + \mathcal{L}_{\text{normal}} + \lambda_{\text{eik}}\mathcal{L}_{\text{eik}}$。
+
+\paragraph{八叉树 SDF 初始化的四阶段交替优化}
+
+GS-Octree（2024.06）~\cite{2406_18199} 修改了原始 3DGS 的初始化和正则化环节，用八叉树 SDF 的零水平集替代 SfM 稀疏点云来初始化高斯位置，用 SDF 值约束高斯的不透明度和缩放，四阶段交替优化让 SDF 和 GS 互相纠错。其出发点是一个关键观察：在体渲染框架下，仅靠八叉树细分的粗 SDF 场难以消除孔洞、裂缝和凹陷等几何伪影，而 3DGS 优化过程中高斯中心会自然向物体表面聚集。基于这一互补性，GS-Octree 设计了四阶段交替优化流水线。
+
+\textbf{阶段一：八叉树 SDF 初始化。}在八叉树叶节点的网格点上存储 SDF 值 $s_{ij}=S(\mathbf{p}_{ij})$ 和球谐系数 $\mathbf{a}_{ij}$，通过三线性插值计算任意点的属性，再用体渲染合成图像进行监督。直觉上，正则化 SDF 场的目标是让距离值"既光滑又锐利"——在平坦区域平滑过渡，在表面附近保持锐利。由于八叉树是显式数据结构（缺少神经网络的归纳偏置），标准的 Eikonal 损失容易使距离值陷入局部极小值，因此 GS-Octree 改用 \emph{singular-Hessian 损失}来正则化 SDF 场：
+
+\begin{equation}
+L_{\text{Hessian}} = \frac{1}{N_s}\sum_{i=1}^{N_s}\|H_S(\mathbf{p}_s^i)\|_1,
+\end{equation}
+
+其中 $H_S$ 是 SDF 场的二阶 Hessian 矩阵，$\mathbf{p}_s^i$ 为零水平集附近的采样点。该损失既能避免局部极小值又能保留几何细节，比通用的拉普拉斯平滑更适合距离场。八叉树深度从 $l{=}6$ 逐步增至 $l{=}7$，阶段一的总损失为 $L_1 = L_{\text{col}} + \lambda_h L_{\text{Hessian}} + \lambda_e L_{\text{relax-eik}} + \lambda_l L_{\text{lap}} + \lambda_t L_{\text{tv}}$，其中 $\lambda_h{=}10^{-9}$，$\lambda_e{=}10^{-6}$，$\lambda_l{=}10^{-10}$，$\lambda_t \in (10^{-5}, 10^{-3}]$（场景越亮取值越大）。
+
+\textbf{阶段二：SDF 引导高斯初始化。}将阶段一得到的粗 SDF 零等值面用 Marching Cubes 提取为网格 $M_o$，以 $M_o$ 的顶点作为高斯基元的初始中心 $G_p$，在 3DGS 流水线中优化 7k 次迭代。这一步让高斯从表面附近出发，而非从随机或 SfM 稀疏点云出发，为后续几何精炼奠定基础。
+
+\textbf{阶段三：高斯反哺 SDF 精炼。}优化后的高斯中心 $G_p$ 大部分围绕表面分布，但并非精确落在表面上，不能直接用于重建隐式表面。为此，GS-Octree 定义了 \emph{GS-points 损失}，让重建的隐式表面恰好包裹高斯中心：
+
+\begin{equation}
+L_{\text{GS}} = \frac{1}{N_g}\sum_{i=1}^{N_g}(S(\mathbf{p}_g^i) - \delta_g), \quad \mathbf{p}_g^i \in G_p,
+\end{equation}
+
+其中 $\delta_g{=}{-}0.01$ 是松弛项，容忍 $G_p$ 中的少量噪声。阶段三中 $\lambda_h$ 从 $10^{-9}$ 递减至 $10^{-13}$，$\lambda_g$ 从 $10^{-1}$ 递减至 $10^{-3}$，八叉树细分至 $l{>}8$ 时关闭总变差项。这一阶段让 SDF 在高斯中心提供的几何线索下逐步精化。
+
+\textbf{阶段四：SDF 引导 3DGS 再优化。}得到精细 SDF 后，GS-Octree 利用 SDF 值对 3DGS 施加额外约束。\emph{不透明度损失}将 SDF 值映射为期望不透明度：
+
+\begin{equation}
+o_{\text{est}} = \frac{4e^{-kS(\mathbf{p}_i)}}{(1+e^{-kS(\mathbf{p}_i)})^2} \;\;(|S(\mathbf{p}_i)|<\tau), \quad 0 \;\;(|S(\mathbf{p}_i)|\geq\tau),
+\end{equation}
+
+当高斯位于表面上（$S{=}0$）时 $o_{\text{est}}{=}1$，远离表面时趋近于 0，阈值 $\tau{=}0.05$。\emph{缩放损失}鼓励高斯呈薄板状：$L_{\text{scale}} = \min(s_1, s_2, s_3)$，最小化最小缩放因子迫使高斯变扁平以贴合表面。最终阶段损失为 $L_{\text{final}} = L_1 + (1{-}\lambda_\alpha)L_{\text{D-SSIM}} + \lambda_o L_{\text{opacity}} + \lambda_s L_{\text{scale}}$，其中 $\lambda_o{=}0.1$，$\lambda_s{=}3$。这套 SDF 引导策略有效减少了远离表面或深埋物体内部的冗余高斯，使最终 3DGS 表示更加紧凑且几何精确。
+
+八叉树结构使 SDF 场的计算复杂度与场景表面积而非体积成正比，在大规模场景中显著提升了效率。GS-Octree 特别适合强光照条件下的物体级 3D 几何重建。
+
+\paragraph{共享哈希编码器的锚点替换式 GS-SDF 融合}
+
+SplatSDF（2024.11）~\cite{2411_15468} 修改了原始 3DGS 的 SDF 预测架构，用一个共享的哈希编码器让 SDF 嵌入和高斯嵌入处于同一特征空间，再用"锚点替换"策略仅在表面附近融合 GS 信息，训练完成后可完全丢弃 3DGS 分支，仅用 SDF-NeRF 渲染。其核心动机是：纯 SDF-NeRF 从零学习 SDF 场需要大量迭代才能收敛，而已训练好的 3DGS 模型已经隐含了丰富的几何信息（高斯中心靠近表面、协方差反映局部形状、不透明度编码了密度分布）。如果能将这些现成的几何线索注入 SDF 预测网络，就能大幅加速收敛。然而，3DGS 中存在大量远离表面的"虚假高斯"（spurious Gaussians），如果简单地将所有高斯特征与 SDF 网络融合，虚假高斯的错误几何信号会污染 SDF 场，导致表面凹凸不平。
+
+为此，SplatSDF 设计了两个关键模块来精准提取和利用 3DGS 的几何信息。直觉上，第一个模块将每个高斯"翻译"成 SDF 网络能理解的特征语言，第二个模块只在"可信"的位置（表面附近）才听 GS 的"建议"。
+
+\textbf{3DGS 聚合器（3DGS Aggregator）。}为了给每个高斯构建一个编码其几何属性的特征向量，SplatSDF 共享同一个哈希编码器 $h$ 来生成 SDF 嵌入和高斯嵌入，确保两者的特征空间一致：
+
+\begin{equation}
+e_{\text{sdf}}(\mathbf{x}) = h(\mathbf{x}), \quad e_g(G) = f_{\text{agg}}\big(h(\mu(G)),\; \Sigma(G),\; c(G),\; \text{SH}(G)\big),
+\end{equation}
+
+其中 $f_{\text{agg}}$ 是一个小型 MLP，$\mu$、$\Sigma$、$c$、$\text{SH}$ 分别是高斯的中心位置、协方差、颜色和球谐参数。注意这里不包含不透明度 $\alpha$，因为它在后续融合阶段扮演特殊角色。共享哈希编码器的设计确保了 $e_{\text{sdf}}$ 和 $e_g$ 处于同一特征空间，这是推理阶段可以完全丢弃 3DGS 的关键——因为 SDF 嵌入已经吸收了 3DGS 的几何先验。
+
+\textbf{稀疏 3DGS 融合（Sparse 3DGS Fusion）。}直接在射线上所有查询点融合高斯特征会导致虚假高斯污染 SDF。SplatSDF 的解决方案极为巧妙：每条射线只在一个“锚点”处替换 SDF 嵌入为 GS 嵌入，其余点仅使用 SDF 嵌入。具体地，先用 3DGS 渲染的深度图找到射线与表面的首个交点 $\mathbf{x}_r$ 作为锚点，然后在 $\mathbf{x}_r$ 处通过加权融合汇聚邻近高斯的特征：
+
+\begin{equation}
+e_{\text{gs}}(\mathbf{x}, \mathcal{G}) = \frac{1}{K}\sum_{G \in \text{KNN}(\mathbf{x}, \mathcal{G})} e_g(G) \cdot w(\mathbf{x}, G) \cdot \alpha(G),
+\end{equation}
+
+其中 $w(\mathbf{x}, G) = \exp\!\big({-}\tfrac{1}{2}(\mathbf{x}{-}\mu(G))^\top\Sigma(G)^{-1}(\mathbf{x}{-}\mu(G))\big)$ 是 3D 高斯权重函数（将 3DGS 的 2D EWA 混合推广到 3D 空间），$\alpha(G)$ 是高斯不透明度。SDF 预测公式为 $f_S(\mathbf{x}) = f_{\text{sdf}}(\text{Fuse}(e_{\text{sdf}}(\mathbf{x}), e_{\text{gs}}(\mathbf{x}, \mathcal{G})))$，其中 Fuse 函数仅在锚点 $\mathbf{x}_r$ 处用 $e_{\text{gs}}$ 替换 $e_{\text{sdf}}$，其余点保持 $e_{\text{sdf}}$ 不变。
+
+这种“锚点替换”策略的效果是：GS 嵌入只在表面附近被使用，远离表面的虚假高斯不会影响 SDF 预测。相比“在射线上所有点做密集拼接+MLP回归”的朴素融合方案，稀疏融合不仅避免了表面伪影，还将计算量大幅降低——每条射线只需计算一次 GS 嵌入。KNN 搜索通过体素哈希加速，复杂度从 $O(|X||\mathcal{G}|)$ 降至 $O(|X||\mathcal{G}|/L^3)$。
+
+训练损失沿用 Neuralangelo 的组合：$L = L_{\text{RGB}} + w_{\text{eik}} L_{\text{eik}} + w_{\text{curv}} L_{\text{curv}}$，其中光度损失 $L_{\text{RGB}} = \|\hat{C} - C\|_1$，Eikonal 损失 $L_{\text{eik}} = \frac{1}{N}\sum_i(\|\nabla f_{\text{sdf}}(\mathbf{x}_i)\|_2 - 1)^2$ 保证 SDF 梯度模为 1，曲率损失 $L_{\text{curv}} = \frac{1}{N}\sum_i|\nabla^2 f_{\text{sdf}}(\mathbf{x}_i)|$ 平滑 SDF 场。推理时 3DGS 聚合器完全不再需要，仅用 SDF-NeRF 即可渲染和提取表面。SplatSDF 的收敛速度比纯 SDF-NeRF 快 3 倍，几何和光度精度均优于当时的 SOTA。
+
+\paragraph{SDF 值直接调制高斯不透明度的单分支方案}
+
+DiGS（2025.09）~\cite{2509_07493} 在原始 3DGS 的高斯基元表示中直接嵌入了 SDF 值，用 SDF 值调制每个高斯的不透明度（在表面上的高斯不透明度最高，远离表面的自动变透明），取代了原始 3DGS 中独立的不透明度参数，整个系统只有一个分支，无需双分支对齐。
+
+\textbf{动机。} 之前的双分支方法（如 GSDF）需要复杂的互正则化和通信机制来保持 SDF 与 3DGS 一致，且容易出现几何-外观错位——将 SDF 直接嵌入高斯基元可以消除这种双分支的维护负担。其出发点是：之前的双分支方法（如 GSDF）将几何和外观分成独立的 SDF 分支与 3DGS 分支，需要复杂的互正则化和通信机制来保持两者一致，且容易出现几何-外观错位。
+
+\textbf{统一 SDF-Gaussian 表示。}直觉上，DiGS 的策略是"让高斯自己知道自己在不在表面上"——每个高斯不仅携带颜色和形状参数，还携带自己的 SDF 值，这个值同时决定了它"该不该被看到"。DiGS 在八叉树 LoD（Level-of-Detail）结构上定义高斯基元。LoD 的核心思想是"远处用粗略表示、近处用精细表示"，类似于地图的缩放。八叉树每一层 $l=0,1,\ldots,L_{\max}$ 对应体素尺寸 $s_l = s_0 \cdot 2^l$（$s_0$ 为基础体素尺寸），粗层覆盖大面积区域，细层捕捉局部细节。每个体素分配 $k$（默认为 10）个高斯基元，其位置相对于体素中心参数化：
+
+\begin{equation}
+\{p_0, \ldots, p_{k-1}\} = \{\mathbf{x}_v + C_0 L_0, \ldots, \mathbf{x}_v + C_{k-1} L_{k-1}\},
+\end{equation}
+
+其中 $\mathbf{x}_v$ 是体素中心，$C_i \in \mathbb{R}^3$ 是可学习偏移量，$L_i \in \mathbb{R}^3$ 是可学习缩放因子。这种"神经位置编码"允许同一单元格内的多个高斯沿不同表面结构排列。每个高斯中心的 SDF 值通过 IDW 插值（Inverse Distance Weighting，反距离加权插值，即离查询点越近的网格点贡献越大的权重）解码：$F(\mathbf{p}) = \sum_{i=1}^{8} \frac{w_i}{\sum_j w_j} f_i$，其中 $w_i = 1/(\|\mathbf{x}_i - \mathbf{p}\| + \epsilon)$，再由 MLP 解码为一维 SDF 值 $f(\mathbf{p})$。
+
+\textbf{SDF 调制不透明度。}直觉上，这一设计让"几何存在感"和"渲染可见性"变成同一件事——一个高斯如果不在表面上，它不仅几何上是"错误"的，渲染上也会自动"消失"。标准 3DGS 的不透明度从图像颜色间接学习，缺乏几何含义。DiGS 直接将每个高斯的 SDF 值映射为其不透明度：
+
+\begin{equation}
+\alpha_i = \exp\!\big({-}f(\mathbf{p}_i)^2 / \sigma^2\big),
+\end{equation}
+
+其中 $\sigma$ 是可学习的带宽参数，控制衰减速度。位于表面上（$f{=}0$）的高斯不透明度最高（$\alpha{=}1$），远离表面的高斯自动变得透明。这一映射将几何与渲染紧密耦合：偏离表面的高斯会自动失去渲染影响力，无需外部正则化来“惩罚”游离高斯。
+
+\textbf{几何引导的网格增长策略。}初始八叉树可能遗漏弱纹理或 SfM 稀疏区域的表面覆盖。DiGS 在训练第 5000 次迭代时触发增长过程：(1) 对每个训练视角用平面引导的深度估计生成稠密深度图 $D_i$ 和法线图 $N_i$；(2) 过滤掉掠射角观测和低置信度深度；(3) 将剩余表面点从粗到细插入 LoD 八叉树——若某层体素未被占据则创建新的高斯网格，新高斯的协方差按法线方向定向为薄板状：
+
+\begin{equation}
+\mathbf{S} = R \begin{pmatrix} s_t^2 & 0 & 0 \\ 0 & s_t^2 & 0 \\ 0 & 0 & s_n^2 \end{pmatrix} R^\top, \quad R = [\mathbf{a}_i, \mathbf{b}_i, \mathbf{n}_i],
+\end{equation}
+
+其中切向半径 $s_t{=}1.0$，法向半径 $s_n{=}0.1$，确保新高斯沿表面延展而非向法线方向膨胀。增长后对新参数使用临时提升的学习率，对旧参数略作降低，随后逐步统一，保持训练稳定性。修剪策略移除低不透明度或大 SDF 绝对值的冗余高斯，保持表示紧凑。
+
+\textbf{损失函数。}总损失为 $L = L_{\text{rgb}} + L_s + L_{\text{geo}} + L_{\text{SDF}}$，其中 SDF 损失包含中心损失 $L_{\text{sdf-center}} = \sum_i |f(\mathbf{p}_i)|^2$（驱动表面高斯的 SDF 趋近于零）和 Eikonal 损失 $L_{\text{Eikonal}} = \mathbb{E}_{\mathbf{x}}(\|\nabla f(\mathbf{x})\|_2 - 1)^2$（保证 SDF 梯度模为 1）；扁平化损失 $L_s = \lambda_6 \sum_i \min(s_4, s_5, s_6)$ 鼓励高斯呈薄板状；RGB 重建损失 $L_{\text{rgb}} = (1{-}\lambda_7)\|\hat{I} - I\|_1 + \lambda_7 \text{D-SSIM}(\hat{I}, I)$ 确保渲染质量。所有损失作用在统一管道上——改善几何对齐的 SDF 损失同时立即提升渲染质量，反之亦然，无需双分支的互正则化机制。DiGS 通过 SDF 嵌入、不透明度调制和几何引导增长的协同设计，在单一框架内实现了精确且完整的表面重建。
+
+\paragraph{Voronoi 图替代高斯椭球的表面网格生成}
+
+SDFoam（2025.12）~\cite{2512_16706} 用 Voronoi 图替代了原始 3DGS 的椭球基元——用可优化种子点定义的空间划分替代高斯椭球，同时联合学习一个全局 SDF 神经网络来控制每个 Voronoi 单元的密度——渲染采用可微光线追踪而非 tile-based 光栅化。其出发点是：3DGS 的椭球基元没有明确定义的表面，需要后处理（如 Marching Cubes、Poisson 重建）才能提取网格，而这些离散化方法本身会引入数值误差和拓扑伪影。SDFoam 使 Voronoi 结构本身就是表面网格——无需任何后处理提取。
+
+具体而言，场景由 $N$ 个可优化种子点 $P=\{p_i\}_{i=1}^N$ 定义 Voronoi 图（一种将空间划分为若干凸区域的空间结构，每个区域内的所有点到该区域种子点的距离比到任何其他种子点都近），每个种子点 $p_i$ 将空间划分为凸区域 $C_i=\{x \in \mathbb{R}^3 \mid \|x-p_i\| \leq \|x-p_j\|, \forall j \neq i\}$。每个 Voronoi 单元存储四类参数：密度值 $\sigma_i$、颜色 $c_i \in \mathbb{R}^3$、球谐系数 $h_i$ 和中心位置 $p_i$，所有参数在其 Voronoi 区域内视为分段常数。密度值 $\sigma_i$ 并非独立学习，而是由全局 SDF 网络 $f_\theta(x)$ 在中心点 $p_i$ 处的求值经过映射函数转换得到。直觉上，这一映射让"距离表面越近的单元密度越高"——类似于 GSDF 中 SDF 引导高斯密度的思路，但 SDFoam 在 Voronoi 结构的层面实现了它：
+
+\begin{equation}
+  \sigma_i = \phi_s\bigl(f_\theta(p_i)\bigr), \quad \phi_s(f) = \sigma\bigl(\beta f\bigr)\bigl(1-\sigma\bigl(\beta f\bigr)\bigr),
+\end{equation}
+
+其中 $\sigma(\cdot)$ 是 sigmoid 函数，$\beta$ 是可学习的锐度参数。这个映射函数（源自 NeuS 的设计）满足两个关键性质：在 SDF 零水平集处取最大值（颜色贡献集中在表面附近），且关于 $f_\theta$ 和 $\beta$ 完全可微。$\beta$ 越大，钟形分布越窄，表面越锐利。
+
+渲染采用可微光线追踪：对每条相机射线 $r(t)=o+td$，SDFoam 计算射线与 Voronoi 图的精确交截面序列，在第 $n$ 段（进出点 $t_n, t_{n+1}$，段长 $\delta_n$）内密度和颜色为常数，不透明度和透射率分别为 $\alpha_n=1-\exp(-\sigma_n \delta_n)$、$T_n=\prod_{k=1}^{n-1}(1-\alpha_k)$，像素辐射度为 $L=\sum_n T_n \alpha_n L_n$。因为段长 $\delta_n$ 由精确的射线-单元相交计算得到，它能随种子位置连续变化，梯度可以回传到 SDF 网络、密度和颜色参数。
+
+训练损失为 $\mathcal{L}=\mathcal{L}_\text{rgb}+\lambda_\text{eik}\mathcal{L}_\text{eik}$，其中 Eikonal 正则化 $\mathcal{L}_\text{eik}=\frac{1}{N}\sum_{i=1}^N(\|\nabla f_\theta(p_i)\|-1)^2$（$\lambda_\text{eik}=0.01$）确保 SDF 梯度的模接近 1，防止距离场畸变。训练中还周期性地进行剪枝和致密化：渲染贡献大的单元被分裂（中心点加扰动产生新种子），贡献小的单元被剪除，每次操作后重建 Voronoi 图。
+
+SDFoam 最具特色的是网格提取方式——完全不需要 Marching Cubes 或 Poisson 重建。训练完成后，先用 SDF 值过滤单元：仅保留 $|f_\theta(p_i)|<0.1$ 的近表面单元；然后对每个保留单元的面，仅保留至少三个顶点满足 $|f_\theta|<0.001$ 的面片。这些面片直接构成最终网格，天然与 Voronoi 拓扑一致，且每个面已附带学习到的颜色和纹理信息。SDFoam 的输出因此是一种“泡沫”结构——显式的 Voronoi 单元格配合隐式的全局 SDF，同时支持高效渲染和精确表面提取。
+
+\paragraph{稀疏体素 SDF 与锚定高斯双支架表示}
+
+Gaussian-Voxel Duet（2026.05）~\cite{2605_26616} 在原始 3DGS 的训练过程中引入了一个并行的稀疏体素 SDF 支架，用仅学习近表面局部 SDF 残差的稀疏体素提供几何锚点，通过两级牵引机制引导高斯分布，3DGS 的光栅化渲染保持不变。其核心问题是：纯 3DGS 的非结构化高斯基元在优化过程中会自由漂移以最小化光度误差，导致几何伪影（尤其在无纹理和稀疏视角区域），而单纯固定高斯位置又会牺牲视图依赖外观的表达能力。
+
+第一个支架是锚定高斯支架（anchor scaffold），继承自 Scaffold-GS 的设计：以 SfM 点初始化锚点，每个锚点动态管理 $k$ 个 2D 高斯基元 $\{G_0, G_1, \ldots, G_{k-1}\}$，根据视角参数预测基元属性。与标准 3DGS 不同的是，Gaussian-Voxel Duet 引入单目深度和法线先验（来自 Metric3D 和 StableNormal）做快速预热，使锚定 2DGS 在约 1 分钟内即可渲染出视图一致的几何。
+
+第二个支架是稀疏体素 SDF（voxel scaffold），将场景表面表示为一组靠近表面的稀疏体素，每个体素编码局部有符号距离 $f_v(x)$ 和颜色 $c_v$。关键设计是只学习近表面的局部 SDF 残差，而非覆盖整个场景的全局稠密 SDF——这大幅加速了收敛。体素的初始化采用“鸡生蛋”策略的巧妙解法：先利用已预热的锚定高斯渲染深度图，再通过 TSDF 融合将深度图转换为稀疏体素放置。
+
+两个支架之间的协同通过两级牵引机制实现。
+
+\textbf{显式锚定牵引}：对每个锚点 $A_i$，从体素 SDF 定义一个置信带 $B=\{x \in \mathbb{R}^3 \mid |f_v(x)| < \tau_d\}$，修改致密化和剪枝规则——致密化仅在梯度大且锚点在置信带内时触发，剪枝则在不透明度低或锚点超出置信带时触发，同时移除超出体素边界的所有锚定高斯。
+
+\textbf{隐式表面牵引}：对每个高斯基元位置 $p_k$，定义牵引损失
+\begin{equation}
+  \mathcal{L}_t = \sum_{k=1}^N \|f_v(p_k)\|_2,
+\end{equation}
+
+该损失用 $L_2$ 范数强惩罚远离表面的高斯（SDF 绝对值大），而赋予已靠近零水平集的高斯更大的移动自由度。梯度同时反向传播到体素 SDF 本身，形成双向协同优化。
+
+整体训练目标为 $\mathcal{L}=\mathcal{L}_\text{gs}+\mathcal{L}_v+\lambda_t\mathcal{L}_t$，其中锚定支架损失 $\mathcal{L}_\text{gs}=\mathcal{L}_c+\lambda_d\mathcal{L}_d+\lambda_n\mathcal{L}_n+\lambda_\text{md}\mathcal{L}_\text{md}+\lambda_\text{mn}\mathcal{L}_\text{mn}$ 包含光度、深度扭曲、法线一致性和单目先验损失，体素损失 $\mathcal{L}_v=\mathcal{L}_\text{vc}+\lambda_\text{vd}\mathcal{L}_\text{vd}+\lambda_\text{vn}\mathcal{L}_\text{vn}+\lambda_\text{eik}\mathcal{L}_\text{eik}$ 包含体素颜色、深度、法线和 Eikonal 正则化。单目先验权重按退火计划递减，体素支架每 1500 次迭代重置一次以消除过时初始化的影响。Gaussian-Voxel Duet 在保持快速训练和实时渲染的同时实现了 SOTA 级别的单目表面重建。
+
+\subsubsection{基于 2DGS 的隐式表面重建}
+\label{subsec:04_2_3}
+
+本路线介绍将 3D 高斯基元改造为 2D 面元（surfel）以直接实现表面重建的方法。前述双分支方法虽然有效，但引入了独立的 SDF 分支，增加了训练复杂度。另一条思路是直接改造高斯基元本身：将 3D 椭球"压扁"为 2D 面元（surfel），使每个基元天然代表一个表面片段，无需额外的 SDF 分支即可实现表面重建。本节的方法以 2DGS 为基础，探索了从直接高斯监督、多光照建模到开放表面重建的多种 SDF 融合策略。
+
+\paragraph{2D 面元替代 3D 椭球的几何优势}
+
+2D Gaussian Splatting（2024.03）~\cite{2403_17888}（2DGS）在第~\ref{ch:03}~章中已作为高斯基元改进讨论。在本章的表面重建语境下，需要理解 2DGS 的三个核心技术创新及其动机。
+
+\textbf{从 3D 椭球到 2D 面元。} 3DGS 用 3D 高斯椭球建模场景，每个基元有完整的三个缩放轴 $(s_u, s_v, s_w)$，在体积内部分布密度。问题在于：椭球没有明确定义的表面法线，导致从 3DGS 表示中提取一致的几何面几乎不可能。2DGS 将 3D 椭球坍缩为 2D 盘状面元（surfel），去掉第三个缩放轴（设为零），仅保留局部切平面上的两个缩放因子 $(s_u, s_v)$。每个 surfel 由中心点 $\mu_k$、两个主切向量 $t_u, t_v$ 和缩放参数定义，法线方向自然就是 $t_w=t_u \times t_v$。在局部切平面坐标 $(u,v)$ 下，surfel 的密度分布为
+\begin{equation}
+  G(u,v) = \exp\!\Bigl(-\frac{u^2+v^2}{2}\Bigr),
+\end{equation}
+
+这是一个标准的二维高斯——密度集中在盘面中心，法线方向即盘面的朝向，盘面本身就是表面的近似。
+
+\textbf{射线-片元交叉与透视正确泼溅。} 3DGS 使用仿射近似将 3D 高斯投影到 2D 图像平面，这种近似仅在投影中心附近准确，偏离中心越远误差越大。2DGS 改用基于齐次坐标的精确投影：对图像坐标 $\mathbf{x}=(x,y)$，将像素射线表示为两个正交平面的交线（$x$-平面 $\mathbf{h}_x=(-1,0,0,x)^T$、$y$-平面 $\mathbf{h}_y=(0,-1,0,y)^T$），变换到 surfel 的局部坐标系后直接解出交叉点 $(u,v)$。这种方法避免了矩阵求逆（3DGS 方法的数值不稳定来源），即使 surfel 从侧面被观察退化为线段时仍然稳定。为防止退化 surfel 在光栅化中被遗漏，2DGS 引入了一个低通滤波器：
+
+\begin{equation}
+  \hat{G}(\mathbf{x}) = \max\!\bigl(G(\mathbf{x}),\, \mathcal{G}_\sigma(\|\mathbf{x}-\pi(\mu_k)\|)\bigr),
+\end{equation}
+
+其中 $\mathcal{G}_\sigma$ 是一个固定半径（$\sigma=\sqrt{2}/2$）的屏幕空间高斯低通滤波，确保每个 surfel 至少覆盖足够的像素参与渲染。
+
+\textbf{深度正则化约束表面一致性。} 仅靠光度损失优化时，surfel 沿射线方向散布（多个半透明 surfel 可给出相同的颜色和深度），导致重建噪声。2DGS 引入两个正则化项。深度扭曲损失 $L_d=\sum_{i,j}\hat{w}_i\hat{w}_j|z_i-z_j|$（受 Mip-NeRF 360 启发）压缩射线上的权重分布，使所有 surfel 集中在同一个深度。法线一致性损失 $L_n=\sum_i\hat{w}_i(1-\mathbf{n}_i^T\mathbf{N})$ 将每个 surfel 的法线 $\mathbf{n}_i$ 与累积不透明度达到 0.5 处的深度图梯度法线 $\mathbf{N}$ 对齐，确保 surfel 局部贴合真实表面。最终训练损失为 $L=L_c+\lambda_d L_d+\lambda_n L_n$，其中 $\lambda_d=1000$（有界场景）或 $100$（无界场景），$\lambda_n=0.05$。2DGS 在 DTU 和 Tanks and Temples 基准上显著超越了当时所有 3DGS 方法，成为表面重建的新基线。
+
+\paragraph{2DGS 光栅化直接监督 SDF 学习}
+
+2DGS 本身提供了几何友好的基元，但并不直接输出 SDF 场。GSurf（2024.11）~\cite{2411_15723} 进一步将 SDF 学习直接嫁接在 2DGS 的光栅化管线上——用高斯中心位置作为 SDF 零水平集的"锚点"来直接监督 SDF 网络，完全绕过了体渲染积分——实现了无需 NeRF 的 SDF 学习。其核心问题是：传统 SDF-NeRF 方法（如 NeuS、VolSDF）需要沿射线采样大量点做体渲染积分来监督 SDF 学习，训练慢且计算昂贵。GSurf 观察到 2DGS 的盘状高斯基元本身就是对表面的离散采样——如果能让 SDF 的零水平集精确对齐这些高斯的中心位置，就不需要 NeRF 式的体渲染，直接用 2DGS 的光栅化即可提供足够的监督信号。
+
+GSurf 建立在 2DGS 渲染管线之上，做了两个关键修改。第一，颜色不由球谐函数表示，而是由一个 MLP 外观网络预测：$c_k=f_\text{app}(p_k, d, \nabla f_\theta, F_\text{geo})$，输入包括高斯中心位置、视角方向、SDF 梯度（法线）和几何特征向量 $F_\text{geo}$。第二，引入不透明度熵正则化 $L_o=\lambda_6\sum_k(-o_k\log o_k)$，迫使每个高斯的不透明度趋向 0 或 1（而非停留在半透明状态），确保高斯盘紧密贴合表面而非飘浮在空间中。
+
+SDF 学习通过与高斯中心的直接约束实现，无需体渲染积分。GSurf 对 SDF 网络 $f_\theta$ 施加五项约束：（1）位置约束 $L_p=\sum_k|f_\theta(p_k)|$ 鼓励零水平集穿过高斯中心；（2）Eikonal 约束 $L_e=\|\|\nabla f_\theta\|-1\|_2$ 保证 SDF 是真正的距离场；（3）离表面约束 $L_s=\sum_k\exp(-\beta|f_\theta(q_k)|)$（$\beta=100$）对空间中均匀采样的点 $q_k$ 施加惩罚，使远离表面的区域 SDF 值保持较大；（4）朝向约束 $L_r=1-|\mathbf{n}_k \cdot \nabla f_\theta(p_k)|$ 对齐高斯短轴方向与 SDF 梯度；（5）法线图约束 $L_m=1-\overline{N_\text{gs}} \cdot \overline{N_\text{sdf}}$ 最小化 2DGS 渲染法线图与 SDF 渲染法线图之间的差异。
+
+\textbf{损失函数与训练细节。}SDF 损失综合为 $L_\text{sdf}=\lambda_1 L_p+\lambda_2 L_e+\lambda_3 L_s+\lambda_4 L_r+\lambda_5 L_m$，其中 $\lambda_1=0.1$、$\lambda_2=\lambda_3=\lambda_6=0.01$、$\lambda_4=\lambda_5=0.05$。整体训练损失为 $L=L_\text{gs}+L_\text{sdf}+L_o$。SDF 用 8 层 MLP（256 隐藏单元）建模，外观用 4 层 MLP，高斯随机初始化（不用 COLMAP），SDF 学习在前 500 次迭代后启动，初始形状为球体。GSurf 避免了传统 SDF-NeRF 中冗余的体渲染过程，用 2DGS 的高效光栅化替代昂贵的体积分，在端到端训练中实现高质量表面重建。
+
+\paragraph{2DGS 几何与 3DGS 光照分解互增强}
+
+GSurf 证明了 2DGS 的光栅化足以替代体渲染来监督 SDF 学习，但仅在单一光照条件下验证。MGSR（2025.03）~\cite{2503_05182} 将 2DGS 的表面重建能力扩展到\textbf{多光照条件}——用 3DGS 分支处理光照分解（透射/反射分离），2DGS 分支负责精确几何，两个分支通过深度图交叉监督互增强。核心观察是：3DGS 的体积高斯表达力强，擅长渲染但几何不准；2DGS 的 surfel 天然对齐表面，擅长几何但渲染能力受限——两者恰好互补。此外，多光照场景中的透明/反射物体使问题进一步复杂化，单一分支无法同时处理光照分离和几何重建。
+
+\textbf{3DGS 分支：光照分解。}MGSR 在标准 3DGS 基础上引入三个反射相关参数——反射不透明度 $\alpha_{\text{ref}}$、反射置信度 $\rho \in [0,1]$、反射球谐系数 $C_{\text{ref}}^k$——将场景建模为透射分量和反射分量的叠加。渲染时，沿射线累积反射置信度得到像素级反射权重 $W = \sum_{i=1}^K \rho_i \alpha_i \prod_{j=1}^{k-1}(1-\alpha_j)$，再分别通过 $\alpha$-混合 计算透射颜色 $C_{\text{tran}}$ 和反射颜色 $C_{\text{ref}}$，最终合成颜色为 $C = C_{\text{tran}} + W \cdot C_{\text{ref}}$。直观地说，$\rho$ 表示某个高斯基元捕获反射分量的概率，$W$ 则是像素层面的反射概率，使方法能在无监督条件下分离透射和反射。该分支的损失为 $L_{3D} = L_{\text{render}} + \lambda_2 L_{\text{trans-TV}}$，其中 $L_{\text{render}} = \lambda_1 L_1(C, C_{GT}) + (1-\lambda_1) L_{\text{D-SSIM}}(C, C_{GT})$，总变差正则 $L_{\text{trans-TV}}$ 平滑透射分量的局部区域。然而，3DGS 分支虽有光照分解能力，其深度图精度不足以直接提取 mesh。
+
+\textbf{2DGS 分支：表面重建。}2DGS 分支用扁平化 2D 高斯盘表示场景，渲染深度图 $Z = \sum_i \omega_i z_i / (\sum_i \omega_i + \epsilon)$（$\omega_i = T_i \alpha_i$ 为混合权重）。为准确识别表面，MGSR 沿射线追踪累积不透明度达到 0.5 的中位点作为表面位置，并用深度图的有限差分计算法线 $\mathbf{N}(x,y) = \nabla_x Z \times \nabla_y Z / \|\nabla_x Z \times \nabla_y Z\|$，与高斯盘的固有法线 $\mathbf{n}_i$ 对齐：$L_n = \sum_i \omega_i (1 - \mathbf{n}_i^T \mathbf{N})$。针对多光照条件，MGSR 引入前景-背景分割掩码加权系数 $\gamma$，使法线损失主要约束前景表面而非整个场景。2DGS 分支总损失为 $L_{2D} = L_{\text{render}} + \lambda_3(\gamma L_n + \lambda_4 L_{\text{n-TV}}) + \lambda_5 L_{\text{d-TV}}$，同时包含深度和法线的总变差平滑项。
+
+\textbf{互增强交替优化。}两个分支先独立预热（auto-stop 策略：哪个分支先收敛就先启动交替阶段），然后交替优化。3DGS 分支用去反射后的透射图像监督 2DGS 的渲染（权重互增强损失 $L_{\text{render-m}} = \lambda_6 L_{\text{mutual}} + (1-\lambda_6) L_{\text{2D-render}}$，兼顾与透射图像和 GT 图像的相似性以稳定训练）；2DGS 分支用其深度图 $Z_{2D}$ 通过 $L_2$ 损失约束 3DGS 的深度 $Z_{3D}$，为光照分解提供几何锚点。交替优化的总损失为 $L_{\text{total}} = w_{2D} L_{2D} + w_{3D} L_{3D} + w_{\text{depth-mutual}} L_Z$。最终通过 TSDF 融合提取纹理 mesh。MGSR 的核心贡献在于证明：光照分解和几何重建可以解耦到不同分支，再通过深度-透射图的交叉监督实现互相促进。
+
+\paragraph{LiDAR 点云先训练 SDF 再初始化 2DGS}
+
+前述方法均依赖 RGB 图像作为唯一输入。GS-SDF（2025.03）~\cite{2503_10170} 引入了 LiDAR 点云作为额外几何先验——用 LiDAR 精确深度先训练神经 SDF 场，再从 SDF 网格初始化 2D 高斯的位置和朝向，最后用 SDF 约束高斯的形状——形成三阶段递进式管线。该方法针对 LiDAR-惯性-视觉里程计（如 FAST-LIVO2）输出的位姿图像和点云，实现几何一致的渲染和精确表面重建。
+
+\textbf{阶段一：神经 SDF 场训练。}GS-SDF 用哈希编码（hash encoding）加 MLP 构建神经 SDF 场 $f(x) \to (s, \beta)$，将三维点 $x$ 映射到有符号距离值 $s$ 和尺度因子 $\beta$。对每条 LiDAR 射线（原点 $\mathbf{o}^L$、方向 $\mathbf{d}^L$、距离 $t$），沿线均匀采样点 $\mathbf{x}_i^L = \mathbf{o}^L + t_i \cdot \mathbf{d}^L$，用 SDF 预测值将射线距离转换为占据概率 $o_i = \sigma(-s_i, \beta_i) = (1 + e^{s_i/\beta_i})^{-1}$，以二元交叉熵损失 $L_{\text{sdf}}$ 监督，配合 Eikonal 正则化 $L_e = \sum_i (\|\nabla f(\mathbf{x}_i)\|_2 - 1)^2$ 确保梯度为单位长度。LiDAR 点云提供的精确深度使 SDF 场在初始阶段就具有高质量几何，避免了纯视觉方法的深度模糊。
+
+\textbf{阶段二：SDF 引导的高斯初始化。}GS-SDF 从训练好的 NSDF 中用 Marching Cubes 提取 mesh，以其顶点作为高斯初始位置——比 SfM 稀疏点更稠密、空间更准确，且避免了传感器离群点的影响。Marching Cubes 分辨率直接决定高斯尺度 $s_u, s_v$。高斯的朝向同样从 SDF 几何信息推导：取 SDF 梯度方向 $\mathbf{n} = \nabla f / \|\nabla f\|$ 作为法线，取主曲率方向 $\mathbf{b} = \nabla^2 f / \|\nabla^2 f\|$ 定义第二旋转轴 $\mathbf{t}_u$，再叉积得到第一旋转轴 $\mathbf{t}_v = \mathbf{n} \times \mathbf{t}_u$，通过 Gram-Schmidt 正交化构建旋转矩阵 $R = [\mathbf{t}_v, \mathbf{t}_u, \mathbf{n}]$。不透明度则由 SDF 值和高斯核函数推导 $\alpha = e^{-s^2}$。这种初始化方式使高斯从训练开始就贴合表面、朝向正确。背景区域则用不透明高斯均匀铺在一个大球面上，防止前景高斯产生漂浮伪影。
+
+\textbf{阶段三：SDF 辅助的形状正则化。}在 2DGS 渲染过程中，GS-SDF 同时施加 2D 渲染一致性正则化和 3D 形状正则化。2D 正则化将高斯盘固有法线渲染的法线图与深度图有限差分推导的法线对齐：$L_r = (1 - \mathbf{N}^T \hat{\mathbf{N}})$。3D 形状正则化是 GS-SDF 的核心贡献：对每个高斯盘，在其表面上随机采样点 $\mathbf{p}_s = \mathbf{p} + \mathbf{t}_u s_u u_s + \mathbf{t}_v s_v v_s$（$[u_s, v_s]^T \sim \mathcal{N}(0,1)$），查询其 SDF 值并以渲染权重加权惩罚：
+
+\begin{equation}
+L_s = \sum_{i=1}^{12} \frac{1}{2} W_i G(\mathbf{u}_{s_i}) f(\mathbf{p}_{s_i})^2
+\end{equation}
+
+其中 $W_i = \sum_k w_k$ 是该高斯在图像中的累积渲染权重。这一损失的关键在于：梯度 $\nabla_{L_s} \mathbf{p}_{s_i} = W_i G(\mathbf{u}_{s_i}) f(\mathbf{p}_{s_i}) \nabla f(\mathbf{p}_{s_i})$ 通过链式法则同时更新高斯的\textbf{全部}结构属性——位置（$\partial \mathbf{p}_s / \partial \mathbf{p} = I$）、旋转切向量（$\partial \mathbf{p}_s / \partial \mathbf{t}_u = s_u u_s$，$\partial \mathbf{p}_s / \partial \mathbf{t}_v = s_v v_s$）和尺度（$\partial \mathbf{p}_s / \partial s_u = \mathbf{t}_u u_s$，$\partial \mathbf{p}_s / \partial s_v = \mathbf{t}_v v_s$），实现一盘多参的全面形状对齐。总损失为 $L = L_{\text{sdf}} + \lambda_e L_e + L_c + \lambda_r L_r + \lambda_s L_s$，其中 $\lambda_e = 0.1$、$\lambda_r = 0.01$、$\lambda_s = 0.005$。GS-SDF 的核心贡献是证明了 LiDAR 先验可以通过 SDF 场系统性地注入高斯的初始化和正则化全过程，而非仅作为初始点云使用。
+
+\paragraph{无符号距离场重建开放表面}
+
+前述方法均假设场景表面是封闭的（有明确的内外之分），但许多真实物体（如布料、叶片、开放曲面）不具有封闭表面。GaussianUDF（2025.03）~\cite{2503_19458} 将 SDF 替换为 UDF（Unsigned Distance Function）——用无符号距离场替代有符号距离场，去掉内外判断只保留到表面的距离——以 2DGS 薄盘作为开放表面的离散近似，通过三步渐进策略桥接离散高斯与连续 UDF 的鸿沟。核心挑战在于：3D 高斯是离散的显式表示，而 UDF 是连续的隐式场——两者的本质差异使得从高斯推理 UDF 极其困难。
+
+\textbf{过拟合高斯到表面。}GaussianUDF 采用 2DGS 的扁平化高斯盘表示场景——这些盘足够薄，天然适合近似开放表面。除了 2DGS 本身的薄盘特性，GaussianUDF 还通过投影损失将高斯中心拉向 UDF 的零水平集：用梯度场将高斯中心 $\boldsymbol{\mu}_i$ 投影到表面 $\boldsymbol{\mu}_i' = \boldsymbol{\mu}_i - d_i \cdot \nabla f(\boldsymbol{\mu}_i) / |\nabla f(\boldsymbol{\mu}_i)|$（$d_i = f(\boldsymbol{\mu}_i)$ 为无符号距离），然后以 $\boldsymbol{\mu}_i'$ 为目标直接优化高斯位置 $L_{\text{proj}} = \|\boldsymbol{\mu}_i' - \boldsymbol{\mu}_i\|_2$。关键设计是：投影过程不通过 UDF 反传梯度，而是将投影结果视为固定目标来更新高斯位置。这一“截断反传”策略避免了 UDF 零水平集附近复杂梯度场导致的优化不稳定问题。
+
+\textbf{自监督近距离推理。}高斯中心是稀疏的，仅靠它们不足以提供完整的距离场监督。GaussianUDF 利用每个高斯盘的整个平面来补充：在高斯盘表面采样根点 $\{\mathbf{r}_i^h\}_{h=1}^H$，沿法线方向 $\mathbf{n}_i$ 随机偏移得到训练样本 $\mathbf{e}_{i,h}^b = \mathbf{r}_i^h + t_b \cdot \mathbf{n}_i / \|\mathbf{n}_i\|$（$t_b \sim [-T, T]$ 确保表面两侧都有样本），以偏移量 $t_b$ 作为真实无符号距离监督 UDF 网络：
+
+\begin{equation}
+L_{\text{near}} = \|f(\mathbf{e}_i^b) - t_b\|_1
+\end{equation}
+
+直观地说，高斯盘本身就是局部表面的离散近似——盘上的点到表面的真实距离就是沿法线的偏移量，因此可以自动生成大量无需标注的距离监督信号。对于最大尺度超过所有高斯最大尺度均值三倍的高斯，GaussianUDF 额外采样更多根点以确保覆盖。
+
+\textbf{梯度场远距离推理。}对于远离高斯盘的区域，GaussianUDF 采用 Neural-Pull 式的梯度投影监督：随机在高斯中心附近采样查询点 $\{\mathbf{q}_j\}$，沿 UDF 梯度投影到零水平集 $\mathbf{q}_j' = \mathbf{q}_j - f(\mathbf{q}_j) \cdot \nabla f(\mathbf{q}_j) / |\nabla f(\mathbf{q}_j)|$，然后用 Chamfer 距离 $L_{\text{far}}$ 约束投影点集 $\{\mathbf{q}_j'\}$ 与高斯中心集 $\{\boldsymbol{\mu}_i\}$ 一致。这使得 UDF 在远离表面的区域能学到正确的粗粒度距离场。为配合上述监督，GaussianUDF 还引入深度扭曲损失 $L_{\text{depth}}$ 鼓励同射线上各高斯深度集中，以及法线正则化 $L_{\text{norm}} = \sum_k g_k (1 - \mathbf{n}_k^T \mathbf{N}_k)$ 对齐高斯法线与渲染深度法线。总损失为 $L = (1-\lambda_1)L_{\text{rgb}} + \lambda_1 L_{\text{ssim}} + \lambda_2 L_{\text{far}} + \lambda_3 L_{\text{near}} + \lambda_4 L_{\text{proj}} + \lambda_5 L_{\text{depth}} + \lambda_6 L_{\text{norm}}$。训练过程分为四个渐进阶段：先优化渲染损失学习高斯表示，再用远距离监督引导 UDF 学习粗形状，然后加入投影损失精炼高斯点云（使表面更薄、噪声更少），最后加入自监督实现精确完整重建。
+
+\paragraph{稀疏视角下 SDF 与 3DGS 循环互补}
+
+GaussianUDF 解决了开放表面问题，但所有前述方法都假设有充足的训练视角。在稀疏视角条件下，无论是 SDF 还是 3DGS 都力不从心。SurfaceSplat（2025.07）~\cite{2507_15602} 专门针对稀疏视角场景设计了循环优化框架——用 SDF 生成的 mesh 初始化 3DGS，再用 3DGS 渲染的新视角图像回过头来增强 SDF 训练——让两种表示互补增强。其出发点是一个关键观察：SDF 方法凭借稠密表示能很好地捕获全局结构但缺乏细节，3DGS 方法凭借稀疏表示擅长保留局部高频细节但全局几何差——两者恰好互补。
+
+\textbf{SDF 改善 3DGS（初始化阶段）。}标准 3DGS 用 COLMAP 稀疏点云初始化，但在稀疏视角下 COLMAP 经常失败或只产生极少且不准确的点。SurfaceSplat 改用 SDF 生成的 mesh 来初始化 3DGS：先用 Voxurf 的粗阶段（$96^3$ 体素网格，约 15 分钟）在稀疏输入图像上训练 SDF 场 $V^{(sdf)}: \mathbb{R}^3 \to \mathbb{R}$，通过可微体渲染和图像重建损失 $L = L_{\text{recon}} + L_{\text{TV}}(V^{(sdf)}) + \lambda L_{\text{smooth}}(V^{(sdf)})$ 监督。为消除稀疏视角导致的漂浮伪影，引入法线一致性损失 $L_{\text{normal}} = \|\hat{\mathbf{N}}(r) - \tilde{\mathbf{N}}(r)\|_1$，用 Metric3D 预测的单目法线 $\hat{\mathbf{N}}$ 监督体渲染法线 $\tilde{\mathbf{N}}$。然后用 Marching Cubes 提取 mesh，通过连通分量聚类保留最大组件并移除漂浮碎片，再将 mesh 投影到训练视角生成深度图，从可见深度区域均匀采样点（每帧 $5k$ 点，融合后约 $50k$ 点）作为 3DGS 的初始化点云。对于背景区域，仍保留 COLMAP 稀疏点补充。这种基于 mesh 的初始化保证点云均匀分布在可见表面上，远优于 COLMAP 的稀疏不可靠结果。
+
+\textbf{3DGS 增强 SDF（视角扩展阶段）。}SDF 重建的核心瓶颈是训练视角不足导致的监督信号匮乏。SurfaceSplat 利用初始化良好的 3DGS 渲染额外的新视角图像来扩充训练数据。3DGS 在 $7k$ 次迭代（约 5 分钟）内即可收敛，然后从新相机位姿渲染图像。新位姿通过两种策略生成：相机位置扰动 $c_m^* = c + \Delta p$（在原位姿附近添加微小偏移）和相机位姿插值（用三次样条在原始相机轨迹间平滑插值位置和朝向）。渲染的 10 张新视角图像与原始稀疏图像合并，使 SDF 的训练数据量翻倍。
+
+\textbf{循环优化。}SurfaceSplat 的完整流程为迭代过程：初始粗 mesh $M^{(0)}$ 生成 3DGS 初始化点云，3DGS 渲染新视角图像 $I^{(n)}$，新图像与原图像合并后精炼 SDF 网格（分辨率从 $96^3$ 提升到 $256^3$），精炼后的 mesh 再采样为新的 3DGS 初始化。公式化为 $I^{(n)} = R(M_c^{(n)})$（渲染步骤）和 $M_f^{(n)} = O(M_c^{(n)}, I^{(n)})$（meshing 步骤），然后 $M_c^{(n+1)} = M_f^{(n)}$。实际中一次循环即可取得良好的效率-精度平衡。完整流程约 1 小时（粗 mesh 15 分钟 + 3DGS 训练 5 分钟 + 新视角渲染 30 秒 + 精细 mesh 40 分钟）。SurfaceSplat 在 MobileBrick 和 DTU 数据集上的稀疏视角条件下均达到 SOTA 性能，证明了 SDF/3DGS 互补融合的有效性。
+
+\subsubsection{基于牵引/对齐的 GS-SDF 融合}
+\label{subsec:04_2_4}
+
+本路线介绍通过可微牵引或对齐操作将高斯中心动态绑定到 SDF 零水平集，实现 GS 与 SDF 双向融合的方法。
+
+\paragraph{可微牵引操作对齐高斯到 SDF 零水平集}
+
+Neural Pulling GS（2024.10）~\cite{2410_14189} 提出一种 GS-SDF 双向融合机制：通过可微牵引（pulling）操作将 3D 高斯中心动态对齐到神经 SDF 的零水平集，同时利用牵引后的高斯盘面约束 SDF 学习。方法包含一个 MLP 表示的 SDF 场 $f$（8 层、256 隐藏单元，初始化为球体）和一组可学习的 3D 高斯 $\{g_j\}$，二者通过五个协同损失联合优化。
+
+\textbf{牵引操作。}给定高斯中心 $\boldsymbol{\mu}_j$，牵引操作将其投影到 SDF 的零水平集上：
+
+\begin{equation}
+\boldsymbol{\mu}_j' = \boldsymbol{\mu}_j - s_j \cdot \frac{\nabla f(\boldsymbol{\mu}_j)}{|\nabla f(\boldsymbol{\mu}_j)|}, \quad s_j = f(\boldsymbol{\mu}_j)
+\end{equation}
+
+直观理解：在 $\boldsymbol{\mu}_j$ 处查询 SDF 值 $s_j$ 和梯度方向，沿梯度方向移动 $s_j$ 的距离，高斯中心就被“拉”到了表面上。梯度归一化保证移动距离恰好等于 SDF 值，这是牵引操作收敛的理论基础。牵引后的高斯 $g_j'$ 与原始高斯 $g_j$ 共享除中心外的所有属性（颜色、不透明度、形状），因此可以直接送入 3DGS 的可微光栅化进行渲染。
+
+\textbf{薄盘约束与切平面对齐。}标准 3D 高斯是椭球体，过于“臃肿”不适合表示薄表面。Neural Pulling GS 引入薄盘约束，惩罚三个轴方差中的最小值：
+
+\begin{equation}
+L_\text{Thin} = \|\min(r_1, r_2, r_3)\|_1
+\end{equation}
+
+这一约束将椭球体“压扁”成薄盘，使高斯天然贴合表面。盘面法线由最小方差对应轴的方向 $\mathbf{n}_j$ 给出。基于薄盘形状，切平面约束进一步对齐高斯法线与牵引中心处的 SDF 梯度：
+
+\begin{equation}
+L_\text{Tangent} = 1 - \left|\frac{\nabla f(\boldsymbol{\mu}_j')}{|\nabla f(\boldsymbol{\mu}_j')|} \cdot \mathbf{n}_j\right|
+\end{equation}
+
+即确保高斯盘面是零水平集在 $\boldsymbol{\mu}_j'$ 处的切平面。
+
+\textbf{盘面牵引与 SDF 推理。}与传统的点到点牵引不同，Neural Pulling GS 将空间中随机采样的查询点 $q$ 牵引到最近的\emph{高斯盘面}（而非盘面中心），以应对高斯分布稀疏且不均匀的挑战：
+
+\begin{equation}
+L_\text{Pull}(q'; g^*) = e^{-\frac{1}{2}(q'-\boldsymbol{\mu}^*)^T \Sigma^{-1} (q'-\boldsymbol{\mu}^*)}
+\end{equation}
+
+其中 $q'=q - s \cdot \nabla f(q)/|\nabla f(q)|$ 是牵引后的查询点，$g^*$ 是距 $q$ 最近的牵引高斯。将牵引目标从“中心点”改为“盘面”，可以有效覆盖高斯中心之间的几何空隙。此外，正交约束 $L_\text{Orthogonal}=1-|\nabla f(q)/|\nabla f(q)| \cdot \mathbf{n}^*|$ 确保牵引方向垂直于盘面，保证 SDF 的距离场性质。
+
+\textbf{总体训练。}渲染损失在牵引后的高斯上进行计算：$L_\text{Splatting}=0.8 L_1(v_i', v_i) + 0.2 L_\text{D-SSIM}(v_i', v_i)$。整体目标函数为：
+
+\begin{equation}
+L = L_\text{Splatting} + \lambda_1 L_\text{Thin} + \lambda_2 L_\text{Tangent} + \lambda_3 L_\text{Pull} + \lambda_4 L_\text{Orthogonal}
+\end{equation}
+
+其中 $\lambda_1=100$、$\lambda_2=0.1$、$\lambda_3=1$、$\lambda_4=0.1$。训练共 15k 次迭代：前 7k 次仅用 3DGS 光度损失训练高斯属性，7k 之后引入牵引操作和几何约束，同时优化 SDF 网络和高斯属性。训练在单张 NVIDIA 3090 上完成。
+
+\paragraph{核回归将离散高斯转化为连续隐式表面}
+
+GVKF（2024.11）~\cite{2411_01853} 提出高斯体素核函数（Gaussian Voxel Kernel Functions），通过核回归将离散 3DGS 转化为连续场景表示，从而在保留 3DGS 高效光栅化的同时获得连续隐式表面。
+
+\textbf{动机。} 离散高斯基元没有明确定义的表面，从中提取网格需要后处理——如果能把离散高斯"平滑"为连续场，就能直接从场中提取精确表面。GVKF 的核心思想是：不直接让离散高斯表示表面，而是用它们作为核函数拟合连续的不透明度场，再从连续场映射到 SDF 进行网格提取。
+
+\textbf{体素高斯表示。}GVKF 用稀疏体素网格管理高斯基元，替代传统 3DGS 的自适应密度控制。每个体素从下采样的 SfM 点云初始化，训练中根据梯度积累动态细分或淘汰。体素内的高斯属性不由直接优化张量表示，而是通过 MLP 从特征向量 $\mathbf{F} \in \mathbb{R}^d$ 解码：不透明度 $\alpha=\sigma_\alpha(\mathbf{F})$、旋转 $\mathbf{R}=f_R(\mathbf{F})$、缩放 $\mathbf{s}=f_s(\mathbf{F})$、颜色 $c=f_c(\mathbf{F}, \mathbf{d})$。高斯中心存储为相对于体素中心的偏移坐标，MLP 的拟合能力压缩了显式存储开销。每次迭代动态生成高斯、更新后回收，显著降低内存占用。
+
+\textbf{核回归与连续不透明度场。}GVKF 的关键创新在于将 3D 高斯的概率密度通过射线-高斯交点变换，转化为沿射线的 1D 核函数。具体地，对于穿过射线的第 $i$ 个高斯，定义核函数：
+
+\begin{equation}
+K_i(t) = \begin{cases} \exp(-k_i t^2) & t < 0 \\ 1 & t \geq 0 \end{cases}
+\end{equation}
+
+其中 $t_i$ 是射线与第 $i$ 个高斯的交点（概率密度峰值位置），$k_i$ 是射线-高斯变换的综合参数。$t \geq 0$ 时核函数保持为 1，这是因为在深度失真正则化下，高斯被鼓励聚集在物体表面后方（solid 物体假设）。沿射线的连续不透明度密度函数通过核回归拟合：
+
+\begin{equation}
+\alpha(t) = \sum_{i=1}^N \alpha_i K_i(t - t_i)
+\end{equation}
+
+即多个离散高斯的核函数加权求和，得到连续的不透明度密度。对应的累积分布函数（CDF）$\Phi(t)$ 描述射线从起点到 $t$ 处命中表面的概率，通过离散累积计算得到。
+
+\textbf{不透明度到 SDF 的映射。}GVKF 的理论基础是：在不透明度密度 $\alpha(u)$ 满足表面附近高斯聚集的假设下，$\alpha(u)$ 近似服从正态分布 $\alpha(u) \sim \mathcal{N}(0, \sigma^2)$。通过严格推导，GVKF 证明概率密度函数 $\hat{\Phi}(u)=\Phi(u)\alpha(u)$ 的峰值出现在表面\emph{之前}（而非表面上），因此不能简单用峰值定位表面。GVKF 的解决方案是用 Logistic 函数近似 CDF 到 SDF 的映射：
+
+\begin{equation}
+D(t) = \frac{\ln(\Phi(t)^{-1} - 1)}{-\sigma} - u_0
+\end{equation}
+
+其中 $\sigma$ 是平滑因子，$u_0$ 是通过数值求解超越方程 $\alpha(u_0) = -\sigma^2$ 得到的偏移量。这一映射建立了连续不透明度场与隐式 SDF 之间的桥梁，使得从训练好的 3DGS 可以直接提取网格表面。GVKF 在开放场景的大规模表面重建中同时实现了高重建质量、实时渲染速度和显著的存储/内存节省。
+
+\begin{takeaway}
+SDF 与隐式表面引导通过引入隐式符号距离场让高斯沿零水平集排列，从根本上解决了高斯缺乏表面约束的问题。NeuGS 和 2DGS 等工作将 SDF 梯度作为法线监督信号，GVKF 建立了不透明度场到 SDF 的理论映射桥梁。核心挑战是双分支优化（高斯分支和 SDF 分支）的复杂性和训练稳定性。
+\end{takeaway}
+
+%=====================================================================
+\section{多视角几何与平面约束}
+\label{sec:04_3}
+
+\subsection{问题背景：从多视角到几何一致性}
+
+多视角几何是传统三维重建的理论基础：从不同视角观察同一场景，通过视角间的对应关系和极线约束恢复三维结构。3DGS 的训练过程天然涉及多视角（多个训练视角），但标准 3DGS 的光度损失并不显式地约束多视角几何一致性——每个视角独立地参与损失计算，视角间的几何约束（如极线一致性、深度一致性）被隐式地“期望”通过梯度下降来满足。
+
+本节的方法显式地将多视角几何约束引入 3DGS 训练，或利用场景的结构先验（平面、Manhattan/Atlanta 世界假设）增强几何重建。
+
+\subsubsection{无偏深度渲染与多视角正则化}
+
+本节介绍 5 种无偏深度渲染与多视角正则化方法：PGSR（基于平面的无偏深度渲染）、MVG-Splatting（法线-深度互优化）、TriaGS（三角测量引导的全局一致性）、GVGS（高斯可见性感知）和多视角几何正则化策略。
+
+\paragraph{平面化高斯的无偏深度渲染}
+
+PGSR（2024.06）~\cite{2406_06521} 修改了原始 3DGS 的深度渲染与正则化环节，用平面化高斯的无偏深度渲染替代标准 $\alpha$-混合 深度，光度损失和自适应密度控制保持不变。PGSR 是多视角几何约束的里程碑工作。
+
+\textbf{动机。} 标准 $\alpha$-混合期望深度在高斯不完整累积时系统性偏向相机侧，且椭球形高斯的"平均深度"不对应任何物理表面，导致渲染深度图无法直接用于表面重建。
+
+\textbf{问题：标准深度渲染的偏差。}直觉地说，标准 3DGS 的期望深度 $D = \sum_{i \in N} T_i \alpha_i z_i$ 就像对一条射线上的所有高斯做加权平均——但这个平均有两个问题：一是每个高斯本身是椭球而非平面，"平均"出来的深度对应一个弯曲面；二是累积权重 $T_i \alpha_i$ 的总和可能小于 1（射线末端的空白区域不贡献任何高斯），导致深度整体偏向相机侧。这两个偏差使得标准深度图无法直接用于表面重建。
+
+\textbf{方案：平面化与无偏深度。}为消除上述偏差，PGSR 先将三维高斯椭球沿最小缩放轴压扁为平面，最小化最短缩放因子 $\mathcal{L}_s = \|\min(s_1, s_2, s_3)\|_1$，使每个高斯局部逼近一个平面片。然后分别渲染法线图和相机到平面距离图：
+
+\begin{equation}
+\bm{N} = \sum_{i \in N} R_c^T \bm{n}_i \, \alpha_i \prod_{j=1}^{i-1}(1-\alpha_j), \quad \mathcal{D} = \sum_{i \in N} d_i \, \alpha_i \prod_{j=1}^{i-1}(1-\alpha_j),
+\end{equation}
+
+其中 $R_c$ 是相机到世界坐标系的旋转，$d_i = (R_c^T(\bm{\mu}_i - T_c))^T(R_c^T \bm{n}_i)$ 是第 $i$ 个高斯平面到相机中心的距离。关键一步：通过射线与平面的交点关系将距离和法线转换为无偏深度 $D(\bm{p}) = \mathcal{D} / (\bm{N}(\bm{p}) K^{-1} \tilde{\bm{p}})$，其中 $\tilde{\bm{p}}$ 是像素 $[u,v]^T$ 的齐次坐标。直觉上，这一除法相当于"用法线方向修正距离值"，消除了累积权重不等于 1 带来的偏差，使深度值真正落在高斯平面上而非偏向相机。
+
+\textbf{三层正则化。}基于无偏深度图，PGSR 引入由局部到全局的三层约束。第一层是\emph{单视角几何一致性}：假设邻域像素共面，从渲染深度采样四邻域点计算法线 $N_d(\bm{p})$，以图像梯度加权的 $L_1$ 损失 $\mathcal{L}_{svgeom} = \frac{1}{W}\sum_{\bm{p}} (1-\overline{\nabla I})^2 \|N_d(\bm{p}) - N(\bm{p})\|_1$ 约束渲染法线与深度推导法线一致。第二层是\emph{多视角几何一致性}：利用平面单应矩阵（homography，描述同一平面在两个视角间的射影变换）$H_{rn} = K_n(R_{rn} - T_{rn}n_r^T / d_r)K_r^{-1}$ 进行前后向重投影，以重投影误差 $\phi(\bm{p}_r) = \|\bm{p}_r - H_{nr}H_{rn}\bm{p}_r\|$ 构建置信度加权损失，大误差像素（遮挡或几何错误）被自动排除。第三层是\emph{多视角光度一致性}：将 $7\times 7$ 图像块通过单应矩阵映射到邻近视角，用归一化互相关（Normalized Cross-Correlation, NCC，衡量两个图像块线性相关程度的指标，值域 $[-1,1]$，越接近 1 越一致）衡量光度一致性。最终总损失为 $\mathcal{L} = \mathcal{L}_{rgb} + \lambda_2 \mathcal{L}_{svgeom} + \lambda_3 \mathcal{L}_{mvrgb} + \lambda_4 \mathcal{L}_{mvgeom}$。这些多视角正则化约束使 PGSR 从 3DGS 中高效提取高质量的表面网格。
+
+PGSR 的无偏深度渲染为后续方法提供了重要的技术基础，但它将多视角一致性建立在像素级重投影误差之上，在纹理匮乏区域容易失效。下一方法从法线与深度的互优化角度寻找突破。
+
+\paragraph{法线-深度闭环互优化}
+
+MVG-Splatting（2024.07）~\cite{2407_11840} 在 2DGS 框架上提出法线-深度互优化策略和基于几何一致性的自适应致密化。此前方法（如 PGSR）假设渲染深度图可直接作为表面重建的真值，但深度质量高度依赖光度监督的准确性。MVG-Splatting 的核心思路是用法线信息反过来修正深度图，再以修正后的深度指导致密化。
+
+\textbf{法线-深度互优化。}直觉上，深度图给出"表面离相机多远"，法线图给出"表面朝向哪里"——两者应该相互一致，但在标准渲染中它们独立计算，常常矛盾。MVG-Splatting 让法线反过来修正深度，实现闭环自校准。具体而言，互优化包含三个步骤：首先，对渲染深度图施加联合双边滤波（joint bilateral filter），在保持边缘细节的同时平滑噪声——滤波权重为 $D_{\text{filtered}}(x) = \frac{1}{W(x)}\sum_{x_i} G_{\sigma_s}(\|x_i - x\|) \cdot G_{\sigma_r}(\|I(x_i) - I(x)\|) \cdot D(x_i)$，其中空间核 $G_{\sigma_s}$ 和强度核 $G_{\sigma_r}$ 均为 $3\times 3$ 高斯核，$I(x)$ 取自 GT 图像而非渲染图像，确保边缘保真。其次，将滤波后的深度图转换为三维点云 $P(u,v) = D(u,v) K_p^{-1}[u,v,1]^T$，通过 8 邻域点的差积计算法线 $n_i = \sum_{j=1}^{8}(p_j - p_i) \times (p_{j+1} - p_i) / \|\sum_{j=1}^{8}(p_j - p_i) \times (p_{j+1} - p_i)\|$。最后，利用法线计算深度修正因子 $\gamma = (\frac{u-c_x}{f_x^p} n_x + \frac{v-c_y}{f_y^p} n_y + n_z)$，更新深度 $D_{i,j} = \gamma_{i,j} D_{\text{padded}}$，并以图像梯度加权的八邻域均值进一步平滑。
+
+\textbf{基于深度分布的自适应致密化。}MVG-Splatting 指出传统 MVS 方法投影深度图到点云时，高置信度区域（通常是传感器中心附近）被过度重建，而需要致密化的近景和远景区域反而被忽略。为此，该方法利用核密度估计（KDE，一种非参数概率密度估计方法，通过叠加若干核函数来近似数据的分布形状）加快速傅里叶变换 (FFT) 动态估计深度分布的累积分布函数，自适应地将深度图划分为近/中/远三个区域，对近景和远景放宽几何一致性容忍度以注入更多点，对中景收紧容忍度以避免过度重建。投影高斯的旋转通过法线初始化（轴角表示，指数映射转换为旋转矩阵），尺度根据邻域点间距局部重新初始化，确保新增高斯不会受原有大尺度高斯的干扰。此外，MVG-Splatting 还设计了边缘感知深度损失 $\mathcal{L}_{\text{edge}} = \sum_x \log(1+|D - D_{\text{evl}}|)_{\lambda_x} + \sum_y \log(1+|D - D_{\text{avg}}|)_{\lambda_y}$（用 Scharr 算子提取 GT 图像边缘作为权重）和特征感知深度损失 $\mathcal{L}_{\text{feat}} = \|\phi(I_{\text{GT}}) - \phi(D)\|$（用预训练 VGG 提取特征），最终损失为 $\mathcal{L} = \mathcal{L}_{\text{rgb}} + \mathcal{L}_{\text{edge}} + \mathcal{L}_{\text{feat}} + \mathcal{L}_n$。
+
+MVG-Splatting 在法线-深度层面实现了闭环校正，但其多视角约束仍是成对视角间的局部比较。这种局部性会累积误差，导致全局几何漂移。TriaGS 从经典多视角三角测量的角度解决这一局限。
+
+\paragraph{可微多视角三角测量的全局一致性}
+
+TriaGS（2025.12）~\cite{2512_06269} 将经典多视角三角测量（triangulation，通过多条射线的交汇确定三维点位置）以可微形式融入 3DGS 训练循环，用全局自一致性信号替代 PGSR 等方法的成对视角比较。其核心洞察是：成对比较会累积误差导致全局几何漂移，而多视角三角测量让所有视角同时参与对一个三维点的共识投票，从根本上消除漂移。
+
+\textbf{几何一致的深度-法线渲染。}标准 3DGS 的 $\alpha$-混合 深度忽略了高斯的形状和朝向，斜盘状高斯的深度值可能不对应任何真实表面点，产生噪声深度和浮游伪影。TriaGS 基于 RaDe-GS 的光栅化深度公式，将射线与高斯椭球的交点定义为沿射线密度最大处的距离——直觉上，这等价于”射线穿过高斯最稠密的点”，即高斯中心在射线方向上的投影。公式为 $t^* = \frac{v^T \Sigma^{-1}(x_c - o)}{v^T \Sigma^{-1} v}$，利用 3DGS 光栅化器中已有的局部仿射近似将其简化为射线空间中的点积 $t^* = \lambda(u_c - u_o)$，从而实现实时精确深度渲染 $d = t^* \cos\theta_c$，法线则通过变换高斯参数再经 Jacobian 反变换回相机空间 $n = J^T n'$。
+
+\textbf{可微多视角三角测量。}这是 TriaGS 的核心创新。对参考视角像素 $p_r$，先渲染其深度 $d_r$ 和法线 $n_r$，结合相机位姿计算当前三维表面点 $X_r$；然后将 $X_r$ 可微投影到 $k+1$ 个视角（含参考视角），得到对应二维观测 $p'_i = P_i X_r$。这些观测对 $(p'_i, P_i)$ 构成经典直接线性变换（Direct Linear Transform, DLT，一种从二维对应点求解三维结构的线性方法）输入，每个视角提供两个线性约束 $(u'_i P_{i3}^T - P_{i1}^T)X = 0$ 和 $(v'_i P_{i3}^T - P_{i2}^T)X = 0$，堆叠为超定方程组 $AX = 0$。直觉上，如果所有视角的射线完美交汇于一点，方程组有精确零解；但渲染点 $X_r$ 只是当前估计、SfM 位姿也有误差，$k+1$ 条射线不会精确交汇。TriaGS 通过对 $A$ 做可微分奇异值分解 (SVD) $A = U\Sigma V^T$，取 $V$ 最后一列作为最优共识点 $X^*$——即最小化 $\|AX\|^2$ 的单位范数解，几何含义是所有 $k+1$ 条射线的最优交汇点。最终的三角测量引导一致性损失为 Geman-McClure 鲁棒损失（对小误差近似二次增长、对大误差趋于饱和的鲁棒损失函数）$\mathcal{L}_T = \sum_{\text{pixels}} \frac{\|X_r - X^*\|_2^2}{\|X_r - X^*\|_2^2 + \sigma^2}$，$\sigma$ 按指数衰减退火以在训练后期追求高精度。整个过程从 SVD 到损失完全可微，梯度直接回传到高斯属性。总损失为 $\mathcal{L} = \mathcal{L}_{\text{photo}} + \lambda_t \mathcal{L}_T + \lambda_{\text{normal}} \mathcal{L}_{\text{normal}} + \lambda_{\text{photo-mv}} \mathcal{L}_{\text{photo-mv}}$。TriaGS 在 DTU 基准上达到了 0.50 mm 的 Chamfer Distance，超越了当时所有可比的显式方法。
+
+TriaGS 实现了全局多视角一致性，但 PGSR 的置信度机制仍在纹理匮乏区域留下监督空白。GVGS 转向高斯级可见性建模来解决这一问题。
+
+\paragraph{高斯基元级可见性替代像素级重投影}
+
+GVGS（2026.01）~\cite{2601_20331} 修改了 PGSR 的可见性判断机制——用高斯基元级可见性替代像素级深度重投影，多视角几何约束的框架保持不变。此前 PGSR 的多视角几何一致性损失依赖前-后向重投影误差 $\phi(\bm{p}_r)$ 估计置信度，$\phi \geq 1$ 的像素被视为遮挡而排除——但这恰恰在纹理匮乏区域（如建筑立面）造成大面积监督空白，形成”深度不可靠导致不可见、不可见导致无监督”的恶性循环。GVGS 的核心思路是将可见性建模从像素级别的深度重投影切换到高斯基元级别，利用体积渲染合成公式本身推导可见性，从而解耦可见性与深度质量。
+
+\textbf{高斯可见性感知的多视角一致性（GVMV）。}在差分光栅化过程中，GVGS 直接计算每个高斯在邻近视角 $v_n$ 中的渲染贡献 $W_i = \sum_{x \in \Omega_n} \alpha_i(x) T_i(x)$，将其归一化为可见性概率 $p_i = W_i / \sum_j W_j$，实际采用阈值化近似 $\hat{v}_i = \mathbb{I}(W_i > \epsilon)$ 以兼顾效率。直觉上，这相当于问”这个高斯在另一个视角中是否被看到”，而非”这个像素的深度在另一视角中是否一致”。然后将可见性投影回参考视角，构建选择性累积不透明度图 $O_r(x) = \sum_i \hat{v}_i \cdot \alpha_i(x) \prod_{j<i}(1-\alpha_j(x))$，该图仅聚合在两个视角中均确认可见的高斯贡献。在此基础上，GVGS 扩展 PGSR 的多视角几何一致性损失为 $\mathcal{L}_{\text{gvmvgeom}} = \frac{1}{|V|}\sum_{x \in V} (\exp(-\phi(x)) + \beta \cdot O_r(x)) \cdot \phi(x)$，其中 $V$ 既包含传统深度一致性像素，也包含通过可见性图新发现的共视区域像素，$\beta$ 动态平衡两项贡献。
+
+\textbf{四叉树校准深度约束（QDC）。}GVGS 将单目深度先验（来自 DepthAnything 等大模型）作为粗结构引导，但全局尺度-偏移校准无法捕捉空间变化的深度畸变。QDC 采用渐进式四叉树策略——直觉上类似于地图的”先看大洲再看城市”式逐级细化：在第 $t$ 次迭代时设四叉树层数 $L(t) = \lfloor t/\tau \rfloor$，将图像划分为 $2^{L(t)} \times 2^{L(t)}$ 个均匀块，在每个块 $B_k$ 内用鲁棒仿射模型对齐单目深度 $D_m'(x) = a_k D_m(x) + b_k$，其中尺度 $a_k$ 和偏移 $b_k$ 通过中位数和中位数绝对偏差（MAD，一种对异常值鲁棒的统计离散度度量）估计，且仅利用可见性确认的像素 $V$ 进行校准。训练初期块少（粗校准），后期块增多（细校准），仿射参数在层数增加时才重算、中间缓存复用，开销极低。对齐后施加 $L_1$ 惩罚 $\mathcal{L}_{\text{qdc}} = \sum_{x \in V} \|D_m'(x) - D_g(x)\|_1$。最终总损失为 $\mathcal{L} = \mathcal{L}_{\text{rgb}} + \mathcal{L}_s + \mathcal{L}_{\text{mvrgb}} + \mathcal{L}_{\text{gvmvgeom}} + \mathcal{L}_{\text{qdc}}$。GVGS 在 DTU 和 Tanks and Temples 上实现了 SOTA 级别的表面重建精度。
+
+上述方法从无偏深度、法线-深度互优化、全局三角测量、可见性感知四个维度强化了多视角几何约束。还有一种互补思路：直接将传统 MVS 的成熟管线与 3DGS 融合。
+
+\paragraph{MVS 引导初始化与冻结位置更新}
+
+Multiview Geometric Regularization（2025.06）~\cite{2506_13508} 系统地将传统 MVS 深度约束与 3DGS 的光度优化融合，提出从初始化到训练全流程的几何增强方案。
+
+\textbf{MVS 引导初始化}是该方法的起点。标准 3DGS 用 COLMAP 稀疏点云初始化，在纹理稀少区域点云不足导致优化陷入局部最优。该方法先运行 COLMAP 的 MVS 管线生成稠密深度图，通过多视角一致性检查滤除不可靠估计，再将所有视角的深度图融合为统一三维点云。为控制点云规模，采用\textbf{多体素网格过滤}：从初始体素尺寸 $l$ 开始随机采样，若点数仍超过目标 $K'$ 则将体素尺寸扩大至 $1.5l$ 重复过滤。初始化后先进行 $N_{\text{prun}}$ 次迭代\textbf{冻结位置更新}——仅优化除中心外的所有参数，利用 3DGS 自然降低无贡献高斯不透明度的倾向自动剪除 MVS 噪声点，再解冻全部参数进行正常优化。
+
+\textbf{相对深度损失}是核心正则化项。MVS 深度含有残余噪声，不能当作真值直接监督。该方法的策略是用渲染深度作为参考过滤 MVS 异常值，仅保留偏差在容差范围内的 MVS 深度：
+
+\begin{equation}
+\mathcal{L}_{\text{rel}} = \left|1 - \frac{D_{\text{mvs}}}{D_r}\right| \cdot U \cdot \mathbb{I}(|D_r - D_{\text{mvs}}| < s \cdot D_r)
+\end{equation}
+
+其中 $D_r$ 取\textbf{中值深度}（累积透射率 $T_i > 0.5$ 处的深度）而非期望深度，以避免半透明物体和边界处的“飞行像素”伪影。$U = \sum_i \alpha_i$ 是渲染置信度（累积 alpha），$s$ 是从宽松到严格退火的容差参数。指示函数 $\mathbb{I}$ 确保仅在 MVS 深度与渲染深度基本一致时施加约束，自动排除噪声估计。
+
+\textbf{多视角几何正则化}将单视角约束扩展到多视角：每次优化迭代同时施加多个视角的深度损失、法线一致性损失和深度畸变损失，使梯度更新影响所有相关高斯而非仅影响当前视角的贡献高斯。此外还引入多视角 RGB 光度损失进一步约束外观一致性。最终损失为 $\mathcal{L} = \sum_v (\mathcal{L}_c^v + \lambda_{\text{rel}} \mathcal{L}_{\text{rel}}^v + \lambda_d \mathcal{L}_d^v + \lambda_n \mathcal{L}_n^v)$，对所有视角求和。
+
+\subsubsection{平面先验与结构化表示}
+
+本路线介绍利用场景的平面先验来约束高斯空间分布的方法。前一节的方法通过多视角约束间接引导几何恢复，本节的方法则直接利用场景的结构先验——平面假设——来约束高斯的空间分布。
+
+\paragraph{纹理/无纹理区域分策略深度-法线引导}
+
+GausSurf（2024.11）~\cite{2411_19454} 的核心洞察是：patch-match MVS 与单目法线先验在几何引导上具有互补性——patch-match 擅长纹理丰富区域（保留锐利特征），法线先验擅长无纹理区域（利用结构信息）。GausSurf 利用几何验证来区分两类区域：通过几何验证的像素判定为纹理丰富区域，由 patch-match 提供深度监督，损失为 $\mathcal{L}_d = |d_p - d_i|$（$d_p$ 为 patch-match 精化深度，$d_i$ 为渲染深度）；未通过验证的像素判定为无纹理区域，由 StableNormal 提供法线先验监督，损失为 $\mathcal{L}_{np} = (1 - \mathbf{n}_p^\top \mathbf{n}_i)$。两种策略通过迭代精化-监督方案交替运行：先用渲染深度/法线图初始化 patch-match，再用精化结果回监高斯训练，如此反复直至收敛。最终通过多视角 TSDF 融合提取表面网格。
+
+\paragraph{层次化平面表示与分区并行重建}
+
+GigaGS（2024.09）~\cite{2409_06685} 解决大规模场景的高质量表面重建问题，核心贡献有三。其一，\textbf{层次化平面表示}：借鉴 OctreeGS 的锚点高斯结构，按距离选择不同层次（$\text{level}(d) = \lfloor \frac{d_\text{max} - d}{\cdot}, K\!-\!1 \rfloor$），远距离用低层次粗粒度锚点，近距离用高层次细粒度锚点；同时用 flatten 损失 $\mathcal{L}_\text{flatten} = \frac{1}{|M|}\sum_i |e_\text{min}(\Sigma_i)|$ 压缩高斯最短轴，使其垂直于表面——即迫使高斯从椭球退化为薄片以贴合表面。其二，\textbf{基于画家算法的分区策略}：用锚点向相机投影（而非人工阈值）自动选择每个分区的训练相机，贪婪地最大化每个分区的监督覆盖，多 GPU 并行后丢弃跨分区辅助锚点。其三，\textbf{多层正则化}：外观模型为每张图学习低维嵌入 $\text{emb}_v$ 以应对曝光/光照变化；局部几何一致性损失约束相邻像素深度-法线一致；多视角一致性损失通过单应性变换 $\mathbf{H}_{rn}$ 做基于 patch 的 NCC 光度一致性检查和反向重投影几何验证，确保跨视角几何全局一致。
+
+\paragraph{高斯混合树与平面描述子的无监督重建}
+
+PGS（2024.12）~\cite{2412_01931} 提出完全无监督的 3D 平面重建方法，核心技术是\textbf{高斯混合树（Gaussian Mixture Tree, GMT）}和\textbf{平面描述子}。PGS 为每个高斯额外学习法线 $\mathbf{n} \in \mathbb{R}^3$ 和平面描述子 $\mathbf{z} \in \mathbb{R}^k$（$\|\mathbf{z}\|_2 = 1$）。描述子通过将 SAM 2D 分割掩码提升到 3D 来学习：对每张训练图，用线性回归将渲染的描述子图映射到 SAM 的 one-hot 分割标签，闭式求解 $W = (Z^\top Z)^{-1} Z^\top Y$，无需跨视角的掩码关联。GMT 自底向上构建：先用 KNN（K-Nearest Neighbors，K 近邻）聚类局部高斯作为叶节点，再用 Bhattacharyya 距离（衡量两个概率分布相似度的度量，值越小越相似）$D_B$ 和描述子余弦相似度作为合并准则，递归地将相邻高斯节点合并为父节点，形成树结构——根节点的子节点即为各独立平面实例。此外，PGS 通过\textbf{局部平面对齐}将高斯中心投影到 KNN 邻域的局部切平面（由协方差矩阵最大两个特征值对应的特征向量定义），迫使高斯精确贴合物体表面。训练中周期性施加 recurrent mean-shift 更新 $\mathbf{Z} \leftarrow \mathbf{Z}(\alpha K D^{-1} + (1-\alpha) I)$（基于 von Mises-Fisher 分布），确保所有平面描述子在整个场景中保持全局可分性。
+
+\paragraph{平面重参数化约束高斯坐标}
+
+GSPlane（2025.10）~\cite{2510_17095} 通过平面先验对高斯坐标进行结构化重参数化，形成完整的平面检测-约束-精修管线。首先，用 Metric3Dv2 预测法线图，结合 SAM 分割掩码识别平面区域（区域内 $>70\%$ 像素法线余弦相似度超过阈值 $\tau$），将多视角 2D 平面掩码投影到 3D 点云，构建无向图 $G(V,E)$ 并用 Leiden 算法聚类出平面组。对每个平面组 $V_P$，用 RANSAC（Random Sample Consensus，随机抽样一致）拟合平面方程，选取三个不共线基点 $F_1, F_2, F_3$，将每个高斯中心表示为归一化线性组合 $V'_P = \alpha_1 F_1 + \alpha_2 F_2 + \alpha_3 F_3$（约束 $\alpha_1 + \alpha_2 + \alpha_3 = 1$），训练时只优化权重 $\alpha_i$ 而非直接优化 $xyz$，从而硬约束高斯中心始终位于平面上。
+
+\textbf{动态高斯重分类器（DGR）}在每次致密化后运行，比较平面高斯梯度和非平面高斯梯度的统计量：若某平面高斯的平均梯度超过非平面高斯 top 20\% 的均值，说明它是误分类的假阳性，将其回退为自由 $xyz$ 坐标。
+
+\textbf{网格布局精修}利用平面先验对 TSDF 提取的网格做后处理：将平面区域内的顶点投影到优化后的平面上，内部顶点替换为均匀 2D 网格点并用 Delaunay 三角化重建，实现法线一致、拓扑简洁的平面网格。
+
+\paragraph{Atlanta 世界先验的隐式结构化高斯}
+
+AtlasGS（2025.10）~\cite{2510_25129} 利用 Atlanta 世界先验配合隐式结构化 GS 表示，实现室内/城市场景的平滑表面重建。Atlanta 世界假设场景由一个水平主平面加多个垂直平面组成——比 Manhattan 世界（要求三个正交方向）更宽松，允许垂直墙面朝向任意方向。
+
+\textbf{隐式结构化高斯。}AtlasGS 用稀疏特征网格存储几何特征 $V_g$ 和语义特征 $V_s$，通过 MLP 解码器预测局部 $K$ 个高斯的属性，使相邻高斯的优化相互影响而非各自独立，从而保证局部几何连续性。语义分支用 Mask2Former 的 2D 伪标签（墙壁/地板/天花板/其他四类）做交叉熵监督，将语义信息提升到每个高斯。
+
+\textbf{平面正则化。}AtlasGS 从 3D 和 2D 两个层面施加平面约束。3D 全局层面：利用语义标签对高斯分组——地板/天花板区域约束高斯位置到平面指示器（$\Pi_f = (\mathbf{n}_g, d_f)$，$\Pi_c = (-\mathbf{n}_g, d_c)$），墙壁区域约束法线垂直于重力方向。2D 局部层面：从渲染深度计算法线 $N_d = \nabla_x P \times \nabla_y P / \|\nabla_x P \times \nabla_y P\|$，将墙壁区域的表面法线对齐到平面指示器，直接优化高斯的空间分布。平面指示器由 RANSAC 从语义点初始化并与高斯一同优化。
+
+\subsubsection{多视角一致性约束的增强}
+
+本路线介绍应对动态干扰物和复杂遮挡场景下多视角一致性增强的方法。前两节的方法假设训练图像中的场景是静态的。实际拍摄中，行人、车辆等动态干扰物破坏了多视角一致性假设。本节的方法应对这些更复杂的情况。
+
+\paragraph{DINOv2 检测动态干扰物后静态重建}
+
+MVGSR（2025.03）~\cite{2503_08093} 解决非静态环境（含行人、车辆等干扰物）下的 3DGS 表面重建。直觉上，该方法先"清洗"干扰物，再在干净场景上施加多视角约束。具体包含三模块流程：干扰物检测、多视角剪枝和多视角一致性约束。
+
+\textbf{干扰物检测}利用 DINOv2 的跨视角特征一致性识别仅存在于少数帧中的物体。先用标准 3DGS 粗训练得到初始场景表示，然后对参考视角 $I_r$ 的每个像素 $p_r$，通过单应矩阵 $H_{nr}$ 映射到邻近视角 $I_n$ 的对应像素 $p_n = H_{nr} p_r$。关键设计是用\textbf{渲染图像} $I^*_n$（而非真实图像 $I_n$）提取 DINOv2 特征——因为真实邻近图像中也可能包含干扰物，会误导特征匹配。对每个像素计算特征距离 $\text{distance}(p_r, p_n) = |F_r(p_r) \cdot F^*_n(p_n)| / (|F_r(p_r)| \cdot |F^*_n(p_n)|)$，低于阈值 $\tau_{\text{near}}$ 的像素初步标记为干扰物。随后通过多视角投票精炼：仅当某像素被至少两个邻近视角判定为干扰物时才保留。最后用 SAM（Segment Anything Model）对粗掩码做边界精炼——在掩码内外均匀采样正负样本点作为 prompt，获得精确边缘的最终掩码 $Mask_{\text{sam}}$。
+
+\textbf{多视角贡献剪枝}（MV-Prune）解决干扰物区域的“浮游高斯”问题。干扰物通常仅出现数帧，优化产生的对应高斯聚集在相机附近形成浮游体，一旦出现就阻断梯度传播。标准 3DGS 的不透明度重置策略在掩码区域反而会分裂出更多高斯。MV-Prune 为每个高斯定义多视角贡献度 $C_{\text{MV}}(p) = \sum_{V_k \in V} \mathbb{I}(\text{cumulative transmittance at } p > \tau_{\text{opacity}})$，统计该高斯在多少个视角中具有显著贡献。贡献度低于 $\tau_{\text{prune}}$ 的高斯被重置为低不透明度，允许梯度重新流动。实验显示 MV-Prune 在保持渲染质量的同时压缩 60\% 的高斯。
+
+\textbf{多视角一致性损失}借鉴 MVS 的光度一致性约束，用单应矩阵将参考视角的 $11 \times 11$ 局部面片 $P_r$ 投影到邻近视角的对应区域 $P_n$，以归一化互相关（NCC）度量面片间的一致性：$\mathcal{L}_{\text{mv}} = \frac{1}{V}\sum_{p_r \in V}(1 - \text{NCC}(I_r(p_r), I_n(p_n)))$。逐像素的重投影误差权重 $w_{\text{repro}} = 1/(1 + E_{\text{repro}})$ 自动处理遮挡和越界问题。总损失为 $\mathcal{L} = \mathcal{L}_{\text{rgb}} + \lambda_1 \mathcal{L}_s + \lambda_2 w_{\text{repro}} \mathcal{L}_{\text{mv}}$，其中 $\mathcal{L}_s$ 是迫使高斯扁平化的最短轴最小化损失（$\lambda_1 = 100$，$\lambda_2 = 0.2$）。
+
+\paragraph{针孔-鱼眼异构相机联合深度估计}
+
+MVGSR 处理的是同质相机的动态干扰问题。PFDepth（2025.09）~\cite{2509_26008} 则面对一个不同的挑战：相机系统本身就是异构的——同时包含针孔和鱼眼相机。直觉上，针孔相机看到的是"直线世界"，鱼眼相机看到的是"弯曲世界"，两者的投影模型完全不同，无法直接在同一框架下融合。PFDepth 是首个针孔-鱼眼异构多视角深度估计框架，专为自动驾驶等同时搭载两类相机的场景设计。
+
+两者的畸变模型和视场角差异巨大——针孔投影 $s' = \pi_P(s, E_i, K_i) = K_i E_i s / d$ 使用线性模型，鱼眼投影 $s'' = \pi_F(s, E_j, K_j, \xi_j)$ 则需要用 Kannala-Brandt 多项式 $\theta(r) = r + \xi_j^1 r^3 + \xi_j^2 r^5 + \xi_j^3 r^7 + \xi_j^4 r^9$ 或 MEI 镜面模型处理非线性畸变。
+
+PFDepth 的架构分为三个阶段。第一阶段是\textbf{畸变感知特征提升与异构空间融合}：共享编码器分别处理两类图像得到特征图 $\phi_P$ 和 $\phi_F$，再通过各自的投影函数将 2D 特征反投影到统一 3D 体素空间。关键在于鱼眼相机的反投影 $\pi_F^{-1}$ 需要求解高次多项式方程（最高九次），通过预计算的查找表加速。体素空间中，重叠区域（多个相机共同覆盖）和非重叠区域（仅单个相机覆盖）分别用独立 MLP 融合后拼接为统一体素 $V_{\text{mix}}$。
+
+第二阶段是\textbf{3DGS 动态采样增强}：为弥补静态体素的固定分辨率缺陷，PFDepth 在每个像素位置生成可移动的\textbf{高斯球}作为动态采样介质。先通过体素-像素代价体积 $C_P[s'] = \{V_{\text{mix}}[s_P^k] \cdot \phi_P[s']\}_{k=1}^D$（在 $D$ 个深度 bin 上计算相似度）推断粗深度中心 $\mu$，再用 U-Net 回归高斯球的方差和颜色球谐系数，生成高斯特征图 $F_{\text{gs}}$。该特征图与体素渲染特征拼接后送入共享深度解码器预测视差图。
+
+第三阶段将体素特征沿高度维度池化为鸟瞰图（BEV）特征，用轻量解码器回归 $4 \times 4$ 位姿矩阵支持自监督训练。训练损失结合监督损失（L1 + SILog + 排序损失）和自监督损失（时空图像重建 + 边缘感知平滑），在 KITTI-360 和 RealHet 数据集上达到 SOTA。
+
+\paragraph{多源深度仿射对齐与图优化融合}
+
+前述方法侧重于训练过程中的多视角约束。SwiftNDC（2026.02）~\cite{2602_22565} 则关注一个更前置的问题：如何在训练之前就获得高质量的初始化深度图和点云？其目标是对少于 60 视角的场景在 1 分钟内完成从图像到稠密一致深度的转换。核心挑战是：多视角深度网络（如 VGGT）全局一致性好但过度平滑、丢失薄结构；单目深度网络（如 Video Depth Anything）保留细节但仅有相对尺度；COLMAP 稀疏点精确但覆盖不足。SwiftNDC 的方案是将三者互补融合。
+
+\textbf{初始深度估计与仿射对齐}：先分别运行 VGGT 和 VDA 得到每帧的两个深度图 $D_i^{\text{vggt}}$ 和 $D_i^{\text{mono}}$，对每个视角用 COLMAP 稀疏点作为锚点，分别求解两个最小二乘仿射对齐问题 $\min_{s,b} \sum_k (s \cdot d_{ik}^t + b - d_{ik}^{\text{col}})^2$（$t \in \{\text{vggt}, \text{mono}\}$），得到对齐深度 $\hat{D}_i^{\text{vggt}} = s_i^v D_i^{\text{vggt}} + b_i^v$ 和 $\hat{D}_i^{\text{mono}} = s_i^m D_i^{\text{mono}} + b_i^m$。仿射对齐消除了整体尺度漂移，但局部厘米级误差仍然残留。
+
+\textbf{像素级神经深度修正场}是核心创新。对每个 COLMAP 稀疏点 $x_k$ 在视角 $i$ 中的投影，构建五维输入向量 $z_{ik} = (d_{ik}^v, d_{ik}^m, u_{ik}, v_{ik}, \nu_i) \in \mathbb{R}^5$（两个对齐深度、归一化像素坐标、归一化视角索引），经位置编码后送入 MLP $f_\theta$（6 层隐藏层，宽度 64），输出四个仿射残差系数 $(\alpha_{ik}^v, \beta_{ik}^v, \alpha_{ik}^m, \beta_{ik}^m)$，修正深度为 $d_{ik}^{v*} = e^{\alpha_{ik}^v} d_{ik}^v + \beta_{ik}^v$（指数化尺度保证正定性）。训练损失仅为稀疏 L1 重投影误差 $\mathcal{L}(\theta) = \sum_k (|d_{ik}^{v*} - d_{ik}^{\text{col}}| + |d_{ik}^{m*} - d_{ik}^{\text{col}}|)$。为加速训练，SwiftNDC 采用\textbf{全局-局部调度}：先用全部视角的稀疏点训练场景级网络（5000 步），再用收敛权重作为热启动对每个视角独立精调（仅 500 步，不到 1 秒）。
+
+\textbf{可靠稠密几何初始化}：修正后的深度图反投影为稠密点云，再通过\textbf{重投影循环滤波}——将每个三维点投影到邻近视角、采样深度、反投影后再重投影回原视角，重投影误差超过 1 像素的点被剔除。滤波后下采样为均匀分布的子集，直接作为 3DGS 的高质量初始化点云，显著加速后续优化和 mesh 重建。
+
+\paragraph{基元截断与深度-法线一致性去歧义}
+
+前面所有方法都在"如何施加更好的约束"上做文章。AmbiSuR（2026.05）~\cite{2605_12494} 则退后一步，从光度歧义（photometric ambiguity）的角度分析约束为什么会失效——即 3DGS 的损失函数本身存在什么根本性的"欠定性"。这一分析揭示了两个被忽视的问题，并分别提出解决方案。
+
+\textbf{问题一：基元边缘歧义}。直觉上，高斯函数像一个"光晕"——中心亮、边缘暗，但边缘的面积远大于中心。标准高斯核函数 $G_i(x) = e^{-\frac{1}{2}(x-\mu_i)^T \Sigma_i^{-1}(x-\mu_i)}$ 的边缘区域面积大但贡献低（低不透明度尾部），这些低贡献边缘区域在弱约束下引入优化歧义。核心区 $G_{\text{core}}$ 被优化膨胀以满足更高不透明度需求时，边缘区 $G_{\text{edge}}$ 被连带过度膨胀，导致重建质量退化。AmbiSuR 的解决方案是\textbf{基元截断}（Primitive Truncation）：仅保留核心区域的渲染不透明度 $\alpha_T(x) = \alpha_{\text{core}}(x) \cdot \mathbb{I}_{\text{core}}$，其中 $\mathbb{I}_{\text{core}} = \mathbb{I}(\|x - \mu_i\| < \gamma \sigma_i)$（$\gamma = 2$ 为统计置信边界），直接丢弃边缘区域。这是一种架构无关的简洁策略，不影响核心区域的正常优化。
+
+\textbf{问题二：光度混合歧义}。直觉上，如果两杯不同颜色的果汁混合后恰好是橙色，光看混合结果你无法确定原来是什么颜色——这就是”混合歧义”。标准 3DGS 的像素光度损失 $\|C - C_{\text{gt}}\|$ 仅约束加权和——只要多个高斯颜色的混合结果匹配真值，个别高斯的颜色可以任意取值。这种”欠定”的自由度允许冗余高斯通过复杂的遮挡关系模拟视角依赖效果，而非恢复确定的表面。AmbiSuR 引入\textbf{射线颜色一致性}约束，最小化射线上各高斯发射颜色的加权方差：
+
+\begin{equation}
+\mathcal{R}(r) = \sum_{i=1}^N w_i \|c_i - C\|_2^2
+\end{equation}
+
+其中 $C = \sum_{i=1}^N w_i c_i$ 为渲染颜色（期望值），$w_i$ 为混合权重。这一约束强制同一条射线上的高斯具有相似的光度属性，防止冗余高斯通过颜色差异“作弊”。
+
+\textbf{球谐歧义指示器}是 AmbiSuR 的另一创新。高斯颜色由球谐系数 $f$ 表示，直觉上，球谐的零阶分量代表"平均颜色"，高阶分量代表"随视角变化的颜色"。AmbiSuR 证明高阶球谐系数的 L2 范数 $I_{\text{SH}} = \|f_{\text{rest}}\|_2^2 = \sum_i \xi_i^2$（$\xi_i$ 为 $l \geq 1$ 阶系数）是光度歧义的自然指标——高 $I_{\text{SH}}$ 表示视角依赖性强（歧义大），极低 $I_{\text{SH}}$ 则表示光度监督不足。据此动态选取顶部 $\tau_U$ 百分位和底部 $\tau_L$ 百分位的高斯组成歧义集 $S^t$，仅对这些高斯施加\textbf{无定形局部正则化}：冻结非歧义高斯的参数，仅优化歧义高斯的旋转和位置（排除不透明度和缩放以保持稳定），用深度推导法线 $N_D$ 与先验法线 $N_P$ 的一致性损失 $\mathcal{L}_N = M^t \cdot (1 - N_D^T N_P)$ 在歧义区域施加精确的几何约束。总损失为 $\mathcal{L} = \mathcal{L}_{\text{photo}} + \lambda \mathcal{L}_{\text{geo}} + \lambda_1 \mathcal{L}_N + \lambda_2 \mathcal{R}$，其中 $\lambda = 0.1$、$\lambda_1 = 0.1$、$\lambda_2 = 10^{-5}$。
+
+\begin{takeaway}
+多视角几何与平面约束利用传统 MVS 的成熟理论增强 3DGS 的多视角一致性。AmbiSuR 的球谐歧义指示器创新性地将高阶 SH 系数作为光度歧义的自然指标，实现正则化的精准投放。核心洞察是：不是所有区域都需要同等强度的几何约束，将资源集中在歧义最大的区域能最大化正则化的效果。
+\end{takeaway}
+
+%=====================================================================
+
+\subsection{近期方法脉络：Shell-supervised geometry for Gaussian reconstruction}
+
+这一组近期工作延续 3DGS，主要把改动集中在正则化等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{Shell-Supervised Gaussian Splatting for Urban Real-to-Sim Reconstruction}
+Shell-Supervised Gaussian Splatting for Urban Real-to-Sim Reconstruction（2026.06）~\cite{2606_30014} 延续 3DGS 在“Shell-supervised geometry for Gaussian reconstruction”上的基本设定，主要改变是：使用外部 facade structural shell 监督视频驱动 Gaussian reconstruction。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：把 real-to-sim 需求中的几何稳定性纳入 3DGS 训练，而不是只优化 novel-view photorealism。
+具体而言，将外部 facade shell 对齐到视频重建坐标系，渲染 per-view geometry supervision 并加入 Gaussian 优化，缓解玻璃、反射和弱纹理带来的表面不稳定。
+适用边界是：依赖外部 shell 的可获取性和对齐精度；复杂城市细节和动态遮挡仍有挑战。
+\section{网格提取与优化}
+\label{sec:04_4}
+
+\subsection{问题背景：从高斯到网格的鸿沟}
+
+前三节的方法通过各种正则化策略提升 3DGS 的几何质量，但最终的输出仍然是高斯基元集合。许多下游应用（物理仿真、游戏引擎、CAD 设计、3D 打印）需要的是三角网格（mesh），而非高斯点云。因此，如何从高斯基元中提取高质量的 mesh 是一个独立且重要的研究问题。
+
+网格提取的关键挑战在于：高斯基元是体积元素，没有明确的表面拓扑；高斯的连续分布使简单的阈值截取产生粗糙的表面；高斯的冗余和 floater 会导致网格中的孔洞和伪影。本节按技术路线分为五类（图~\ref{fig:04_mesh}）：基于传统重建的方法（\S\ref{subsec:04_4_2}）、基于可微渲染的方法（\S\ref{subsec:04_4_3}）、混合 Mesh-Gaussian 表示（\S\ref{subsec:04_4_4}）、特定领域的网格重建（\S\ref{subsec:04_4_5}）和 CAD/B-Rep 重建（\S\ref{subsec:04_4_6}）。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.95\textwidth}{!}{\input{tikz/ch04_mesh_extraction.tikz}}
+\caption{网格提取的四大技术路线。从左到右按时间发展排列，加粗框为里程碑工作。}
+\label{fig:04_mesh}
+\end{figure}
+
+\subsubsection{基于传统重建的网格提取}
+\label{subsec:04_4_2}
+
+本路线介绍利用 Poisson 表面重建、TSDF 融合等经典算法从 3DGS 中提取三角网格的方法。
+
+\paragraph{表面对齐正则化与 Poisson 网格提取}
+
+SuGaR（2023.11）~\cite{2311_12775} 修改了原始 3DGS 的高斯优化环节，用表面对齐正则化替代自由分布的高斯基元，渲染管线保持不变。SuGaR 是从 3DGS 中提取 mesh 的里程碑工作。
+
+\textbf{动机。} 标准 3DGS 优化后高斯基元散布在空间中，彼此大量重叠，没有明确的表面概念——直接从这样的"概率云"中提取网格几乎不可能，需要先将高斯拉到表面上。SuGaR 的核心思想是：通过正则化使高斯基元对齐到场景表面，然后用 Poisson 表面重建（一种从带法线的点集推断封闭三角网格的经典算法）从对齐的高斯中提取 mesh。
+
+SuGaR 首先定义了一个从高斯基元推导的密度函数。直觉上，如果将所有高斯基元视为一团团三维的"概率云"，那么空间中任意一点的密度就是所有云团在该点的叠加——表面附近密度高、远离表面密度低。对空间中任意点 $\mathbf{p}$，将所有高斯加权求和得到密度值：
+
+\begin{equation}
+d(\mathbf{p}) = \sum_g \alpha_g \exp\!\Bigl(-\frac{1}{2}(\mathbf{p} - \boldsymbol{\mu}_g)^\top \boldsymbol{\Sigma}_g^{-1} (\mathbf{p} - \boldsymbol{\mu}_g)\Bigr)
+\end{equation}
+
+其中 $\boldsymbol{\mu}_g$、$\boldsymbol{\Sigma}_g$、$\alpha_g$ 分别为第 $g$ 个高斯的中心、协方差和混合权重。如果高斯已经很好地对齐到表面且充分扁平，那么在每个空间位置附近，贡献最大的高斯 $g^*$（马氏距离最小者）的主导作用远超其他高斯，密度函数可近似为一个理想形式。
+
+基于此观察，SuGaR 构造了一个理想符号距离函数（SDF）。直觉上，SDF 就像一个"距离指示器"——表面上的点距离为零，表面外侧为正、内侧为负。设 $s_{g^*}$ 是 $g^*$ 的最小缩放因子，则理想 SDF 定义为：
+
+\begin{equation}
+f(\mathbf{p}) = s_{g^*} - \sqrt{2\,\ln d(\mathbf{p})}
+\end{equation}
+
+这个公式的含义是：当高斯完美对齐时，$f(\mathbf{p})=0$ 的零交叉面恰好对应场景表面——离表面越远，$f$ 值越大；在表面上，$f$ 恰好为零。
+
+SuGaR 的正则化目标就是让实际 SDF 估计 $\hat{f}$ 逼近理想 SDF $f$。具体地，SuGaR 从高斯分布中采样三维点 $\mathbf{p} \sim \sum_g \alpha_g \mathcal{N}(\boldsymbol{\mu}_g, \boldsymbol{\Sigma}_g)$（这些点在梯度大的区域密度更高），最小化两种损失：
+
+\begin{align}
+\mathcal{L}_{\text{align}} &= \frac{1}{|\mathcal{P}|} \sum_{\mathbf{p} \in \mathcal{P}} |f(\mathbf{p}) - \hat{f}(\mathbf{p})| \\
+\mathcal{L}_{\text{normal}} &= \frac{1}{|\mathcal{P}|} \sum_{\mathbf{p} \in \mathcal{P}} \bigl\|\nabla f(\mathbf{p}) / \|\nabla f(\mathbf{p})\|_2 - \mathbf{n}_{g^*}\bigr\|_2^2
+\end{align}
+
+其中 $\hat{f}(\mathbf{p})$ 通过训练视角的深度图高效计算——对可见点 $\mathbf{p}$，$\hat{f}(\mathbf{p})$ 就是 $\mathbf{p}$ 的深度与对应深度图像素深度的差值。$\mathcal{L}_{\text{align}}$ 迫使高斯贴合真实表面，$\mathcal{L}_{\text{normal}}$ 确保高斯最小轴（法线方向 $\mathbf{n}_{g^*}$）与 SDF 梯度方向一致。
+
+正则化完成后，SuGaR 从训练视角的深度图中随机采样像素，沿每条视线方向在 $[-3\sigma, +3\sigma]$ 区间内（99.7\% 置信区间）搜索密度等值面点，然后用线性插值精确定位等值面交点。最后，对这些等值面点及其法线（密度梯度的归一化方向）执行 Poisson 表面重建，生成三角网格。SuGaR 还可选地在提取的 mesh 上绑定新的扁高高斯——每个三角面片上采样 $n$ 个高斯，仅保留 2 个可学习缩放因子和 1 个 2D 旋转参数（而非原始的 3 个缩放 + 四元数旋转），联合优化 mesh 和高斯，实现可编辑的高质量渲染。整个流程在单 GPU 上分钟级完成，在当时实现了速度和质量的显著突破。
+
+SuGaR 的局限在于它依赖密度函数的阈值截取来定位表面，而密度函数本身是高斯加权求和的结果——在高斯冗余或分布不均的区域，等值面的质量会下降。GOF 从另一角度切入：与其从高斯密度间接推导表面，不如直接在三维空间中定义一个连续的不透明度场，使表面提取更加精确。
+
+\paragraph{光线-高斯交点的三维不透明度场}
+
+Gaussian Opacity Fields (GOF)（2024.04）~\cite{2404_10772} 修改了原始 3DGS 的渲染环节，用显式的光线-高斯交点计算取代二维投影，从而保留完整的三维不透明度信息，使其可直接用于表面提取。GOF 是另一项里程碑工作。
+
+\textbf{动机。} 标准 3DGS 将三维高斯投影到二维屏幕后即丢失三维信息，无法从投影结果反推空间中任意一点的不透明度——因此无法定义连续的表面场来提取网格。标准 3DGS 的渲染管线将三维高斯投影到二维屏幕空间后计算像素颜色，一旦投影完成，三维信息就丢失了，无法从投影结果反推空间中任意一点的不透明度。
+
+具体而言，给定相机中心 $\mathbf{o}$ 和射线方向 $\mathbf{d}$，射线上的点为 $\mathbf{x} = \mathbf{o} + t\mathbf{d}$。直觉上，要计算射线与高斯的交点，最自然的思路是把射线变换到高斯的局部坐标系下——在那里高斯退化为一个标准椭球，射线变成一条直线，交点计算大大简化。GOF 先将射线变换到每个高斯 $k$ 的归一化局部坐标系下：
+
+\begin{equation}
+\mathbf{p}_g = \mathbf{S}_k^{-1}\,\mathbf{R}_k (\mathbf{x} - \boldsymbol{\mu}_k), \quad \mathbf{d}_g = \mathbf{S}_k^{-1}\,\mathbf{R}_k\,\mathbf{d}
+\end{equation}
+
+在此归一化坐标系中，高斯值沿射线退化为一个一维高斯函数 $G_k^{\text{1D}}(t) = \exp\!\bigl(-\frac{1}{2}(At^2 + 2Bt + C)\bigr)$，其中 $A = \mathbf{d}_g^\top\mathbf{d}_g$，$B = \mathbf{p}_g^\top\mathbf{d}_g$。对 $t$ 求极值可得交点深度 $t^* = -B/A$，该交点处的高斯值即为高斯 $k$ 对这条射线的最大贡献。
+
+GOF 的关键创新在于定义了逐点不透明度。直觉上，从相机出发沿射线行进时，每个高斯像一个"半透明的团雾"——越靠近高斯中心，雾越浓；穿过后，浓度不再增加（因为你已经穿过了最浓处）。对射线上的任意点 $t$，单个高斯 $k$ 对应的不透明度为：
+
+\begin{equation}
+\tau_k(t) = \begin{cases} o_k \cdot G_k^{\text{1D}}(t) & t \leq t^* \\ o_k \cdot G_k^{\text{1D}}(t^*) & t > t^* \end{cases}
+\end{equation}
+
+即不透明度沿射线递增到交点处达到最大值后保持不变——直觉上，一个高斯对它“前方”的点贡献递增，对“后方”的点贡献恒定。在此基础上，多个高斯沿射线累积不透明度的方式与标准体渲染完全一致：
+
+\begin{equation}
+\tau(\mathbf{o}, \mathbf{d}, t) = \sum_{k=1}^{K} \tau_k(t) \prod_{j=1}^{k-1}\bigl(1 - \tau_j(t)\bigr)
+\end{equation}
+
+由于一个三维点可被多个训练视角看到，GOF 取所有视角中的最小值定义该点的全局不透明度 $O(\mathbf{x}) = \min_{(\mathbf{o},\mathbf{d})} \tau(\mathbf{o}, \mathbf{d}, t)$，这就是所谓的高斯不透明度场。取最小值的逻辑类似于视觉外壳（visual hull）：如果一个点从某个视角看是透明的，那它就不在表面上。$O(\mathbf{x})$ 的等值面即为场景表面。
+
+基于不透明度场，GOF 用 Marching Tetrahedra 而非 Marching Cubes（一种从均匀体素网格中提取等值面的经典算法）提取自适应分辨率的 mesh。Marching Tetrahedra 使用四面体单元替代立方体单元，天然支持非均匀分辨率。核心思路是以每个高斯基元的位置和尺度为指示生成局部四面体网格：在高斯中心放置一个顶点，在高斯的三倍缩放范围（$3\sigma$）处放置边界角点，然后用 Delaunay 三角剖分构建四面体单元，并剪枝掉连接非重叠高斯的长边。这样，表面复杂的区域自然获得更密的四面体，平坦区域则更稀疏。在等值面搜索阶段，GOF 发现线性插值在非线性的高斯不透明度场上会产生伪影，因此改用 8 次二分搜索（等效于 256 次密集采样）精确定位等值面交点。
+
+GOF 还引入了两种正则化提升几何质量：深度畸变损失 $\mathcal{L}_d = \sum_{i,j} w_i w_j |t_i - t_j|$ 将射线上的高斯向同一个深度集中（但梯度不对权重回传，避免产生过大的不透明度）；法线一致性损失 $\mathcal{L}_n = \sum_i w_i (1 - \mathbf{n}_i^\top \hat{\mathbf{n}})$ 使高斯交点平面的法线与深度图梯度估计的法线对齐。
+
+GOF 通过重新定义不透明度实现了高质量的表面提取，但它仍然在 3DGS 的框架内操作——从高斯基元中推断几何。GOF 的核心思想是：与其从高斯密度间接推导表面，不如直接在三维空间中定义连续不透明度场 $O(\mathbf{x})$（取所有视角中的最小值），其等值面即为场景表面，实现精确表面提取。GS2Mesh 则选择了一条完全不同的路线：放弃直接从高斯提取几何，转而利用 3DGS 的高质量渲染能力配合成熟的立体视觉管线来重建 mesh。
+
+\paragraph{立体匹配网络从渲染图像提取网格}
+
+GS2Mesh（2024.04）~\cite{2404_01810} 的核心思想是：不直接从高斯基元提取几何，而是将 3DGS 渲染的立体图像对输入预训练立体匹配网络，借其大规模数据训练的强几何先验来重建 mesh——即用"立体视觉先验"替代"高斯基元直接重建"作为几何推断路径，从而绕开 3DGS 体积元素带来的噪声和伪影。GS2Mesh 利用预训练立体匹配模型从 3DGS 渲染的立体图像对中提取高质量 mesh。GS2Mesh 的出发点是一个关键观察：标准 3DGS 本身的几何质量有限——高斯基元是体积元素而非表面元素，从中直接提取 mesh 往往充满噪声和伪影。但如果用 3DGS 渲染出的高质量图像（而非高斯基元本身）作为输入，再通过成熟的立体视觉管线重建几何，就能借助立体匹配网络在大规模数据上学习的强几何先验来弥补 3DGS 的几何缺陷。
+
+GS2Mesh 的流程分为三个阶段。第一阶段是\textbf{立体对渲染}：对每个训练视角位姿 $(R_L, T_L)$，将左相机设为训练位姿本身（确保渲染质量最高），右相机通过水平基线 $b$ 偏移构造：
+
+\begin{equation}
+R_R = R_L, \quad T_R = T_L + (R_L [b, 0, 0]^\top)
+\end{equation}
+
+这样产生的立体对天然满足立体标定条件。基线 $b$ 的设置需要在两个矛盾因素间权衡：基线越大，立体匹配的深度精度越高（“甜点区”越宽）；但基线越大，3DGS 新视角渲染的质量越差（偏离训练视角越远，渲染噪声越大）。GS2Mesh 实验发现 $b = 7\%$ 场景半径（即 $3.5\%$ 场景直径）为最优折中，此时立体匹配的有效深度范围为 $4b \leq Z \leq 20b$（即场景直径的 $14\%$--$70\%$）。
+
+第二阶段是\textbf{立体深度估计}：GS2Mesh 用预训练的立体匹配网络（实验中 DLNR + Middlebury 预训练权重效果最佳）估计每对立体图的视差图。深度误差与视差误差的关系为 $\sigma(Z) \propto \sigma(d) \cdot Z^2 / (f_x \cdot B)$，即深度误差与距离的平方成正比——远处的深度估计天然不如近处精确。为滤除不可靠估计，GS2Mesh 应用两类掩码：遮挡掩码（左右视差一致性检查，剔除仅单侧可见的区域）和深度范围掩码（仅保留 $4b \leq Z \leq 20b$ 的有效范围）。被遮挡区域由相邻视角的估计填补。
+
+第三阶段是\textbf{TSDF 融合}：将所有视角的滤波后深度图通过截断符号距离函数（TSDF）融合为全局一致的体素网格，再用 Marching Cubes 提取三角网格。TSDF 融合通过加权平均多视角深度值来平滑单视角噪声和误差，是传统重建管线中成熟的去噪步骤。GS2Mesh 的核心优势在于\textbf{将渲染与几何解耦}：3DGS 只负责渲染高质量图像，几何重建完全交给在大规模数据上预训练的立体匹配网络。相比直接在高斯基元上提取 mesh（基线方案），这一路径规避了高斯体积元素带来的几何噪声，保留了预训练网络从真实大规模场景中学到的精确几何结构。GS2Mesh 的优势在于，它将 3DGS 的高质量渲染能力与立体匹配的强几何先验解耦——3DGS 只负责”画图”，几何重建完全交给立体视觉，从而绕过了 3DGS 自身的几何缺陷。
+
+GS2Mesh 的局限在于它依赖预训练立体匹配网络的质量（网络偏差直接传递到重建结果）且基线参数需针对场景标定。正是为了规避这一外部依赖，3DGS-to-PC 回到了更直接的路线：不依赖任何外部模型，直接将高斯基元本身转换为点云或 mesh。GS2Mesh 的局限在于它依赖预训练立体匹配网络的质量，且需要精心设计基线参数。3DGS-to-PC 回到更直接的路线：不依赖外部模型，而是将高斯基元本身转换为点云或 mesh。
+
+\paragraph{颜色校正的概率点云转换}
+
+3DGS-to-PC（2025.01）~\cite{2501_07478} 提出将 3DGS 场景转换为密集点云或 mesh 的通用框架。3DGS-to-PC 的核心问题是：直接从高斯分布中采样三维点是容易的（高斯本身就是概率分布），但如何确保采样出的点云颜色与实际渲染结果一致却非常困难——每个高斯的颜色只是球谐系数的零阶分量，而最终像素颜色是多个高斯 $\alpha$-混合 的结果，单个高斯的颜色不能代表它所在位置的视觉外观。
+
+3DGS-to-PC 的流程分为三个阶段。第一阶段是\textbf{颜色校正}：直觉上，一个像素的最终颜色是多个高斯叠加的结果，每个高斯的"贡献"取决于它的 alpha 值和累积透射率。3DGS-to-PC 首先用原始相机位姿渲染场景，对每个像素计算每个高斯的贡献权重：
+
+\begin{equation}
+C_i = \alpha_i \cdot T_i
+\end{equation}
+
+其中 $\alpha_i$ 是高斯 $i$ 在该像素的 alpha 值，$T_i$ 是累积透射率。对每个高斯，找到它贡献最大的那个像素（即 $C_i$ 最大的像素），将该像素的渲染颜色赋给该高斯作为校正后颜色。贡献为零的高斯（从未被任何视角渲染到）被直接移除。这样，每个高斯的颜色就不再是孤立的球谐零阶分量，而是反映了它实际参与渲染的视觉外观。
+
+第二阶段是\textbf{概率采样}：3DGS-to-PC 根据每个高斯的体积分配采样点数量。直觉上，体积越大的高斯覆盖的空间范围越广，需要更多的采样点来充分表达其内部结构。高斯体积的计算公式为：
+
+\begin{equation}
+V = \prod_{i} \bigl(e^{s_i}\bigr)^2
+\end{equation}
+
+其中 $s_i$ 是各维度的尺度参数。体积越大的高斯获得越多的采样点（因为它们通常代表大面积表面），用户可控制总点数来调节点云密度。采样点从高斯的多变量正态分布中随机抽取，但为了防止采样点落在高斯椭球外过远的位置，3DGS-to-PC 计算每个采样点的马氏距离：
+
+\begin{equation}
+D_M(\mathbf{x}) = \sqrt{(\mathbf{x} - \boldsymbol{\mu})^\top \boldsymbol{\Sigma}^{-1} (\mathbf{x} - \boldsymbol{\mu})}
+\end{equation}
+
+默认阈值为 $D_M \leq 2$（即 $2\sigma$ 椭球内），超出阈值的点被丢弃并重新采样，最多重试 5 次。马氏距离的关键优势是尺度不变性——无论高斯大小如何，阈值含义一致。
+
+第三阶段是\textbf{可选 mesh 生成}：3DGS-to-PC 先用表面高斯筛选过滤掉内部高斯——仅保留最大渲染贡献高于全体高斯均值的高斯作为“表面高斯”，再用统计离群点移除（Open3D）清理噪声，最后用 Poisson 表面重建生成三角网格。法线取自高斯最小缩放轴方向（与 SuGaR 一致）。3DGS-to-PC 不需要重新训练 GS 模型，是一个即插即用的后处理工具。
+
+上述方法都在"后处理"阶段提取 mesh——先优化完 3DGS，再从结果中转换。ConfMesh 则提出一个更本质的问题：能否在 3DGS 训练过程中就改善几何质量，从而让后续 mesh 提取更加可靠？
+
+\paragraph{可学习逐基元置信度网格提取}
+
+Confidence-Based Mesh Extraction（ConfMesh）（2026.03）~\cite{2603_24725} 针对 3DGS mesh 提取中的一个核心矛盾：在视角依赖外观强烈的区域（如反射面、树叶），光度损失占据主导地位，大梯度幅值导致过度致密化——小高斯被反复克隆，用几何"伪造"视角依赖外观，导致提取的 mesh 充满伪影。——小高斯被反复克隆。在这些高基元密度区域，3DGS 尤其容易用几何来“伪造”视角依赖的外观，导致提取的 mesh 充满伪影。此前方法在平衡光度与几何损失时捉襟见肘：统一加权无法适应不同区域的可靠性差异。
+
+ConfMesh 的核心设计是\textbf{可学习的逐基元置信度}。每个高斯基元被赋予一个可学习标量 $\text{conf}_i$（初始化为 0），通过指数激活 $\text{conf}_{a_i} = \exp(\text{conf}_i)$ 得到正值置信度，初始值恰好为 1。置信度图通过 $\alpha$-混合 渲染到像素空间：
+
+\begin{equation}
+\hat{C}(\bm{r}) = \sum_{i=0}^{N-1} w_i(\bm{r}) \cdot \text{conf}\_a_i
+\end{equation}
+
+即每个像素的置信度是射线上各高斯置信度的加权混合，权重与颜色渲染完全一致。渲染出的置信度图能有效识别反射表面、细薄植被、稀疏观测区域——这些区域的置信度自动降低，但仍然保持良好的重建质量。
+
+\textbf{置信度感知损失。}直觉上，置信度就像一个"可信度评分"——对于反射面等难以用光度损失准确建模的区域，置信度自动降低，告诉优化器"这里的颜色误差不可全信"。渲染置信度 $\hat{C}$ 用于对光度损失进行自适应加权：
+
+\begin{equation}
+\mathcal{L}_{\text{conf}} = \mathcal{L}_{\text{rgb}} \cdot \hat{C} - \beta \cdot \log \hat{C}
+\end{equation}
+
+其中 $\beta > 0$ 平衡两项。当 $\hat{C} = 1$ 时退化为标准光度损失。直觉上，当某区域难以用光度损失准确建模时（如强反射），置信度自动降低——第一项允许“用不确定性换取光度误差”，而第二项 $-\beta \log \hat{C}$ 防止置信度无限趋近零。关键设计是：几何损失\textbf{不受}置信度调制，因此低置信度区域的光度约束自动减弱、几何约束相对增强，实现了光度和几何之间的动态平衡。
+
+\textbf{置信度引导的致密化。}ConfMesh 进一步改造了 3DGS 的自适应密度控制机制。标准 3DGS 在高斯的位置梯度累积超过阈值 $\tau_{\text{grad}}$ 时触发 split/clone。ConfMesh 将阈值修改为：
+
+\begin{equation}
+\bar{\tau}_{\text{grad}} = \frac{\tau_{\text{grad}}}{\min(\text{conf}_{a_i},\, 1)}
+\end{equation}
+
+低置信度高斯的致密化阈值被提高（更难触发分裂），防止在困难区域产生过多小基元；而 $\min(\text{conf}\_a_i, 1)$ 的截断确保高置信度区域不会因置信度大于 1 而被过度致密化。
+
+\textbf{方差缩减损失。}即使有置信度机制，ConfMesh 仍观察到高不透明度基元隐藏在表面后方、通过半透明基元的差异化遮挡来模拟视角依赖效果的现象。根本原因在于 $\alpha$-混合 仅约束最终混合颜色，单个基元缺乏正确建模辐射的激励——多个不正确的颜色可以"恰好"混合出正确的像素值。为此，ConfMesh 引入两项方差损失，迫使每个高斯"独立合格"而非"集体蒙混"。颜色方差损失对射线上每个基元独立施加光度约束：
+
+\begin{equation}
+\mathcal{L}_{\text{color-var}} = \sum_{i=0}^{N-1} w_i(\bm{r})\, \|\text{sh}(\bm{\theta}_i, \bm{d}) - \bm{I}_{\text{gt}}\|_2^2
+\end{equation}
+
+这等价于最小化射线上混合颜色的加权方差——迫使每个高斯单独对齐真值颜色，而非仅靠混合结果“蒙混过关"。类似地，法线方差损失确保每个基元的法线与整体一致——所有高斯应该"朝同一个方向看"：
+
+\begin{equation}
+\mathcal{L}_{\text{normal-var}} = \sum_{i=0}^{N-1} w_i(\bm{r})\, \|\bm{n}_i - \bm{N}\|_2^2
+\end{equation}
+
+其中 $\bm{N} = \sum_{i=0}^{N-1} w_i(\bm{r})\, \bm{n}_i$ 为混合法线。该损失可被高效地重写为 $(1-T_N) - (1+T_N)\|\bm{N}\|_2^2$（$T_N$ 为总透射率），仅需一次前向传播即可计算。
+
+\textbf{改进的法线计算。}ConfMesh 还指出此前 GOF 的法线定义 $\bm{n}_{\text{GOF}} = -\bm{\Sigma}^{-1}\bm{d}$ 与高斯的实际最大贡献表面不一致。直觉上，正确的法线不应从高斯中心出发定义，而应在射线"最深入高斯"的那个点上取——那个点才是高斯对表面最忠实的表达。正确的法线应取自射线-高斯最大贡献点处的隐式表面梯度：
+
+\begin{equation}
+\bm{n}_{\text{Ours}} = \nabla f(\bm{x}^*) = \bm{\Sigma}^{-1}(2\bm{x}^* - \bm{\mu} - \bm{o})
+\end{equation}
+
+其中 $\bm{x}^*$ 是射线上距高斯中心最近的点。这一定义与高斯的几何一致，在几何正则化驱动高斯退化为扁平盘时与 GOF 定义趋同，但在训练过程中提供了更准确的法线监督。
+
+此外，ConfMesh 还改进了外观建模：将 D-SSIM 损失中的亮度项 $l$ 用外观校正后的图像 $\bm{I}_{\text{app}}$ 计算，而对比度项 $c$ 和结构项 $s$ 保持使用原始渲染图像，因为后者对光照不敏感。该方法仅需光度监督，无需多视角约束、迭代 mesh 提取或大型预训练模型，在保持 3DGS 固有效率的同时实现了无界场景的 SOTA mesh 质量。
+
+此前方法都从场景整体提取 mesh，但在实际应用中（如场景编辑、物体操作），往往需要物体级别的独立 mesh。Gaussian Object Carver 首次将 3DGS 与物体级分割和表面补全结合，实现了从场景图像直接输出可分离的物体 mesh。
+
+\paragraph{语义分割引导的物体级组合重建}
+
+Gaussian Object Carver（GOC）（2024.12）~\cite{2412_02075} 是首个基于 3DGS 的物体组合式重建框架，其目标是从多视角场景图像中直接生成可分离的物体级 mesh，支持灵活的场景编辑和物体操作。GOC 由两个核心模块组成：3DGS 物体组合重建模块和物体表面补全（Object Surface Completion, OSC）模块。
+
+\textbf{3DGS 物体组合重建。}GOC 在标准 3DGS 基础上引入\textbf{分割正则化}，为每个高斯基元附加一组可学习的语义特征 $f_i$，通过 $\alpha$-混合 渲染语义特征图 $F = \sum_i f_i \alpha_i T_i$，再经 MLP 和 softmax 得到逐像素实例掩码 $M_o$，以交叉熵损失 $L_o$ 监督。在几何正则化方面，GOC 同时引入单目几何先验和多视角几何约束。单目先验包括深度损失 $L_d = |D - \hat{D}|$（$D$ 为渲染深度，$\hat{D}$ 为单目深度先验）和法线损失 $L_{dn} = (1 - N_d^T \hat{N})$（$N_d$ 为从渲染深度推导的法线，$\hat{N}$ 为单目法线先验）。多视角约束包括光度重投影损失 $L_{\text{pho}}$（利用渲染深度将参考帧像素投影到目标帧，以 SSIM+L1 度量投影颜色一致性）和几何重投影一致性损失 $L_{\text{geo}}$（约束参考帧与目标帧深度图之间的循环投影误差）。渲染深度 $D$ 采用 alpha 归一化以消除透明度影响：$D = \sum_i d_i \alpha_i T_i / A$，其中 $d_i$ 为高斯中心到相机的距离，$A$ 为像素的 alpha 值。总损失为 $L = L_c + \lambda_d L_d + \lambda_{dn} L_{dn} + \lambda_{\text{geo}} L_{\text{geo}} + \lambda_{\text{pho}} L_{\text{pho}} + \lambda_o L_o$（$\lambda_d=0.3$、$\lambda_n=0.1$、$\lambda_{\text{pho}}=0.3$、$\lambda_{\text{geo}}=0.3$、$\lambda_o=0.1$），所有损失从零开始联合训练。
+
+\textbf{物体表面补全模型（OSC）。}重建出的物体 mesh 通常因遮挡而不完整——被其他物体遮挡的表面无法从图像中观测到。GOC 设计了一个通用的 OSC 模型，从稀疏或部分点云恢复完整的水密 mesh。OSC 采用轻量级 VAE 框架，编码器使用 FPS（Farthest Point Sampling）将部分点云下采样为 $M=2048$ 个核心点，经 Fourier 位置编码后通过交叉注意力层和自注意力层编码为 $E \in \mathbb{R}^{M \times D}$（$D=16$），再用 MLP 学习高斯分布的均值 $\mu_i$ 和方差 $\sigma_i^2$，通过 KL 正则化 $L_{\text{KL}}$ 约束隐空间。训练时采用 3D MAE 掩码策略：将网格表面采样点投影到虚拟相机，移除不可见点和被遮挡点，模拟真实场景中的部分观测。解码器以均匀查询点 $Q_g \in \mathbb{R}^{k \times 3}$ 和采样隐编码 $E_s$ 为输入，输出每个查询点的占用概率 $O_s(Q_g)$。损失函数采用标签平滑的 BCE 损失和 IoU 损失的组合：用 SDF 阈值 $T_{\text{iso}} = 1/128$ 将二元占用标签平滑为连续值，$L = \lambda_{\text{BCE}} L_{\text{BCE}} + \lambda_{\text{IoU}} L_{\text{IoU}} + \lambda_{\text{KL}} L_{\text{KL}}$（$\lambda_{\text{BCE}}=1.0$、$\lambda_{\text{IoU}}=0.01$、$\lambda_{\text{KL}}=0.0001$）。最终通过 Marching Cubes 在阈值 $T_b=0.3$ 处提取水密 mesh。OSC 在约 40 万个 ShapeNet 和 Objaverse 高质量 mesh 上训练（经 TSDF 转换为水密），展现出强大的零样本泛化能力，能处理来自真实传感器、深度恢复或 3DGS/NeRF 重建的任意几何点云输入。
+
+GOC 用数据驱动的方法补全缺失表面，需要在大规模 mesh 数据集上训练。ComPC 则利用生成模型（扩散模型）的先验来完成同一任务，且无需任何额外训练数据。
+
+\paragraph{扩散先验驱动的部分点云补全}
+
+ComPC（2024.04）~\cite{2404_06814} 解决部分点云的补全问题——给定因遮挡或视角不足导致不完整的 3D 重建结果，如何恢复完整的物体几何。ComPC 的流程分为三个阶段：部分高斯初始化（PGI）、零样本分形补全（ZFC）和点云提取（PCE）。
+
+\textbf{部分高斯初始化（PGI）。}ComPC 首先确定一个参考相机位姿 $V_p$，使部分点云 $P_{\text{in}}$ 在该视角下自遮挡最小且距相机最近。具体地，对 5000 个均匀分布在点云周围的候选位姿，通过表面滤波器 $h(G_{\text{in}}, V_n)$ 提取每个位姿下最前排的高斯基元索引，选择使 Chamfer Distance（衡量两个点集之间最近点距离的度量）$\text{CD}(P_{\text{in}}[h(G_{\text{in}}, V_n)], P_{\text{in}}) + w_0 \bar{d}(P_{\text{in}}, V_n)$ 最小的位姿作为 $V_p$。随后，从 $P_{\text{in}}$ 初始化 3D 高斯 $G_{\text{in}}$，关键属性设置是：所有高斯不透明度设为 1（保证完全可见），颜色设为缩放法线图 $G_{\text{in}}^c = (1 + N(P_{\text{in}}))/2$（将法线从 $[-1,1]$ 映射到 $[0,1]$）。$G_{\text{in}}$ 在后续优化中被冻结，以保留原始部分点云的几何特征。
+
+\textbf{零样本分形补全（ZFC）。}ZFC 是 ComPC 的核心：利用 2D 扩散模型（Zero 1-to-3）的先验来补全缺失区域，同时不引入任何额外训练。具体地，ComPC 创建噪声增强的点集 $P_N = P_{\text{in}} + \mathcal{N}(0, \sigma_n^2)$ 用于初始化补全高斯 $G_m$，其尺度属性初始化为 $G_m^s = 1/|P_N| \cdot \text{Neighbor}(P_N)$（到最近邻的距离），保持高斯形状与点一致。不透明度采用可微量化实现二值化：$G_m^o = f_{\text{stop}}(\lfloor G_m^o \rfloor - G_m^o) + G_m^o$（前向传播时二值化为 $\epsilon$ 或 1，反向传播时保留连续梯度），使高斯要么完全不透明（紧贴表面）要么接近透明（被视为噪声移除），避免因不透明度分散导致的中心偏离表面问题。补全过程使用 View-dependent Guidance：从参考图像 $I_{\text{in}}$ 和随机视角渲染图像 $I_i$ 计算 SDS 损失（Score Distillation Sampling，一种利用预训练扩散模型的梯度来引导优化的技术）$\nabla_{G_{\text{all}}} L_{\text{SDS}} = \mathbb{E}_{t,\epsilon}[(\epsilon_{f_Z}(I_i, t, \epsilon) - \epsilon) \frac{\partial I_i}{\partial G_{\text{all}}}]$，引导 $G_m$ 的优化方向。正则化项 $L_{\text{mreg}} = w_1 |G_m^s|$ 控制高斯尺度不过大。同时，保持约束 $L_p = w_2 \text{CD}(P_{\text{pre}}, P_{\text{in}})$ 确保从参考位姿观察 $G_{\text{all}}$ 时，可见高斯中心 $P_{\text{pre}}$ 与原始部分点云 $P_{\text{in}}$ 的形状一致性。
+
+\textbf{点云提取（PCE）。}优化完成后，ComPC 通过高斯表面提取算法从 $G_{\text{all}}$ 中选取表面点 $P_{\text{surf}}$：先用不透明度阈值 0.5 过滤有效高斯，再从 500 个均匀分布的相机位姿观察有效高斯，收集所有最前排可见高斯的中心。由于补全区域的点密度可能与原始区域差异显著，ComPC 引入 Grid Pulling 模块实现均匀重采样：学习一个 SDF 场 $g(\cdot)$ 将随机采样点拉向 $P_{\text{surf}}$ 的表面（$P_{\text{pull}} = P_{\text{sam}} - g(P_{\text{sam}})\nabla g / \|\nabla g\|$），训练损失为 Chamfer Distance；同时设计合并层 $g_m$，根据到 $P_{\text{in}}$ 的距离将 $P_{\text{pull}}$ 与原始部分点云融合——距原始点近的位置直接继承原始几何，远的位置使用补全结果，实现两种几何的无缝拼接。整个流程无需文本描述或任何训练数据，是一个将 3DGS 与生成模型结合用于几何补全的零样本方案。
+
+以上方法都采用"先训练 3DGS，再提取 mesh"的两阶段策略。接下来的方法将 mesh 提取与 3DGS 训练耦合在一起，通过可微渲染使 mesh 拓扑和顶点直接参与梯度优化。
+
+\subsubsection{基于可微渲染的网格优化}
+\label{subsec:04_4_3}
+
+本路线介绍通过可微表面提取器和端到端训练直接优化三角网格拓扑与顶点位置的方法。
+
+\paragraph{SDF 推导三角网格端到端联合优化}
+
+Direct Learning of Mesh and Appearance（2024.05）~\cite{2405_06945} 修改了原始 3DGS 的表示环节，用 SDF 推导的三角 mesh 替代自由分布的高斯基元作为几何表示，渲染管线（$\alpha$-混合）保持不变。该方法提出一种端到端框架，将 3D 高斯严格绑定到从 SDF 推导的 mesh 面上，使 mesh 的拓扑和顶点位置直接参与 3DGS 的训练循环。整个模型由四个耦合组件构成：SDF 场 $D: U \to \mathbb{R}$、三角 mesh $G=(V,F)$、约束 3DGS 模型和神经外观模型。
+
+\textbf{SDF 与可微 mesh 计算。}场景几何由 SDF 的零水平集 $\{D(x)=0\}$ 隐式定义。SDF 用显式格式表示：在规则 3D 网格节点 $\{x_n\}_{n=1}^N$ 上存储值 $\{d_n\}_{n=1}^N$，任意点 $x$ 的 SDF 值通过包围该点的 8 个节点的三线性插值计算。为使 SDF 可学习，采用 FlexiCubes 作为可微表面提取器（替代不可微的 Marching Cubes），将 SDF 参数 $\{d_n\}$ 的梯度回传到 mesh 面片，使面片能随训练演化。针对无界室外场景的两个特殊挑战——背景尺度巨大导致内存爆炸、前景与背景需要分离建模——DirectMesh 采用双分支策略：前景由 SDF + mesh + 约束高斯表示，背景由标准 3DGS 高斯 $GS_{\text{bg}}$ 表示，两者在渲染时直接合并。为控制内存，还采用\textbf{节点优化}（每步仅处理当前相机视锥内的可见网格节点）和\textbf{由粗到细网格}（从低分辨率开始、训练中逐步提高分辨率，节点值通过线性插值初始化）两种策略。
+
+\textbf{几何一致的高斯。}直觉上，如果将三角面片想象为一块"面板"，高斯就是贴在面板上的"贴纸"——贴纸的位置用重心坐标（三角形内部的归一化坐标）定义，当面板移动时贴纸自动跟随。每个三角面片 $(v_1, v_2, v_3)$ 上放置 $K$ 个高斯（$K$ 取决于期望的细节层次），高斯中心位于固定的重心坐标 $\beta_k \in S^2$（2-单纯形）处：
+
+\begin{equation}
+\mu_k = [v_1, v_2, v_3]\, \beta_k
+\end{equation}
+
+重心坐标 $\beta_k$ 固定不变，但中心 $\mu_k$ 随 mesh 顶点移动——这意味着高斯位置完全由 SDF 参数决定。
+
+\textbf{协方差定义。}高斯协方差通过局部坐标系定义：以 $v_1$ 为原点，$\bm{t}_1 = \overrightarrow{v_1 v_2} \times \overrightarrow{v_1 v_3}$（法线方向）、$\bm{t}_2 = \overrightarrow{v_1 v_2}$、$\bm{t}_3 = (\bm{t}_1 \times \bm{t}_2) \times \bm{t}_1$ 为三轴，构建旋转矩阵 $R_{t2w} = [\hat{t}_1, \hat{t}_2, \hat{t}_3]$。对近似等边三角形，局部协方差取 $\Sigma_e = \text{diag}(\epsilon, r^2, r^2)$（薄盘状），$\epsilon$ 极小使高斯沿法线方向被压扁。对不规则三角形，引入线性变换 $M$ 修正 $\Sigma_e$，最终世界坐标系协方差为 $\Sigma = R_{t2w} M \Sigma_e M^T R_{t2w}^T$。
+
+\textbf{神经外观模型。}由于 mesh 在训练中不断演化（面片拓扑 $F$ 从第 $t-1$ 步变到第 $t$ 步），直接优化逐高斯颜色行不通——相邻步骤的面片之间没有自然的一一对应。DirectMesh 引入神经外观模型 $A: \mathbb{R}^3 \to \mathbb{R}^d$（$d$ 为球谐系数数），将高斯中心映射为颜色 $c = A(\mu)$。$A$ 使用哈希网格位置编码和轻量级 MLP 实现（受 NvdiffRec 启发），参数在训练中保持一致，即使面片拓扑变化也能稳定学习。实验表明该方案比朴素的近邻搜索方法快约 40 倍且细节更丰富。所有高斯不透明度设为 1，避免半透明面片。
+
+\textbf{渲染与精调。}渲染采用标准 3DGS 的 $\alpha$-混合，损失仅为光度监督 $\mathcal{L} = (1-\lambda)\mathcal{L}_1 + \lambda \mathcal{L}_{\text{D-SSIM}}$。当 mesh 和外观模型收敛后，DirectMesh 固定面片拓扑 $F$，进入精调阶段：从外观模型 $A$ 采样球谐系数作为逐高斯可学习变量（而非继续通过 MLP 查询），协方差参数化为 2D 缩放 + 复数旋转（类似 SuGaR），实现几何和外观的联合精修。
+
+端到端网格方法通过 SDF 间接定义 mesh，mesh 顶点位置由 SDF 参数决定。Triangle Splatting+ 则直接以三角面片为基元，完全抛弃高斯核——每个三角面片既承担几何又承担外观，训练结束后自然形成可直接使用的 mesh。
+
+\paragraph{顶点共享不透明三角面片渲染}
+
+Triangle Splatting+（2025.09）~\cite{2509_25122} 修改了原始 3DGS 的基元类型，用不透明三角面片替代高斯核，渲染管线的 $\alpha$-混合 框架保持不变。该方法将基元从高斯核替换为不透明三角面片，实现可直接导入游戏引擎的端到端网格优化。其表示层采用\textbf{顶点共享}设计：定义全局顶点集 $V=\{v_i \in \mathbb{R}^3\}_{i=1}^{N}$，每个顶点携带位置 $(x_i, y_i, z_i)$、颜色 $c_i$ 和不透明度 $o_i$；三角面片 $T_m=(i,j,k)$ 由三个顶点索引定义，面片不透明度取顶点均值 $o_{T_m}=\text{mean}(o_i, o_j, o_k)$，面片内颜色通过重心坐标插值 $c_{T_m}=\lambda_i c_i + \lambda_j c_j + \lambda_k c_k$。共享顶点使得相邻面片自然连通，梯度从所有相连面片回传到同一顶点。
+
+渲染时，3D 顶点经针孔相机模型投影到 2D，利用带符号距离场定义窗口函数 $I(p)$：在三角面片内心处值为 1、边界处为 0，由全局平滑参数 $\sigma$ 控制过渡宽度。像素颜色按深度顺序 $\alpha$-混合：
+
+\begin{equation*}
+C(p) = \sum_{n=1}^{N} c_{T_n}\, o_{T_n}\, I(p) \prod_{i=1}^{n-1}(1-o_{T_i}\, I(p)).
+\end{equation*}
+
+训练结束后 $\sigma \to 0$、$o \to 1$，渲染公式退化为 $C(p) = c_{T_n}\, I(p)$，即每个像素仅需一次求值，实现零过度绘制的实时渲染。
+
+训练策略是获得高质量不透明网格的关键。
+
+\textbf{平滑参数退火}：$\sigma$ 从 1.0 线性退火至 0.0001，前期提供充分的梯度流、后期收敛到锐利的三角面片。
+
+\textbf{不透明度调度}：重定义 Sigmoid 映射为 $\phi(x) = O_t + (1-O_t)\,\text{sigm}(x)$，其中不透明度下界 $O_t$ 在训练中从 0 线性增至 1，逐步把半透明面片推向完全不透明。
+
+\textbf{致密化}：采用 MCMC 采样选择候选面片，通过中点细分（midpoint subdivision）将一个三角形分成四个子三角形，新增顶点继承相邻顶点的平均颜色和不透明度，且保持连通性。
+
+\textbf{剪枝}：5k 迭代时以阈值 $T_o=0.2$ 硬剪枝，去掉约 70\% 的面片；此后监控每个面片在所有训练视角下的最大体渲染权重 $w = T \cdot o$（$T$ 为透射率），低于阈值则移除。最终损失函数为 $L = (1-\lambda)L_1 + \lambda L_{\text{D-SSIM}} + \lambda_1 L_o + \lambda_2 L_n$，其中法线损失 $L_n$ 由法线估计网络监督。
+
+Triangle Splatting+ 生成的三角面片是互不连通的"面片汤"（triangle soup），缺乏网格拓扑。MeshSplatting 在此基础上增加连通性约束，通过受限 Delaunay 三角剖分将面片汤转换为真正的流形网格。
+
+\paragraph{两阶段三角面片汤到连通网格转换}
+
+MeshSplatting（2025.12）~\cite{2512_06818} 基于 Triangle Splatting 的顶点共享表示，通过\textbf{两阶段优化}将无结构三角面片汤（triangle soup）转换为连通网格。
+
+\textbf{阶段一——三角面片汤优化}：从 SfM 稀疏点云初始化等边三角形（大小正比于最近邻距离的均值），初始不透明度设为 0.28。此阶段不施加任何连通性约束，每个三角形自由移动，行为类似基于点的泼溅，能快速覆盖可见场景。与原始 Triangle Splatting 不同的是，MeshSplatting 在面片内部插值顶点属性（颜色、不透明度），而非保持均匀。
+
+\textbf{阶段二——网格创建与精调}：在三角面片汤收敛后，对其执行\textbf{受限 Delaunay 三角剖分}（restricted Delaunay triangulation）。该操作先计算标准 Delaunay 四面体化，再识别对偶 Voronoi 边与输入面片汤表面相交的四面体面。关键特性：不引入新顶点、不修改已有顶点位置，仅建立连通关系，保留阶段一优化得到的空间精度和外观。获得连通性后继续优化，共享顶点的梯度由所有相邻面片累积，确保每个顶点根据所有相邻面片一致更新。
+
+与 Triangle Splatting+ 类似，MeshSplatting 也采用不透明度调度（$O_t$ 从 0 线性增至 1）和平滑参数 $\sigma$ 的全局退火策略（1.0 至 0.0001），将半透明软边界逐步转为不透明锐利三角形。致密化同样基于 MCMC 采样加中点细分，但连通性使得每次细分仅新增 6 个顶点（连通时），而非无结构时的 12 个。
+
+\textbf{剪枝与损失函数。}剪枝策略分两步：5k 迭代时硬剪枝 $o < 0.2$（去掉约 70\% 面片），此后监控最大体渲染权重 $w = T \cdot o < O_t$ 则移除。损失函数为 $L = L_{\text{3DGS}} + \lambda_o L_o + \lambda_z L_z + \lambda_n L_n + \lambda_d L_d$，其中深度对齐损失 $L_z = \frac{1}{N}\sum_{i=1}^{N}|z_i - z_i^*|$ 将顶点拉向观测深度图，促进流形形成；法线损失 $L_n$ 同时受外部法线估计网络和 2DGS 自监督正则化监督。在 Mip-NeRF 360 上比 SOTA 提升 +0.69 dB，训练速度快 2 倍且内存减半。
+
+前述方法通过显式的三角面片直接获得 mesh。Gaussian Wrapping 则回到高斯基元，但为每个高斯赋予方向信息，从而推导出连续的占用场和法线场，实现无需显式 mesh 定义的表面提取。
+
+\paragraph{定向法线高斯的封闭形式水密网格}
+
+Gaussian Wrapping（2026.04）~\cite{2604_07337} 为每个高斯引入可学习的定向法线 $n_i \in S^2$，基于 Objects as Volumes 框架推导出封闭形式的占用场和法线场，实现高质量水密网格提取。
+
+\textbf{动机}：标准 3DGS 的高斯核是各向同性的“密度团”，无法区分表面的内外侧。Gaussian Wrapping 受到 Objects as Volumes（OaV）理论的启发：如果将场景建模为随机曲面，则占用函数 $\omega$ 是某点被占用的概率，空余率 $v(\mathbf{x}) = 1 - \omega(\mathbf{x})$ 与体渲染中的衰减系数直接关联——前提是衰减满足互易性 $\tau(\mathbf{o}, \mathbf{d}) = \tau(\mathbf{o}, -\mathbf{d})$。标准 3DGS 的衰减不满足互易性，因此无法直接推导几何场。
+
+\textbf{定向衰减与空余率}：Gaussian Wrapping 为每个高斯 $G_i$ 添加定向法线 $n_i$，定义定向衰减系数：
+
+\begin{equation*}
+\tau_i(\mathbf{x}) = \max\big(0,\, -n_i \cdot (1 - G_i(\mathbf{x}))\big).
+\end{equation*}
+
+直觉上：法线指向一侧（外侧）时，高斯密度 $G_i$ 从表面中心向外衰减，$1-G_i$ 从内向外增大，定向点积取正值——这正是外侧的“空余”信号；法线反向一侧则被“截断”为 0，表示该侧完全占用。该衰减满足互易性，因此 OaV 框架适用，可以直接推导出封闭形式的\textbf{高斯向量场}及其归一化\textbf{法线场}：
+
+\begin{equation*}
+V(\mathbf{x}) = \sum_{i=1}^{N} (1 - G_i(\mathbf{x})) \cdot n_i, \quad \hat{n}(\mathbf{x}) = \frac{V(\mathbf{x})}{\|V(\mathbf{x})\|}.
+\end{equation*}
+
+$\hat{n}(\mathbf{x})$ 在表面附近与真实法线场一致。不需要额外可学习参数——法线场完全由高斯参数和定向法线确定。
+
+\textbf{训练策略}：法线对齐损失 $L_N = \sum_p (1 - N(p) \cdot D(p))$ 强制渲染法线与渲染深度的图像空间梯度一致（法线应垂直于表面）。当高斯未能完全包裹表面时出现间隙，法线对齐误差局部升高，Gaussian Wrapping 据此执行\textbf{法线感知致密化}：克隆高误差高斯并翻转其法线，闭合包裹壳的间隙。总损失为 $\mathcal{L} = \mathcal{L}_{\text{RGB}} + \lambda_{\text{DN}} L_{\text{DN}} + \lambda_N L_N + L_{\text{MV}}$。
+
+\textbf{局限}：Gaussian Wrapping 依赖前期 3DGS 优化质量——若初始高斯分布稀疏或存在 Floater，高斯向量场推导的占用场将出现系统性偏差，致密化策略仅能弥补局部误差而无法纠正全局初始化缺陷。此外，法线对齐损失 $L_N$ 与 RGB 损失的联合优化需谨慎调整 $\lambda_N$，权重过高会导致法线过拟合渲染梯度而非几何真实性。
+
+\textbf{网格提取}采用两种策略。
+
+\textbf{Pivot-Based Marching Tetrahedra}：每个高斯生成两个 Delaunay 轴点（中心 $\mu_i$ 和 $\mu_i + 3s_i n_i$），仅 2 个轴点（对比先前方法 9 个），在 Delaunay 四面体化上执行 Marching Tetrahedra，通过二分搜索精调到 0.5-等值面。
+
+\textbf{Primal Adaptive Meshing}：从 MT 网格按距相机距离反比加权采样顶点，用 Newton 迭代投影到空余率的 0.5-等值面 $x_{i+1} = x_i + \frac{1}{2}(0.5 - v(x_i))\hat{N}(x_i)$，过滤离群点后执行 Delaunay 四面体化并提取内外分界面。两种策略均能恢复自行车辐条等极薄结构，但仍受 Marching Tetrahedra 固有离散化误差限制，在曲率剧烈变化区域需依赖顶点密度换取精度；Primal Adaptive Meshing 的 Newton 迭代投影在低空余率梯度区域可能陷入局部不动点，需以额外过滤步骤抑制震荡伪影。
+
+Gaussian Wrapping 从定向高斯推导连续表面。DiWR 则从另一个方向出发：给定一个无方向的噪声点云（例如从 3DGS 中提取的），如何联合优化法线方向、面积权重和置信系数来重建水密表面？
+
+\paragraph{广义绕数场引导的水密表面重建}
+
+DiWR（2026.02）~\cite{2602_13801} 从无方向噪声点云中鲁棒重建水密表面。给定无方向点集 $P=\{p_i\}_{i=1}^{n}$，DiWR 将法线方向 $N=\{n_i\}$、面积权重 $a=\{a_i\}$ 和置信系数 $c=\{c_i\}$ 作为未知变量联合优化，采用交替优化策略求解。
+
+\textbf{广义绕数场}（generalized winding number）是 DiWR 的核心几何工具。给定查询点 $q$，绕数场定义为：
+
+\begin{equation*}
+w_\Theta(q) = \sum_{i=1}^{n} \frac{a_i c_i\, (p_i - q) \cdot n_i}{4\|p_i - q\|^3}.
+\end{equation*}
+
+直觉上，绕数衡量“点 $q$ 被定向曲面包围的程度”——若法线全局一致且 $q$ 在封闭曲面内部，则 $w \approx 1$；在外部则 $w \approx 0$；表面上 $w \approx 1/2$。面积权重 $a_i$ 控制每个点对曲面的面积贡献，置信系数 $c_i$ 标记内点（$c_i=1$）与离群点（$c_i=0$）。
+
+\textbf{Dirichlet 能量}是优化的主目标。在连续情形下，一致定向的绕数场在曲面外部是调和的，从而极小化 Dirichlet 能量 $E_{\text{diri}}(\Theta) = \int_{B \setminus U(\Theta)} \|\nabla w_\Theta(x)\|^2\, dV(x)$，其中 $U(\Theta)$ 是高置信点周围的薄排除带。该能量促使绕数场在空间中尽可能平滑——正确的定向产生调和场（低能量），错误的定向导致绕数场剧烈波动（高能量）。
+
+\textbf{三阶段交替优化}。由于 $N$、$a$、$c$ 非线性耦合，DiWR 采用分阶段交替策略：\textbf{(i) 法线更新}：以 DWG（Diffusing Winding Gradual）算法作为黑盒法线更新算子，根据当前有效权重 $a_i c_i$ 将随机初始化的法线逐步推向全局一致。
+
+\textbf{(ii) 面积权重优化}：固定法线和置信度，最小化 $\lambda_a E_{\text{diri}} + \lambda_1 E_{\text{surf}} + \lambda_2 E_{\text{area}}$，其中 $E_{\text{surf}}$ 鼓励高置信点的绕数值接近 $1/2$，$E_{\text{area}}$ 约束总有效面积在每阶段保持稳定。
+
+\textbf{(iii) 置信度优化}：先用双均值聚类（bi-means）对绕数值做粗分离（均值偏离全局均值更远的簇判为离群点），再用密度分层细化——按局部密度将点分为 128 层，每层内取平均置信度，绕数值接近全局均值的点保持不变。然后最小化 $\lambda_c E_{\text{diri}} + \lambda_3 E_{\text{surf}} + \lambda_4 E_{\text{area}} + \lambda_5 E_{\text{conf}}$，其中极化项 $E_{\text{conf}} = \sum_{i} |c_i(1-c_i)|$ 驱使置信度趋向二值化。
+
+\textbf{重建}：优化后，保留高置信点（$c_i > \tau_{\text{in}}=0.9$）及其定向法线，输入 Screened Poisson Surface Reconstruction（sPSR）。对于采样严重不均匀或残留离群点较多的输入，可用有效面积权重 $c_i a_i$ 加权 sPSR 的筛选项，使稀疏区域和稠密区域的贡献重新平衡。DiWR 在 3DGS 等产生的噪声点云上表现出色，能从高度退化的输入中恢复水密网格。
+
+前两类方法分别使用传统重建管线和可微渲染来获得 mesh。第三类方法选择折中：同时维护 mesh 和高斯两种表示，让它们各自承担擅长的角色——mesh 负责几何、高斯负责外观——通过联合优化达到更好的整体效果。
+
+\subsubsection{混合 Mesh-Gaussian 表示}
+\label{subsec:04_4_4}
+
+本路线介绍将可学习 mesh 与 3DGS 高斯基元混合使用，各自负责不同场景组件的协同重建方法。
+
+\paragraph{SAM 实例分割的 Mesh-高斯混合室内重建}
+
+Mesh-3DGS 混合室内重建（2024.07）~\cite{2407_16173} 用可学习 mesh（球谐纹理）表示房间布局，用 3DGS 表示物体，两者通过联合光栅化混合渲染。核心难题是靠近墙壁的物体归属歧义——若高斯挡在 mesh 前会阻断梯度回传。作者利用 SAM 无提示模式生成实例掩码，将每个掩码区域的平均不透明度 $o_i$ 推向 $0$ 或 $1$：$\mathcal{L}_{\mathrm{SAM}} = \sum_i \frac{\sqrt{A_i}}{\sum_k \sqrt{A_k}}\, o_i(1 - o_i)$，即同一实例只能由一种基元表示。训练分三阶段：先单独预训练 mesh，再联合训练，最后在致密化结束后施加 SAM 损失并追加额外致密化以填补空缺。
+
+前一个方法用 mesh 表示房间布局。MeshGS 将同样的混合思路应用于大规模场景，并引入距离阈值来区分表面绑定高斯和自由高斯。
+
+\paragraph{距离阈值区分绑定与自由高斯}
+
+MeshGS（2024.10）~\cite{2410_08941} 面向大规模场景，先用 BakedSDF 提取 mesh 并通过二次误差度量（QEM）激进简化至可管理规模，再将高斯绑定到 mesh 三角面中心。关键设计是按距离阈值 $d_{\mathrm{th}}$ 将高斯分为紧密绑定（$d_i < d_{\mathrm{th}}$）和松散绑定两类：紧密绑定高斯施加法线一致性损失 $\mathcal{L}_{\mathrm{nc}} = \sum_{G^t}(1 - \mathbf{n}_i \cdot \mathbf{n}_f)$ 使其贴合表面，松散绑定高斯保持自由以表达毛发、烟雾等体积效果。渲染时利用 mesh 深度遮罩剔除被表面遮挡的高斯，在保持渲染质量的同时大幅减少高斯数量。
+
+MeshGS 通过距离阈值区分绑定与自由高斯。Hybrid Mesh-Gaussian 则专注于室内场景，用 mesh 承载平坦的墙壁/地板/天花板，用高斯处理家具等复杂物体，并通过透射率感知纹理损失避免外观"幽灵投影"到错误的 mesh 上。
+
+\paragraph{透射率感知纹理的网格-高斯联合渲染}
+
+Hybrid Mesh-Gaussian（2025.06）~\cite{2506_06988} 提出纹理网格 + 高斯的联合光栅化方案，专为室内场景设计。先用 PGSR 提取粗 mesh，再通过法线总变差（剔除复杂几何区域）和相邻面夹角（剔除 $>45°$ 的面片）进行自动化裁剪，保留的平坦区域附加 UV 纹理图。联合渲染时，mesh 作为不透明背景：$I_h = I_{\mathrm{gs}} + T \cdot I_m$（$T$ 为高斯透射率），高斯仅在 mesh 前方渲染。核心损失为透射率感知纹理损失 $\mathcal{L}_t = M_T \| I_m - I_{\mathrm{GT}}\|_2^2$，掩码 $M_T = \sigma(k(T - 0.5))$ 确保只在 mesh 可见的像素上优化纹理，防止将前方物体“幽灵投影”到背面 mesh 上。
+
+前述混合方法都是先提取粗 mesh，再绑定高斯——mesh 的质量受限于初始提取的精度。MILo 提出一种更紧密的耦合方式：在每次训练迭代中都执行可微的 mesh 提取，使 mesh 直接参与梯度回传。
+
+\paragraph{训练循环内可微 Marching Tetrahedra}
+
+MILo（2025.06）~\cite{2506_24096} 将网格提取从后处理变为训练循环内的可微操作。每次迭代执行五步：从高斯中心 + 8 个轴对齐角点采样 Delaunay 顶点 $\to$ 构建四面体化 $\to$ 为每个顶点学习独立 SDF 值 $\to$ 可微 Marching Tetrahedra 提取 mesh $\to$ 双路渲染对比。体积-表面一致性损失 $\mathcal{L}_{\mathrm{mesh}} = \lambda_{\mathrm{MD}}\sum_i(1 + |D_i - D_{M,i}|) + \lambda_{\mathrm{MN}}\sum_i(1 - \mathbf{n}_i \cdot \mathbf{N}_{M,i})$ 强制高斯深度/法线与 mesh 对齐。MILo 还引入抗侵蚀正则化（鼓励高斯中心的 SDF $<0$）和内部伪影正则化（将 mesh 内部顶点的 SDF 推负），生成干净的水密网格。
+
+MILo 从高斯中提取 mesh。OMeGa 反其道而行之：先有 mesh，再将 2D 高斯通过重心坐标灵活绑定到三角面片上，让高斯在面片上自由移动而非硬性固定于中心。
+
+\paragraph{重心坐标绑定高斯到三角面片}
+
+OMeGa（2025.09）~\cite{2509_24308} 通过重心坐标绑定将 2D 高斯灵活锚定在三角面片上：$\mathbf{m} = u\mathbf{v}_1 + w\mathbf{v}_2 + (1 - u - w)\mathbf{v}_3$，高斯可在面片上自由移动而非硬性固定于中心。尺度约束为 $s = s_{\mathrm{rel}} \circ s_0$，其中 $s_{\mathrm{rel}} \in [s_{\min}, s_{\max}]$ 确保高斯大小与对应面片匹配，旋转由面片法线加可学习面内旋转 $\mathbf{R}_{2d}$ 确定。网格优化采用粗到精策略：基于顶点梯度投影到面法线方向的误差 $e(f_j) = \sum_{v_i \in f_j}\|(\nabla_{v_i}\mathcal{L}) \cdot \mathbf{n}_{f_j}\|$ 对高误差面片做中点细分，同时通过 Chamfer 距离移除无对应高斯的多余面片，在室内场景 Chamfer-L1 上降低 47.3\%。
+
+OMeGa 通过重心坐标紧密绑定高斯和 mesh。HaloGS 提出"松耦合"策略——三角形只提供几何骨架，高斯围绕三角形自由分布，两者之间不做逐顶点绑定。
+
+\paragraph{三角形骨架与神经高斯的松耦合双支架}
+
+HaloGS（2025.05）~\cite{2505_20267} 将场景表示为\textbf{可学习三角形基元}与\textbf{神经高斯}的双支架结构。几何由三角形基元承担：每个三角形由三个可移动顶点 $p_0, p_1, p_2$ 参数化，通过 2DGS 的射线-片元交叉算法光栅化为法线图 $N(x) = \sum_i n_i w_i \prod_{j<i}(1-w_j)$ 和深度图 $D(x) = \sum_i d_i w_i \prod_{j<i}(1-w_j)$。三角形定义局部坐标系——重心 $\bar{p}$ 为原点，第一顶点 $p_0$ 局部坐标为 $[1,0]^T$，主切向量 $t_u = (p_0 - \bar{p})/\|p_0 - \bar{p}\|$，法线 $n = (p_1-p_0) \times (p_2-p_0)/\|(p_1-p_0) \times (p_2-p_0)\|$。每个三角形还配有可学习不透明度 $o$ 和边缘保持核参数 $\gamma, \beta$，用于计算射线-三角形交点的贡献权重 $w(x) = \text{Sigmoid}(-\gamma \sum_{j=0}^2 \exp(-\beta \cdot \text{dist}(x, e_j)))$。外观由从三角形派生的神经高斯承担：每个三角形配备局部上下文特征 $f_v \in \mathbb{R}^{32}$、缩放因子和 $k$ 个可学习偏移量，高斯属性由此解码生成，并嵌入 Octree-GS 八叉树结构支持 Level-of-Detail 渲染。
+
+“松耦合”的关键在于三角形与高斯\textbf{不是}逐顶点绑定——三角形仅提供几何骨架，高斯围绕三角形自由分布。训练采用两阶段粗-细策略。粗阶段利用 Depth-Anything-V2 和 StableNormal 的单目先验通过几何损失 $\mathcal{L}_{\text{geo}} = \|D - D_{\text{ref}}\|_1 + \|N - N_{\text{ref}}\|_1 + \|1 - N^T N_{\text{ref}}\|_1$ 约束三角形位置。细阶段由神经高斯的渲染损失驱动，渲染出更精细的深度/法线图反过来监督三角形细节——使用小波变换权重图 $W$（在边缘和纹理区域趋近 1）增强高频区域的监督。致密化策略检测每条三角形边上的方向导数差异 $\delta_e = (f(p_1)-f(p_0))(p_1-p_0)/\|p_1-p_0\|$（$f$ 为隐式场梯度），超过阈值时在中点插入新顶点分裂三角形。最终三角形通过 GoCoPP 聚类为平面基元，再经 kinetic shape reconstruction 缝合为紧凑网格。
+
+前述方法都引入了额外的几何表示（SDF、mesh 三角形）来约束高斯。GSSR 则坚持纯粹的高斯路线——不引入任何隐式表示，直接在逐高斯粒度上强制几何约束。
+
+\paragraph{逐高斯法线一致性与周期性重初始化}
+
+GSSR（2025.07）~\cite{2507_18923} 受 Point Set Surfaces 经典工作启发，提出在\textbf{逐高斯}粒度上强制几何约束，使高斯均匀紧贴潜在表面且法线一致。GSSR 指出此前 PGSR 等方法仅约束融合深度图/法线图的质量，却忽视了单个高斯的实际位置——大量高斯可以“漂浮”在表面两侧形成厚壳层，只要融合结果看起来合理即可。这种厚壳层导致几何噪声和不稳定，且不利于场景编辑。
+
+GSSR 的约束分两层。
+
+\textbf{像素级法线一致性}：在单视图层面，约束渲染深度图推导的法线与各高斯协方差最小轴方向一致，类似 2DGS 的法线损失，但 GSSR 特别强调这一约束在像素级别的逐高斯响应。
+
+\textbf{多视角光度一致性}：在跨视图层面，约束同一高斯在多个视角下的渲染贡献一致，从全局角度校正高斯位置。为消除冗余高斯，GSSR 引入\textbf{不透明度正则化损失}驱赶低贡献高斯的透明度趋近零，并在后续剪枝中移除。此外，GSSR 还引入\textbf{周期性深度和法线引导的高斯重新初始化}：每隔一定迭代次数，利用当前渲染的深度/法线图重新分布高斯位置，使高斯从聚集的区域分散到表面稀疏覆盖的区域，实现更均匀的空间分布。GSSR 不引入额外隐式表示（SDF、体素网格等），纯粹通过 3DGS 参数的直接优化实现高精度表面重建。针对 GSSR 在周期性重初始化环节的潜在不稳定性：该方法依赖当前渲染的深度/法线图质量重新分布高斯位置，若训练早期深度/法线估计偏差较大，重初始化反而可能将高斯从正确位置驱赶至错误区域，形成误差累积；此外，固定周期的重初始化策略对不同复杂度场景的适应性缺乏验证，在纹理稀缺或几何歧义性高的区域可能出现非预期的高斯分布畸变。
+
+GSSR 从零开始优化高斯的表面贴合度。但如果场景已经有粗糙的 mesh（如建筑 BIM 模型或激光扫描结果），能否直接利用这些先验几何来加速和改善重建？
+
+\paragraph{面积自适应重心坐标采样增强粗糙网格}
+
+Enhancement of 3DGS using Raw Mesh（2024.07）~\cite{2407_15435} 针对建筑重建中一个实际场景：建筑信息模型（BIM）或激光扫描通常已提供粗糙 mesh，但 SuGaR 等方法无法直接利用这些粗糙 mesh——建筑 mesh 的面片数量少、形状粗糙，SuGaR 为每个面片分配固定数量的高斯无法适应巨大的面积差异。该工作的核心贡献是\textbf{面积自适应的重心坐标采样}策略。
+
+具体地，在每个三角形面片上用重心坐标 $w = (w_a, w_b, w_c)^T \in [0,1]^3$ 表示采样点位置，这使得采样可以完全并行化——无需知道顶点的真实坐标，只需预计算一组重心坐标模板。关键设计是\textbf{分级面积采样}：先将所有三角形按面积降序排列，以面积比阈值 $1/4$ 分为 $N+1$ 级（$N$ 根据场景复杂度取 5--7），最小面积等级分配最少采样点，每增大一级采样点数量按指数增长（倍率 4）。位置通过递归中点细分确定：每次将三角形三边中点相连生成 4 个子三角形，取子三角形几何中心为采样点。最终采样点位置由矩阵乘法 $P_{nm} = W_n V_m^T$ 计算，其中 $W_n$ 是第 $n$ 级的重心坐标矩阵，$V_m$ 是第 $m$ 个三角形的顶点坐标矩阵。颜色初始化采用 K-means 聚类（$k=3$）从图像集中提取最具代表性的颜色，随机选取一个赋予初始高斯。该采样策略使平坦的大面片获得稀疏采样、细节丰富的小面片获得密集采样，显著改善建筑场景的重建质量。
+
+最后，GauSep 指出标准 3DGS 中一个被忽视的问题：几何优化和外观优化的梯度方向可能冲突——光度损失可能将高斯拉离表面。GauSep 通过将高斯属性解耦为几何属性和外观属性来解决这一冲突。
+
+\paragraph{置信度解耦几何与外观的梯度冲突}
+
+GauSep（2025.09）~\cite{2509_12742} 的核心洞察是：标准 3DGS 用同一组高斯同时优化几何和外观，但两种监督信号的梯度方向可能冲突——光度损失的梯度可能将高斯拉离表面，而法线损失的梯度又将高斯拉回。这种冲突在具有强视角依赖效果（如镜面高光）的区域尤为严重。GauSep 通过三模块框架解决这一问题。
+
+\textbf{CoRe（置信度重建）}先建立双分支架构：高斯分支 $B_g$ 负责渲染，SDF 分支 $B_v$ 提供准确的法线先验。两分支通过\textbf{置信度机制}耦合——每个高斯附带可学习置信度属性 $f^g \in (0,1)$，渲染为置信度图 $F_g = \sum_i f^g_i \alpha_i T_i$。置信度图识别“光度误差小但几何误差大”的像素（即梯度冲突区域），并以此调制法线一致性损失的掩码，抑制外观对几何的不当干预。训练前 15k 迭代用 Omnidata 的预训练法线作为先验，之后切换为 SDF 分支蒸馏出的更准确法线 $N_v$。
+
+\textbf{GauSep（属性解耦致密化）}是核心创新。每个高斯的属性被解耦为基础属性（位置 $p$、旋转 $R$、缩放 $S$、不透明度 $o$）和任务属性（颜色 $c$、法线 $n$）。根据梯度冲突程度——用内积 $P_g = \langle \nabla_a \mathcal{L}_{\text{rad}}, \nabla_a \mathcal{L}_{\text{geo}} \rangle$ 量化——高斯被分为三个不相交子集：公共集 $G^m$（保留全部属性）、颜色活跃集 $G^c$（仅激活颜色）、法线活跃集 $G^n$（仅激活法线）。分离后三个子集通过\textbf{分离渲染}（Separate Rendering）管线分别参与颜色、深度和法线图的渲染，消除梯度冲突。
+
+\textbf{GauRep（自适应表示）}进一步压缩模型。球谐阶数从零阶开始，根据累积梯度范数 $K_g = \|\nabla_{\text{sh}} \mathcal{L}_{\text{rad}}\|_2$ 是否超过阈值 $\tau_d$ 自适应升级——平滑区域保持低阶节省参数，高频区域提升至三阶保留细节。任务解耦剪枝对三个子集独立排名并分别移除贡献最低的 $\tau_g\%$，避免混合排名的歧义。
+
+前四类方法追求通用场景的网格提取。然而，特定领域（室内场景、植物、城市、CAD）有独特的几何先验和需求，专用方法往往能达到更好的效果。
+
+\subsubsection{特定领域的网格重建}
+\label{subsec:04_4_5}
+
+本路线介绍面向室内、植物、城市等特定领域利用领域先验进行网格重建的方法。
+
+\paragraph{外观-几何-语义联合室内重建}
+
+OmniIndoor3D（2025.05）~\cite{2505_20610} 首次实现室内场景外观、几何和全景分割（panoptic segmentation）的联合高斯泼溅重建。现有方法要么只关注几何重建（如 DN-Splatter、2DGS），要么只关注语义分割（如 LangSplat、OpenGaussian），忽略了两者的互相依赖——精确的几何为分割提供清晰边界，准确的分割又可引导几何致密化。
+
+OmniIndoor3D 为每个高斯附加语义特征 $f_{\text{sem}}$ 和实例特征 $f_{\text{ins}}$，三者共享 $\alpha$-混合 渲染管线：$F(x') = \sum_i f_i \alpha_i \prod_{j<i}(1-\alpha_j)$，其中 $f_i$ 根据任务取颜色、深度或语义/实例特征。为解决外观与几何优化的冲突，OmniIndoor3D 引入轻量几何 MLP，将外观特征冻结后单独预测几何协方差，作为低通滤波器抑制室内场景的高频噪声；全景引导的致密化策略在平面语义区域增加高斯密度，弥补弱纹理区域的高斯不足。在 ScanNet 和 ScanNet++ 上同时在新视角合成、几何重建和全景分割三个任务上达到 SOTA。
+
+OmniIndoor3D 解决的是通用室内场景。接下来几个方法针对更具体的领域——植物、叶片、城市和 CAD——它们利用领域特有的几何先验来获得更好的重建效果。
+
+\paragraph{层次化双层基元的植物结构重建}
+
+GaussianPlant（2025.12）~\cite{2512_14087} 专门解决植物的 3D 重建问题——从多视角 RGB 图像同时恢复植物外观和内部结构（被叶片遮挡的枝干骨架）。植物的挑战在于：叶片和枝干形状复杂，大量枝干被叶片遮挡无法直接观测，且传统方法（如 L-systems、骨架化）需要物种特定先验或高质量 3D 扫描。GaussianPlant 提出层次化双层基元表示：\textbf{结构基元}（Structure Primitive, SP）是不可见的低频高斯，转换为圆柱体（枝干）或圆盘（叶片）表示植物的拓扑骨架；\textbf{外观基元}（Appearance Primitive, AP）是可见的高频高斯，密集绑定在 SP 表面捕捉精细外观和几何细节。关键设计是 SP 与 AP 之间的梯度流：AP 通过标准光度重渲染损失优化，SP 则通过绑定其上的 AP 的运动间接更新，使不可见的结构基元从外观线索中受益。训练流程为：先将标准 3DGS 基元分类为枝干 SP 和叶片 SP，再绑定高频 AP，然后联合优化 SP 的几何和语义标签（枝干 vs. 叶片）以及 AP 的外观属性。GaussianPlant 无需物种特定训练或手工设计，在自组织方式下渐进地恢复枝干和叶片的内部结构。
+
+GaussianPlant 恢复了植物的枝干和叶片结构，但输出仍然是高斯基元。LeafFit 进一步将叶片转换为可编辑的参数化网格，利用同一植物叶片形状高度相似的先验大幅减少存储需求。
+
+\paragraph{实例化模板变形的叶片网格拟合}
+
+LeafFit（2026.02）~\cite{2602_11577} 利用叶片形状的重复性先验将 3DGS 植物转换为轻量可编辑的实例化网格资产。3DGS 虽能忠实捕捉复杂叶片形态，但内存占用大、缺乏 mesh 拓扑，无法直接用于游戏制作等传统工作流。LeafFit 的核心观察是：同一植物的叶片形状高度相似，可用单一参数化模板表示。具体流程为：首先从无结构的 3DGS 中分割叶片（可选的交互式校正作为 fallback），然后选取代表性叶片组并将其转换为薄而锐利的 mesh 模板；接着通过可微分 MLS（Moving Least Squares）变形将模板拟合到所有其他叶片的 3DGS 高斯上。运行时，MLS 变形在 vertex shader 中即时求值以最小化存储需求——只需一个模板加每叶片的变形参数，数据量大幅减少，同时支持参数级编辑。
+
+LeafFit 利用领域先验（叶片形状相似性）来改善特定植物的重建。ARGS 则回到通用场景，在 SuGaR 框架基础上引入两种互补的正则化策略来提升 mesh 质量。
+
+\paragraph{有效秩正则化与神经 SDF 约束}
+
+ARGS（2025.08）~\cite{2508_21344} 通过有效秩正则化和神经 SDF 约束两种互补策略，显著提升 SuGaR 框架从 3DGS 提取高质量 3D 网格的能力。
+
+\textbf{有效秩正则化}作用于每个高斯基元的缩放因子 $s = (s_1, s_2, s_3)$，迫使高斯从“针状”（有效秩 $\approx 1$）退化为“盘状”（有效秩 $\approx 2$），盘状高斯自然贴合表面片元，最小缩放轴对齐法线。直觉上，三维空间中的表面是二维流形，用二维盘来近似比用一维针更合理。
+
+\textbf{神经 SDF 约束}从全局角度提供连续表面先验：一个 8 层 MLP（256 隐藏单元，位置编码 + skip connection）学习场景隐式 SDF 场，同时施加 Eikonal 正则化（$\|\nabla f\| = 1$）和 SDF-高斯一致性损失（鼓励高斯中心落在 SDF 零水平集附近）。总损失为 $\mathcal{L} = \mathcal{L}_{\text{sugar}} + \lambda_1 \mathcal{L}_{\text{eff}} + \lambda_2 \mathcal{L}_{\text{Eikonal}} + \lambda_3 \mathcal{L}_{\text{SDF-Gauss}}$，在 SuGaR 粗优化阶段联合激活。正则化后的高斯经 Poisson 重建生成更完整光滑的 mesh。
+
+ARGS 专注于几何质量提升。Hash-based GPU-Accelerated 3D Reconstruction 则从效率角度出发，用空间哈希表替代传统的均匀体素网格，实现 GPU 并行的大规模场景重建。
+
+\paragraph{空间哈希表 GPU 并行自适应重建}
+
+Hash-based GPU-Accelerated 3D Reconstruction（2025.11）~\cite{2511_21459} 基于空间哈希表构建方差自适应多分辨率体素网格，实现高效 GPU 并行 3D 重建。传统 TSDF 融合方法（如 KinectFusion、Voxblox）采用均匀体素网格，内存随场景立方体体积增长；八叉树虽节省内存但层次遍历开销大，GPU 并行性差。
+
+\textbf{空间哈希表。}该方法的核心创新是用扁平空间哈希表替代层次结构：每个哈希槽存储一个固定大小的体素块，通过三维坐标的哈希函数直接索引，实现平均 $O(1)$ 的访问时间。分辨率自适应策略基于局部方差——几何复杂区域（高方差）自动细分体素至更高分辨率，平坦区域保持粗分辨率。跨分辨率边界的网格化是关键难点：该方法将 Marching Cubes 扩展为支持混合分辨率，在相邻不同分辨率的体素块之间插入过渡单元，避免网格裂缝。此外，全并行 GPU 四叉树控制高斯泼溅密度：细分辨率区域分配更多高斯、粗分辨率区域分配更少，实现自适应渲染质量。整个系统完全在 CUDA/C++ 中实现，支持实时重建和渲染。
+
+反射面（如镜面、金属面）是网格提取中的一个特殊难题——标准 3DGS 用半透明高斯"伪造"反射效果，但这些半透明高斯无法转换为有效的 mesh。GS-2M 引入材质分解来正确处理反射面。
+
+\paragraph{多视角光度变化监督的材质分解网格}
+
+GS-2M（2025.09）~\cite{2509_22276} 在 PGSR 框架基础上引入材质分解，实现无神经组件的高保真反射面网格重建。标准 3DGS 用半透明高斯模拟反射效果，但半透明高斯无法正确重建为 mesh。GS-2M 为每个高斯增加两个可学习材质参数——粗糙度 $r_i$ 和金属度 $m_i$——配合差分环境立方体贴图（differential environment cubemap）进行光照建模。核心创新是\textbf{基于多视角光度变化的粗糙度监督}：对每个高斯，在邻近视角间计算扭曲面片的归一化互相关（NCC）损失作为粗糙度的监督信号——光滑表面（低粗糙度）在不同视角下因镜面反射产生较大光度变化，粗糙表面则相对稳定。直觉上：多视角间的颜色变化模式本身就是粗糙度的天然指示器，无需额外标注。深度渲染采用 PGSR 的无偏深度公式 $d_i = \mu_i \cdot n_i / (R_i n_i)$（法线取最短缩放轴方向），避免期望深度的偏差。基于估计的材质参数，GS-2M 可正确区分漫反射和镜面反射分量，将反射面重建为干净 mesh 而非半透明伪影。
+
+GS-2M 用材质分解解决反射面的物理建模问题。语言引导的多模态 Mesh 重建则从用户交互角度出发，允许用户通过自然语言描述指定要重建的物体，实现全自动的端到端 mesh 生成。
+
+\paragraph{文本驱动分割的端到端自动化网格生成}
+
+Multi-Modal 3D Mesh Reconstruction（2025.03）~\cite{2503_07190} 结合语言分割、运动恢复结构和高斯泼溅网格化，实现从少量图像和文本提示到 3D mesh 的端到端自动化流程。具体管线分为四步：（1）\textbf{文本驱动分割}：LangSAM（GroundingDINO + SAM）根据用户提供的文本提示（如“重建这把椅子”）在每张图像中生成目标的二值掩码，掩码额外填充 50 像素以处理半透明物体并减少 mesh 伪影；（2）\textbf{端到端 SfM}：VGGSfM 从掩码图像中估计相机参数和稀疏点云，无需链式成对匹配，提高了重建鲁棒性；（3）\textbf{高斯泼溅网格化}：在生成的 COLMAP 数据集上运行 SuGaR，提取带纹理的高分辨率 3D mesh；（4）\textbf{自动后处理}：用 PyMeshLab 脚本清除 SuGaR 生成的表面伪影。整个流程无需任何手动干预，将语言理解与 3D 重建无缝连接。
+
+前述方法处理的都是物体或房间尺度的场景。City-Mesh3R 将 mesh 重建扩展到城市尺度，通过分治策略处理大规模无序图像集合。
+
+\paragraph{分治策略的城市级水密网格重建}
+
+City-Mesh3R（2026.05）~\cite{2605_30310} 实现从大规模无序图像集合直接重建城市级水密表面 mesh。现有 NeRF/3DGS 方法在城市尺度上常产生不完整几何和噪声表面，而小规模方法因计算复杂度无法扩展。City-Mesh3R 的核心是端到端 images-to-mesh 的分治策略：首先通过\textbf{拓扑图像聚类}将图像分为空间局部组，每组独立执行稀疏 SfM（无需穷举特征匹配），再通过地图合并生成全局稀疏城市地图；然后\textbf{空间划分}将地图分为局部块，每块执行几何感知的相机选择、稠密表面重建和\textbf{曲率自适应顶点密度重网格化}（curvature-aware adaptive vertex density remeshing）——在高曲率区域增加顶点密度保留细节，平坦区域减少顶点保持规整；最后各块 mesh 通过缝合生成全局城市网格。整个框架可在分布式设置下端到端处理，可扩展到任意大规模城市场景，生成几何规整、适合仿真使用的网格资产。
+
+前面的网格提取方法产生的是三角网格（triangle mesh），这是图形学中最通用的表面表示。但在工程设计和制造领域，CAD 边界表示（B-Rep）和结构化网格才是标准——它们用参数化曲面（平面、圆柱面等）而非三角面片来描述几何，天然支持精确的尺寸标注和布尔运算。本节讨论从 3DGS/2DGS 直接重建 CAD 级别几何的方法。
+
+\subsubsection{CAD 与 B-Rep 重建}
+\label{subsec:04_4_6}
+
+本路线介绍从 3DGS/2DGS 中重建 CAD 参数化模型和 B-Rep 表示的方法，将高斯泼溅扩展到工程制造领域。
+
+\paragraph{从 2DGS 直接重建 CAD B-Rep 参数化模型}
+
+BrepGaussian（2026.02）~\cite{2602_21105} 首次实现从多视角图像通过 2DGS 直接重建 CAD B-Rep（Boundary Representation）参数化模型。现有 CAD 重建方法依赖高质量点云和大量标注，而 BrepGaussian 直接从图像出发，核心流程为：（1）用边缘检测器和 SAM 从每张图像提取 2D 边缘掩码和面片掩码；（2）在 2DGS 框架上为每个高斯附加可学习边缘/面片特征嵌入，采用\textbf{两阶段学习}——第一阶段联合优化几何和边缘语义，第二阶段冻结几何和边缘特征，用对比学习获得面片实例标签；（3）从高斯中按椭圆形状采样点云，确保采样点对齐真实表面分布并携带对应标签；（4）用约束引导的基元拟合（constraint-guided primitive fitting）将标记点云拟合为参数化线条、曲线和曲面（平面、圆柱面等），最后通过拓扑优化修剪碎片，生成干净的 CAD B-Rep 模型。BrepGaussian 是首个无需点云监督即可从图像完成完整 CAD 重建的方法，在 ABC-NEF 数据集上甚至优于需要点云输入的基线方法。
+
+BrepGaussian 从 2DGS 中重建 CAD 参数化模型。StructuredField 则从另一个角度解决同一问题：将高斯基元绑定到结构化四面体网格上，使输出的网格天然兼容动画和物理仿真等传统图形学管线。
+
+\paragraph{方向保持同胚约束的四面体网格}
+
+StructuredField（2025.01）~\cite{2501_18152} 统一结构化四面体网格与高保真可微渲染，解决点云表示（3DGS）缺乏结构、无法直接用于动画/仿真等下游工程应用的根本问题。核心表示是四面体网格：每个顶点携带可学习的高斯基元属性（位置、协方差、球谐系数、不透明度），四面体内部通过\textbf{层次隐式细分}（hierarchical implicit subdivision）实现多尺度细节——粗四面体捕获大尺度结构，细分子四面体补充高频纹理，类似 Instant-NGP 的多分辨率哈希编码但施加在结构化网格上。关键几何保证是\textbf{方向保持同胚约束}（orientation-preserving homeomorphism）：约束顶点的可行变形空间，严格防止自相交和单元翻转（inversion），确保优化过程中四面体网格始终保持数学有效的流形结构。高斯属性通过四面体顶点的重参数化与几何参数绑定，图像损失可直接端到端优化网格顶点位置。最终输出的四面体网格既支持高质量实时渲染，又天然兼容动画、物理仿真和变形等传统图形学管线。
+
+StructuredField 将高斯基元嵌入四面体网格。Gaussian Mesh Renderer (GMR) 则反向操作：将已有的 mesh 三角面片转换为高斯基元，使 mesh 可以利用 3DGS 的高效光栅化器进行可微渲染。
+
+\paragraph{三角面片到高斯基元的解析转换可微渲染}
+
+Gaussian Mesh Renderer (GMR)（2026.02）~\cite{2602_14493} 将每个网格三角面片解析转换为一个各向异性高斯基元，实现“用 GS 光栅化器渲染 mesh”。具体地，对三角面片 $f=(v_i, v_j, v_k)$，先在其局部坐标系下计算均匀分布的二阶矩（封闭形式积分，无需采样），得到 2D 协方差 $\Sigma^{(2D)}$；再通过局部正交坐标系 $(\mathbf{e}_x, \mathbf{e}_y, \mathbf{n}_f)$ 将其提升为 3D 协方差，法线方向的缩放设为极小值使高斯近似平面。高斯中心取三角形质心，颜色通过顶点球谐系数的重心插值获取。这样 mesh 顶点位置直接参与 3DGS 光栅化的梯度回传。与 SoftRas 等传统可微渲染器相比，GMR 利用 3DGS 的 tile-based 排序和 $\alpha$-混合 实现高效并行，且梯度流不局限于三角形边界，支持更大范围的形状推理。在有限小批量下 GMR 的优化收敛显著优于 SoftRas 和 Nvdiffrast，为 mesh 优化提供了高效替代方案。
+
+GMR 将 mesh 转换为高斯基元以利用 GS 光栅化器。MeshSplats 则反向操作：将 3DGS 高斯基元转换为带属性的三角面片，使 GS 场景可以被传统图形工具（如 Blender）直接渲染，支持光线追踪实现阴影和反射。
+
+\paragraph{高斯基元到三角面片的转换与光线追踪}
+
+MeshSplats（2025.02）~\cite{2502_07754} 将 3DGS 高斯基元转换为带颜色和不透明度的离散三角面片，使 3DGS 场景可被现有图形工具（如 Blender、Nvdiffrast）直接渲染，支持光线追踪实现阴影和反射效果。标准 3DGS 是泼溅渲染，无法处理非相干光线（secondary rays），因此不支持阴影、反射等高级光照。
+
+\textbf{椭圆到面片的转换。}MeshSplats 的核心转换策略是：对每个高斯，根据其协方差矩阵确定投影椭圆，将椭圆离散化为三角形面片（扁平高斯的椭圆形态与 mesh 面片天然接近，转换损失最小）。转换后的 mesh 保留高斯的颜色和不透明度属性，可进一步微调以消除椭圆到多边形近似引入的伪影。此外，MeshSplats 支持双层次 mesh：第一层是外部几何 mesh（由 PermuToNet 或 NeuS 等工具生成）捕捉物体形状，第二层是 MeshSplats 生成的带属性三角面片叠加在几何 mesh 上负责外观渲染，实现几何与外观的分离。
+
+前面讨论的都是在固定视角下的 mesh 提取。细节几何与外观恢复利用物体运动产生的虚拟视角突破稀疏固定视角重建的限制——将运动物体在不同时刻的位置等价为额外的虚拟相机位姿。
+
+\paragraph{运动虚拟视角的物体几何与外观恢复}
+
+Detailed Geometry and Appearance（2026.03）~\cite{2603_26665} 利用物体运动产生的虚拟视角突破稀疏固定视角重建的限制。给定 $V$ 个固定相机（如 $V{=}4$ 角落相机）拍摄的物体运动视频，该方法将运动物体在不同时刻的位置视为额外的虚拟视角，将 $V \times T$ 个观测（$T$ 为帧数）等价于从 $V \times T$ 个视角观测同一物体。核心流程采用交替优化框架：先初始化 $t{=}1$ 时刻的“规范”2D 高斯集合，然后对每个时间步联合优化物体位姿（四元数 $q_{\text{obj}}^t$ + 平移 $\mathbf{t}_{\text{obj}}^t$）和高斯属性，通过可微渲染最小化渲染帧与观测帧之间的光度差异。外观建模将颜色分解为材质（统一光泽度假设）、远距离光照（环境贴图）和阴影分量，使几何优化不受光照变化干扰。最终表面几何从规范高斯通过后处理 meshing 提取。该方法在仅 4 个固定视角下即可恢复精细的物体几何和外观细节。
+
+细节几何方法通过运动产生额外观测。Hybrid Latents 则从表示层面解决几何与外观纠缠的问题——为每个 2D surfel 附加可学习潜变量，并用 3D 哈希网格调制，实现几何与纹理的强分离。
+
+\paragraph{哈希网格调制潜变量的几何-外观解耦}
+
+Hybrid Latents（2026.04）~\cite{2604_14928} 通过为每个 2D surfel 附加可学习潜变量，并用 3D 哈希网格的空间采样进行调制，实现几何与纹理的强分离。标准 2DGS 中，每个 surfel 的颜色由球谐系数决定，高频纹理（如棋盘格、文字）需要大量细小 surfel 才能表达。Hybrid Latents 的关键设计是\textbf{混合潜变量}：每个 surfel 维护一个基础几何潜变量（编码位置、朝向等低频属性），渲染时从单一分辨率的 3D 哈希网格中采样残差纹理潜变量并与基础潜变量拼接，经一个小型 MLP 解码为颜色和不透明度。渲染管线中，调制后的逐片元潜变量通过 $\alpha$-混合 混合后再解码，而非先解码再混合——这避免了半透明片元颜色混合导致的伪影。直觉上：基础几何信息（由 surfel 数量和位置决定）保持不变，高频纹理细节完全由共享的哈希网格提供，因此用数量级更少的 surfel 即可实现高质量重建，几何与外观真正解耦。
+
+Hybrid Latents 通过潜变量增强基元的外观表达力。Neural Gabor Splatting 则用更彻底的方案——用轻量 MLP 替代球谐系数——使单个高斯基元即可表达任意复杂的局部纹理。
+
+\paragraph{基元内 MLP 替代球谐的连续颜色预测}
+
+Neural Gabor Splatting（2026.04）~\cite{2604_15941} 用每个高斯基元自带的轻量 MLP 替代球谐系数，实现连续空间变化的颜色预测。标准高斯的颜色由球谐（SH）系数决定，表达能力受限于 SH 阶数，高频纹理（如条纹、网格）需要大量高斯才能拟合。
+
+\textbf{基元内 MLP。}具体而言，Neural Gabor 的每个基元维护一个 1 层 SIREN 网络（6 个隐藏单元），输入为局部坐标 $(u, v)$ 和视角方向 $\mathbf{d}$，最终输出 RGB 颜色：$c_k = \text{Sigmoid}(\text{MLP}_k([\omega_0 u, \omega_0 v, \mathbf{d}]))$，其中频率参数 $\omega_0 = 30$ 使 SIREN 的正弦激活隐式执行位置编码。由于 MLP 通过非线性变换联合处理空间坐标和视角方向，它天然学习视角相关的反射效果，无需显式 SH 基。颜色渲染沿用标准 $\alpha$-混合：$c = \sum_k c_k \alpha_k T_k$，但每个 $c_k$ 是连续函数而非常数。这种表示的核心优势是：单个基元即可表达任意复杂的局部纹理，不受离纹理分辨率限制，因此用远少于标准 3DGS 的基元即可实现同等甚至更高的渲染质量，间接减少了高斯数量对几何精度的干扰。
+
+\begin{takeaway}
+网格提取与优化解决了从高斯到 mesh 的"最后一公里"问题。技术路线从早期的 TSDF 融合和 Marching Cubes 演进到高斯-mesh 混合表示（MILo、OMeGa、Gaussian-Voxel Duet），后者在统一框架中联合优化渲染和几何，标志着从"先优化高斯再提取 mesh"到"渲染与几何统一表示"的范式转变。
+\end{takeaway}
+
+%=====================================================================
+
+\subsection{近期方法脉络：Mesh与Gaussian双向转换}
+
+这一组近期工作延续 3DGS，主要把改动集中在增量改进等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{Mesh2GS}
+Mesh2GS（2026.06）~\cite{2606_21898} 延续 3DGS 在“Mesh与Gaussian双向转换”上的基本设定，主要改变是：Mesh2GS：基于plenoptic sampling theory的白盒mesh到3DGS构造。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：填补mesh-to-3DGS问题，避免启发式将高斯绑定到mesh，追求Nyquist级别的全局渲染性能。
+具体而言，方法依据plenoptic sampling从mesh几何和外观采样生成高斯位置、尺度、方向和颜色，使高斯覆盖满足视图重建需求。
+适用边界是：依赖输入mesh和纹理质量；复杂透明材质和视角相关外观需额外建模。
+\section{其他几何重建方法}
+\label{sec:04_5}
+
+前四节覆盖了几何重建的主流路线——正则化、SDF 引导、多视角约束和网格提取。本节汇集无法归入上述类别但同样重要的方法，按技术主题分为五个方向：高斯修剪与几何精炼、边缘与曲线重建、替代核函数的几何改进、PDE 优化与物理方法，以及特殊模态重建。
+
+\subsection{几何精炼与边缘重建}
+\label{ss:04_6a}
+
+本节讨论两条技术路线：（1）高斯修剪与几何精炼；（2）边缘与曲线重建。
+
+\subsubsection{高斯修剪与几何精炼}
+
+本路线介绍通过删除漂浮高斯、推动高斯向真实表面对齐来提升几何质量的后处理方法，核心挑战在于识别哪些高斯应该保留以及如何在不损害渲染质量的前提下改善几何。
+
+修剪与精炼是提升几何质量的最直接手段——删除漂浮高斯、推动高斯向真实表面对齐。本组方法的核心挑战在于识别"哪些高斯应该保留"以及"如何在不损害渲染质量的前提下改善几何"。
+
+\paragraph{借图像超分做 3D 点云上采样}
+
+GaussianPU（2024.09）~\cite{2409_01581} 修改了原始 3DGS 的训练流程，用双尺度渲染加图像修复的"3D $\to$ 2D $\to$ 超分 $\to$ 3D"管线替代标准的单尺度训练，光栅化器和损失函数保持不变。该方法的目标不是直接改善几何，而是将 3DGS 作为稀疏点云上采样的桥梁，从稀疏输入生成百万级密集彩色点云。
+
+\textbf{问题背景。} 现有深度学习点云上采样方法基于分块训练，块间边界产生不连续，且受 MLP 开销限制难以处理大规模点云。GaussianPU 的核心思路是"借图像超分的力做 3D 上采样"：先将稀疏点云渲染为 2D 图像，在图像域完成超分，再用 3DGS 将超分结果映射回 3D。
+
+\textbf{三阶段管线。} （1）\textbf{双尺度渲染}：对稀疏点云分别以小点尺寸（保留细节但背景噪声可见）和大点尺寸（前景/背景清晰但信息重叠）渲染低分辨率图像；（2）\textbf{图像修复上采样}：用预训练修复网络将两组渲染图像上采样至高分辨率，小点输出保留纹理细节，大点输出提供可靠前景区分；（3）\textbf{3DGS 精炼}：以高分辨率修复图像为监督，通过标准 3DGS 训练精炼稠密点云的颜色和位置。最终输出百万级密集彩色点云，可直接用于 Poisson 或 TSDF 重建。
+
+\paragraph{渲染贡献度驱动的渐进修剪}
+
+如果说 GaussianPU 关心的是"如何增加高斯"，Trim 3DGS 则关注相反的问题——"如何删除多余的高斯"。标准 3DGS 以不透明度作为剪枝判据，但这一判据存在明显漏洞：高不透明度的漂浮高斯（floaters）会被保留，而重要的低不透明度小高斯反而被误删。Trim 3DGS（2024.06）~\cite{2406_07499} 的核心贡献是提出一个更忠实的"贡献"度量。
+
+\textbf{直觉。} 一个高斯"有没有用"，不应该看它自身有多亮，而应该看它在最终渲染的每张图片中实际贡献了多少像素颜色。一个覆盖半幅画面的漂浮高斯虽然不透明度高，但它的颜色会被前方更近的高斯遮挡，对最终图像几乎无贡献；而一个微小的表面高斯虽然不透明度低，却可能是某个细节区域的唯一贡献者。
+
+\textbf{贡献度量。} 基于上述直觉，高斯 $G$ 对第 $k$ 个视角的贡献定义为其 $\alpha$-混合 权重的归一化累积：
+
+\begin{equation}
+C_k = \frac{1}{|P_k|} \sum_{p \in P_k} \alpha_i(p) \prod_{j<i(p)}(1-\alpha_j)
+\end{equation}
+
+其中 $P_k$ 是 $G$ 的 2D 投影区域，$i(p)$ 是 $G$ 在像素 $p$ 处的深度排序。直觉上，这就是 $G$ 在所有它覆盖的像素上贡献的颜色比例之和。归一化因子 $|P_k|$ 消除大高斯因面积大而获得不公平高贡献的偏差。多视角总贡献为 $C = \sum_k C_k$。
+
+\textbf{渐进修剪与尺度控制。} 修剪策略是渐进式的——每隔一定迭代步数，移除贡献最低的一批高斯，使剩余高斯逐步向表面聚集。此外，Trim 3DGS 引入\textbf{尺度控制策略}：限制高斯的最大尺度，避免退化的大高斯主导渲染且难以优化。配合法线正则化损失（将渲染深度图梯度法线与高斯最短轴对齐），Trim 3DGS 在不牺牲渲染质量的前提下显著改善了几何精度。
+
+\paragraph{贡献自适应的渲染-重建统一正则化}
+
+Trim 3DGS 证明了"贡献"是修剪的有效判据。CarGS（2025.03）~\cite{2503_00881} 将同一概念推进了一步：贡献不应只决定是否修剪，还应决定正则化的强度——在单一统一模型中同时实现渲染和重建的双 SOTA。
+
+\textbf{冲突根源。} CarGS 首先分析了冲突根源：当几何正则化（如法线约束）施加于所有高斯时，高贡献高斯（对渲染质量至关重要的纹理丰富区域）被不当约束，导致渲染退化。关键发现是高斯的\textbf{协方差矩阵}是冲突的主要来源——尺度和旋转同时影响渲染外观和几何形状。
+
+\textbf{解耦策略。} 为此，CarGS 引入 \textbf{Lite-Geo}，一个轻量残差模块（基于 anchor 的 MLP），根据 anchor 特征、相机距离和方向预测几何专用的协方差调整量，将外观协方差与几何协方差解耦。贡献自适应正则化策略为：对高贡献高斯（$\alpha$-混合 权重大）降低几何正则化强度以保留外观表达力，对低贡献高斯加强几何约束。此外，\textbf{几何引导致密化}利用渲染法线的不连续性检测表面边缘（法线突变处需要更多高斯），而在平坦区域减少密度，避免高斯浪费。
+
+\paragraph{Shannon 熵最小化的信息论几何正则化}
+
+Trim 3DGS 和 CarGS 都从"贡献"的角度分析高斯质量，而 GEF（2025.12）~\cite{2512_04542} 换了一个全新的视角——信息论。直觉上：正确对齐表面的高斯邻域应该呈现高度有序（低熵），而漂浮高斯则散乱无序（高熵）。通过最小化局部邻域的 Shannon 熵，就能自动驱使高斯向表面聚集。
+
+GEF 采用三阶段正则化策略。首先借用 2DGS 的深度对齐聚合，沿深度维度加速高斯向表面对齐；然后引入\textbf{3D 邻域熵正则化器}，将高斯不透明度建模为概率分布并最小化其 Shannon 熵，使少数主导高斯定义表面并抑制混叠；最后引入\textbf{多尺度图像熵先验}，将图像域感知熵分布与 3D 模型熵分布对齐，在高纹理区域放松平滑约束以保留细节。GEF 在 DTU 上取得 Chamfer Distance 0.64、T\&T 上 F1 0.44，Mip-NeRF 360 上 SSIM 0.855——无需额外显式表面参数化，几何一致性从信息论优化中自然涌现。
+
+\paragraph{马氏距离邻域上的拉普拉斯-贝尔特拉米算子}
+
+前面几个方法关注"如何让高斯排列正确"，LBO（2025.02）~\cite{2502_17531} 则解决一个更基础的问题：一旦高斯排列好了，如何在不转换为网格的情况下直接对其进行几何分析？核心难题是高斯缺乏显式连通信息，且渲染优化产生的离群值严重干扰几何分析。
+
+\textbf{术语铺垫：马氏距离。} 马氏距离（Mahalanobis distance）是一种考虑数据协方差的距离度量。直觉上，如果高斯在切线方向拉伸（大方差）而在法线方向压缩（小方差），那么两个沿切线方向远离中心的高斯在马氏距离下仍然"很近"（因为在高方差的维度上偏离是正常的），而一个沿法线方向稍有偏移的高斯在马氏距离下则"很远"（因为在低方差的维度上偏离意味着异常）。这使得马氏距离天然适合识别表面对齐的高斯邻域。
+
+\textbf{方法。} 该工作分两步应对：首先用\textbf{对称马氏距离}构建邻域图——仅当两个高斯中心互为 $k$-近邻马氏邻居时才建立边，有效过滤低不透明度离群值；然后基于该图构建 LBO 刚度矩阵 $W_{ij}$，权重由马氏距离而非欧氏距离决定，充分利用高斯协方差编码的各向异性几何信息。最终离散 LBO 为 $L = M^{-1}W$，其中质量矩阵 $M$ 由局部面积估计得到。该方法无需转换为网格即可直接计算热扩散、测地距离和形状对应，在 TOSCA 数据集上的特征值分析和曲率估计中优于点云方法、媲美网格方法。
+
+\paragraph{随机固体理论建立高斯泼溅与体渲染等价条件}
+
+LBO 在已有高斯上做几何分析，Geometry-Grounded GS（2026.01）~\cite{2601_17835} 则从理论层面回答了一个更根本的问题：3DGS 的高斯泼溅渲染在什么数学条件下等价于体渲染？这直接关系到深度提取的理论正确性。
+
+\textbf{术语铺垫：随机固体。} 随机固体（stochastic solid）是体积渲染中的一个经典概念——将物体建模为一个随机占据的空间区域，每个位置要么被固体占据（概率 $1-v(\mathbf{x})$），要么为空（概率 $v(\mathbf{x})$），$v(\mathbf{x})$ 称为空置率（vacancy）。体渲染通过沿射线积分衰减系数来合成颜色。
+
+\textbf{核心等价关系。} 作者借鉴"Objects as Volumes"的随机固体理论，严格证明了\textbf{高斯基元等价于随机固体}：当空置率取 $v(\mathbf{x}) = 1 - G(\mathbf{x})$ 时，随机固体的体渲染结果与 3DGS 的光栅化渲染\textbf{完全等价}。三个约束保证唯一性：越靠近高斯中心占据率越高、远处趋零、且对位置可微。基于此等价关系，作者推导出高斯的衰减系数 $\sigma(\mathbf{x}) = -\nabla \cdot \log v(\mathbf{x})$，进而得到封闭形式的透射率 $T_i(t)$，使深度渲染成为可能。
+
+\textbf{深度提取。} 标准 3DGS 用启发式中值深度提取表面，而该方法从随机固体的衰减系数出发，通过二分搜索求解透射率 $T(t_{\mathrm{med}}) = 0.5$ 的等值面深度，具有天然的多视角一致性和抗浮点伪影鲁棒性。在 TnT 数据集上显著优于现有 GS 方法，实现精细几何细节重建。
+
+\subsubsection{边缘与曲线重建}
+
+本路线介绍将高斯泼溅从面重建拓展到线重建的边缘与曲线重建方法。前一节的方法以"面"为目标——让高斯排列成连续表面。然而现实世界中大量结构是线状的：建筑物的棱角、机械零件的边缘、植物的枝干。本节的方法专门针对这些 1D 结构，将高斯泼溅从"面重建"拓展到"线重建"。
+
+\paragraph{2D 边缘图监督的 3D 边缘高斯重建}
+
+EdgeGaussians（2024.09）~\cite{2409_12886} 修改了原始 3DGS 的监督信号和几何正则化，用 2D 边缘图替代 RGB 图像作为监督，并引入方向对齐约束使高斯沿边缘方向排列，高斯基元的基本参数化（位置、协方差、不透明度）保持不变。
+
+\textbf{直觉。} 每个边缘高斯沿边缘方向延伸、垂直方向压缩，像一个"边缘探针"。高斯中心即边缘点位置，协方差矩阵的主轴即边缘方向。
+
+\textbf{训练与后处理。} 训练时以 2D 边缘图（由 PiDiNet 等检测器生成）作为监督信号，而非 RGB 图像。前 30 个 epoch 仅优化位置参数以锁定边缘位置，随后引入\textbf{几何正则化}：对每个高斯的 $k$-近邻计算方向对齐损失 $L_{\mathrm{orient}}$，惩罚主轴方向不一致的近邻。训练完成后，通过 DBSCAN 聚类将边缘高斯分为独立边缘组，每组内根据曲率拟合为直线或参数曲线。EdgeGaussians 比 NEF/EMAP 等隐式方法快一个数量级（ABC-NEF 数据集上约 15 分钟 vs. 数小时），在精度和完整度上与 SOTA 持平。
+
+\paragraph{单阶段端到端 3D 参数曲线重建}
+
+EdgeGaussians 先重建边缘点云再拟合曲线，是典型的两阶段方法。CurveGaussian（2025.06）~\cite{2506_21401} 将其合并为\textbf{单阶段}端到端 3D 参数曲线重建，突破两阶段范式的误差累积瓶颈。
+
+\textbf{直觉。} 传统方法先建点云再拟合曲线是"先画点再连线"，CurveGaussian 直接优化"线"的参数，渲染梯度自然驱动曲线对齐。
+
+\textbf{曲线-高斯双向耦合。} 核心是每条参数曲线（三次/一阶 B\'{e}zier 曲线）在参数 $t \in [0,1]$ 上采样 $N_g$ 个点生成边缘高斯，高斯的中心、缩放和旋转由曲线控制点通过解析公式决定；渲染误差经高斯反传至曲线控制点。为处理复杂拓扑，CurveGaussian 设计了自适应控制策略：迭代 3k 步后启动曲线线性化（将弯曲角度超过 $20°$ 的曲线分裂），7k 步后执行合并和分裂操作。在 ABC-NEF 数据集上，CurveGaussian 生成的曲线数量比 EdgeGaussians 少一个数量级且精度更高。
+
+\paragraph{各向同性球面高斯的轻量曲线重建}
+
+EdgeGaussians 和 CurveGaussian 都使用各向异性高斯作为边缘探针。SGCR（2025.05）~\cite{2505_04668} 出人意料地走了相反的路线：将各向异性高斯进一步简化为\textbf{固定半径的各向同性球面高斯}（Spherical Gaussian），仅保留位置和不透明度两个可优化参数，删除了协方差矩阵和球谐系数。
+
+\textbf{直觉。} 各向异性高斯像"有方向的探针"，球面高斯像"无方向的粒子"——虽然单个粒子的表达力弱，但 2D 边缘监督足以约束大量粒子收敛到边缘位置。球面高斯渲染到 2D 后形成均匀圆形泼溅，通过边缘图渲染损失将梯度反传至位置参数，驱动高斯聚集到 3D 边缘位置。训练完成后，从球面高斯点云中提取 3D 参数曲线。SGCR 在 ABC-NEF 和 ModelNet 上全面超越 NEF 和 EMAP（Chamfer Distance、IoU、F-score），且参数量仅为标准 3DGS 的一小部分。
+
+\paragraph{植物枝干曲线与叶片曲面重建}
+
+在\ref{subsec:04_4_5}~节中已讨论的 LeafFit（2026.02）~\cite{2602_11577} 和 GaussianPlant（2025.12）~\cite{2512_14087} 也涉及曲线与曲面重建。植物枝干是典型的 3D 曲线结构（可用圆柱体或 B\'{e}zier 曲线参数化），叶片是典型的曲面结构（可用 B\'{e}zier 曲面参数化）。LeafFit 通过骨架驱动的叶片变形将 2D 叶片模板拟合到 3DGS 中的叶片高斯；GaussianPlant 通过结构对齐先验（structure-aligned prior）将高斯沿植物拓扑（枝干-叶片）进行语义分组和几何约束。这些方法展示了领域特定几何先验与高斯泼溅结合的潜力——通用方法难以区分枝干和叶片，而植物结构先验提供了额外的拓扑和形状约束。
+
+\subsection{物理方法与特殊模态}
+\label{ss:04_6b}
+
+本节讨论三条技术路线：（1）替代核函数的几何改进；（2）PDE 优化与物理方法；（3）特殊模态：触觉与偏振。
+
+\subsubsection{替代核函数的几何改进}
+
+本路线介绍专门为改善几何重建而设计的核函数替换方案，其核心假设是标准高斯核的形状特性本身阻碍了几何精度。
+
+第~\ref{ch:03}~章已经讨论了替代核函数作为基元改进的一般策略。本节聚焦于那些\textbf{专门为了改善几何重建}而设计的核函数替换方案——它们的核心假设是：标准高斯核的形状特性（无限延伸、各向同性衰减）本身阻碍了几何精度。
+
+\paragraph{二次曲面替代平面盘的几何表达}
+
+针对 2DGS 欧氏距离与变形表面几何不一致的局限，Quadratic Gaussian Splatting (QGS)（2024.11）~\cite{2411_16392} 修改了原始 3DGS 的基元几何，用二阶二次曲面（quadric surface）替代一阶平面盘（2DGS），渲染管线和优化框架保持不变。这是首个将二次曲面引入 Gaussian Splatting 的工作。
+
+\textbf{术语铺垫：测地距离。} 测地距离（geodesic distance）是曲面上两点之间的最短路径长度。直觉上，欧氏距离是"直线距离"，测地距离是"沿曲面走的距离"——在平面上两者相同，但在弯曲表面上测地距离更长。对于可展曲面（如抛物面），测地距离有封闭形式解。
+
+\textbf{核心思想。} QGS 用隐式函数 $f(\mathbf{x}) = \mathbf{x}^T Q \mathbf{x} = 0$（其中 $Q \in \mathbb{R}^{4\times4}$ 为锥面矩阵）定义基元边界，可表示椭球面、抛物面、双曲面等多种形状。核心创新在于使用\textbf{测地距离}而非欧氏距离构建高斯分布：在抛物面等可展曲面上，测地距离有封闭形式解，避免了欧氏距离在曲面变形时导致的泼溅不一致。直觉上：2DGS 的盘只能做一阶近似（局部平坦），QGS 的抛物面可以做二阶近似（局部弯曲），一个抛物面基元可以替代多个盘基元来拟合高曲率区域。QGS 在 DTU 上 Chamfer Distance 比 2DGS 降低 33\%、比 GOF 降低 27\%。
+
+\paragraph{Gaussian-Hermite 多项式核函数}
+
+QGS 通过提升几何阶次来改善表达力，2DGH（2024.08）~\cite{2408_16982} 则通过提升函数阶次来实现——从量子物理中量子谐振子的波函数汲取灵感，用 \textbf{Gaussian-Hermite 多项式}替代标准 Gaussian 核作为 2DGS 的新基函数。
+
+\textbf{直觉。} 标准高斯核只有一个"钟形"模式，而高阶 Hermite 项引入了可控的振荡——如同从单色光升级到多频光，可以在不增加基元数量的前提下表达更锐利的边界和更复杂的表面形状。
+
+\textbf{数学定义。} Gaussian-Hermite 多项式定义为 $\mathrm{GH}_n(x) = e^{-x^2/2} H_n(x)$，其中 $H_n$ 为第 $n$ 阶 Hermite 多项式（$H_0=1, H_1=x, H_2=x^2-1, \ldots$）。数学上 $\{\mathrm{GH}_n\}$ 构成 $L^2(\mathbb{R})$ 空间的完备正交基，标准高斯恰好是零阶项。2DGH 采用从粗到精的策略逐步提升 Hermite 阶数（每 1000 步增加一阶，最高到第 9 阶），实验表明第 6 阶已足够提升几何重建质量。
+
+\paragraph{椭圆-线段-三角形混合基元}
+
+前面两种方法统一使用同一种基元形状，MP-GS（2025.07）~\cite{2507_11321} 则引入\textbf{混合基元}——同时使用高斯椭圆（Gaussian ellipse）、高斯线段（Gaussian line）和高斯三角形（Gaussian triangle），让不同形状的基元各自承担最适合的几何任务。
+
+\textbf{直觉。} 单一椭圆只能做"点中心衰减"，而三角形覆盖区域的衰减由三个顶点共同决定，更接近真实平面的均匀分布；线段则由两端点控制衰减。
+
+\textbf{组合泼溅策略。} 核心难点在于线段和三角形没有现成的泼溅公式，MP-GS 提出\textbf{组合泼溅策略}（compositional splatting）：将三角形视为三个顶点的组合，每个顶点按标准高斯泼溅贡献颜色和权重，再通过重心坐标 $(\lambda_1, \lambda_2, \lambda_3)$ 混合三个顶点的贡献，其中 $\lambda_i$ 由可学习参数 $\alpha_i$ 控制。初始化时根据局部点云颜色一致性（$\ell_2$ 距离阈值内颜色相似则构成三角形），剪枝时将共线三角形退化为线段。MP-GS 在 DTU 和 TnT 上均取得最佳平均性能。
+
+\paragraph{紧支撑多项式核替代指数核}
+
+前面三种方法设计了全新的基元形状，High-Fidelity Surface Splatting（2026.05）~\cite{2605_07254} 则从核函数的衰减特性入手，在 IMLS-Splatting 框架中用\textbf{紧支撑多项式核}替代指数核。
+
+\textbf{直觉。} 指数核像"无限延伸的渐变光"，必须在某处截断而引入边界伪影；多项式核像"有明确边界的聚光灯"，在某处自然衰减为零。
+
+\textbf{核函数定义。} 多项式核定义为 $\phi(s_i, k_i, m_i) = (1 - s_i m_i k_i)^{2m_i}(2s_i k_i + 1)$（当 $s_i \leq m_i k_i$），否则为 0，其中 $s_i = \|\mathbf{q} - \mathbf{p}_i\|^2$，$k_i$ 和 $m_i$ 是每个点的可学习参数。两个可学习参数使核函数可以自适应地调整衰减曲线形状，在平坦区域更平滑、在高曲率区域更锐利。为克服紧支撑带来的优化景观局部极小问题，该方法引入\textbf{随机预处理}（训练时对每个体素添加均匀噪声平滑损失景观）和\textbf{拉普拉斯滤波}（恢复被随机化抑制的高频细节）。在 DTU 上 Chamfer Distance 从 IMLS-Splatting 的 0.57 降至 0.41。
+
+\paragraph{半透明 surfel 的深度剥离多层渲染}
+
+DP-GES（2026.05）~\cite{2605_25345} 在 GES（Gaussian-Enhanced Surfels）基础上引入\textbf{半透明 surfel 边界}和\textbf{深度剥离渲染}，解决 GES 的两个关键问题：硬深度测试导致高斯被截断产生锯齿、不透明 surfel 的不可微几何阻碍联合优化。
+
+\textbf{术语铺垫：深度剥离。} 深度剥离（depth peeling）是一种多层渲染技术：第一遍渲染取最近层的深度，第二遍渲染取第二近层的深度（被第一遍遮挡的部分），依此类推——就像"一层层剥洋葱"，每遍暴露一个更深的层。
+
+\textbf{半透明 surfel。} Surfel 的不透明度定义为 $\alpha_i(x,y) = \min(1,\, w \cdot G(x,y))$，其中 $w=30$ 使中心区域完全不透明、边界薄环半透明——直觉上像一个"中心实心、边缘渐隐"的圆盘。
+
+\textbf{两阶段渲染。} 第一阶段对 surfel 执行 3 层深度剥离，计算透射率 $T_i^s$；第二阶段将 3D 高斯免排序泼溅，每个高斯根据自身深度查询所在层的透射率来调制权重，超出第 3 层的高斯被深度测试剔除。直觉上：深度剥离相当于"一层层剥开"surfel 的遮挡关系，高斯根据自己被哪一层遮挡自动获得正确的透明度。DP-GES 在所有测试数据集上 PSNR、SSIM、LPIPS 均优于或持平 SOTA，同时消除弹出伪影（popping artifacts）。
+
+\subsubsection{PDE 优化与物理方法}
+
+本路线介绍用偏微分方程和物理模拟约束高斯优化过程的方法。前面四组方法都在高斯基元的表示层面做文章。本节转向优化过程本身——用偏微分方程和物理模拟来约束高斯的运动规律，使优化轨迹更平滑、几何结果更物理可信。
+
+\paragraph{粘性项约束高斯运动的 PDE 优化}
+
+PDEO（2025.09）~\cite{2509_13938} 修改了原始 3DGS 的参数更新规则，在标准梯度下降的基础上引入流体力学中的粘性项，让每个高斯的运动受到邻域高斯运动趋势的约束，损失函数和致密化策略保持不变。
+
+\textbf{直觉。} 标准 3DGS 中每个高斯独立地沿梯度移动，可能产生振荡和跳跃。PDEO 让每个高斯的运动"参考"周围高斯的速度——如果邻域都在向左移动，某个向右跳的高斯会被拉回来。这不会改变最终收敛位置（因为梯度为零时粘性力也消失），但有效抑制了优化过程中的振荡。
+
+\textbf{PDE 建模。} 原始 3DGS 的位置更新 $\mu_i^{t+1} = \mu_i^t + \eta^t \nabla_{\mu_i^t}$ 可视为离散速度场，PDEO 对其求时间偏导后引入流体力学中的粘性项（viscous term），将每个高斯的速度与邻域平均速度混合：
+
+\begin{equation}
+\mu_i^{t+1} = \mu_i^t + \eta^t \nabla_{\mu_i^t} + (1{-}\omega_g)\sum_{j} w_{ij}(v_j^t - v_i^t)
+\end{equation}
+
+其中 $\omega_g$ 为权重系数。粘性项不改变方程的稳态解——当梯度趋零时速度自然衰减——但有效抑制了小尺度高斯的位置突变与优化振荡。
+
+\textbf{高效实现。} 为高效计算邻域交互，PDEO 采用 MPM（Material Point Method）的粒子-网格双向传递策略：先通过 Particle-to-Grid（P2G）将高斯的"过剩速度"存储到体素网格，再通过 Grid-to-Particle（G2P）将网格速度回传给高斯，使局部速度场平滑化。此外，PDEO 引入尺度约束 $L_s$ 惩罚过大的高斯尺度、置信度约束 $L_t$ 强制不透明度接近 1（满足"粒子假设"），并在致密化时利用粒子速度与网格速度的余弦相似度决定是否克隆或分裂。整个框架即插即用，可与任意 3DGS 变体结合，消除模糊和浮点伪影。
+
+\paragraph{碰撞外观推断物体内部结构}
+
+PDEO 用物理约束改善高斯的优化轨迹，SfC-NeRF（2025.05）~\cite{2505_21335} 则更进一步——用物理模拟本身作为几何推断的工具。它开创性地提出"Structure from Collision"问题：给定物体碰撞前后的多视角视频，通过外观变化推断物体的内部 3D 结构（如是否空心、内部空腔形状）。
+
+\textbf{问题挑战。} 这是一个高度不适定问题——同一组碰撞外观可由不同的内部结构与材料属性组合产生（例如，高弹性可由空心结构或柔软材料分别实现）。因此，SfC-NeRF 假设材料属性（杨氏模量 $E$、泊松比 $\nu$、密度 $\rho$、质量 $m$）已知，将优化目标锁定为初始帧的体积密度场 $\sigma^{G'}(t_0)$。
+
+\textbf{两步优化。} 第一步用首帧优化外部形状，第二步通过完整视频序列优化内部结构。第二步引入四类约束：(1) \textbf{物理约束}——通过 DiffMPM 可微分物理模拟将材料属性融入前向传播，并附加质量损失 $L_{\text{mass}}$ 约束估计质量与真实质量一致；(2) \textbf{外观保持约束}——通过像素保持损失 $L_{\text{pixel}_0}$ 和深度保持损失 $L_{\text{depth}_0}$（比较相邻像素的深度差分而非原始深度，以减轻深度估计误差的影响）确保外部结构不因内部优化而退化；(3) \textbf{关键帧约束}——对碰撞后第一帧施加额外像素损失，因为该帧最能体现内部结构对变形的影响；(4) \textbf{体积退火}——交替执行体积缩小与扩大操作以跳出局部最优，最终从初始实心状态收敛到正确的内部空腔结构。
+
+\subsubsection{特殊模态：触觉与偏振}
+
+本路线介绍利用触觉传感器和偏振相机等非标准模态为几何重建提供额外物理约束的方法。前面所有方法都假设输入是标准的 RGB 图像。本节放松这一假设，探索触觉传感器和偏振相机等非标准模态如何为几何重建提供额外的物理约束。
+
+\paragraph{触觉点云与视觉高斯融合重建}
+
+Tactile-Informed 3DGS（2024.03）~\cite{2403_20275} 融合触觉数据与多视角图像，实现非朗伯表面的高质量重建。方法维护两套高斯集合：$G_c$ 由 COLMAP 点云初始化的视觉高斯，$G_t$ 由触觉传感器点云初始化的触觉高斯。
+
+\textbf{触觉点云获取。} 触觉点云通过 CNN 将 2D 触觉图像映射为局部 3D 点云获得——先用触觉模拟器收集触觉图像与对应局部点云的配对数据训练 CNN，实际使用时通过 GAN 将真实触觉图像转换到模拟域再映射为 3D 点。
+
+\textbf{3D 透射率损失。} 核心正则化是 3D 透射率损失。直觉上：触觉传感器接触到的表面位置应该是"实心"的——如果该位置的透射率高（说明很多高斯是半透明或不存在的），那就意味着高斯没有正确建模这个表面。给定触觉接触点 $p$ 和所有未投影 3D 高斯，定义该点的平均透射率 $\mathcal{T}(p) = \frac{1}{N}\sum_{j}(1 - f(p; \mu_j, \Sigma_j))\cdot\alpha_j$，其中 $f$ 是高斯评估函数。最小化 $L_T = -\frac{1}{|P|}\sum_i \mathcal{T}(p_i)$ 的效果是将高斯拉向触觉表面并增大其不透明度，隐式地迫使其建模真实表面。为避免边缘感知平滑损失 $L_S$（利用 5x5 Sobel 核计算深度与 RGB 梯度的对齐度）在触觉区域干扰透射率损失，方法引入基于距离变换的高斯衰减掩码，在触觉点附近抑制平滑损失的影响，确保透射率损失在接触面处具有优先权。
+
+\paragraph{偏振信息约束法线与光度校正}
+
+触觉提供了局部的"接触确认"，偏振则提供了全局的"法线约束"。PolarGS（2025.12）~\cite{2512_00794} 利用偏振信息作为物理先验解决 3DGS 表面重建中反射和过曝区域的光度模糊问题。方法包含两个核心模块：偏振引导的光度校正和偏振增强的高斯致密化。
+
+\textbf{术语铺垫：偏振度与偏振角。} 偏振度（Degree of Linear Polarization, DoLP）描述光的偏振程度，取值 0（完全非偏振）到 1（完全偏振）。偏振角（Angle of Linear Polarization, AoLP）描述偏振方向。关键物理规律是：漫反射表面的偏振角与表面法线的方位角密切相关，因此偏振信息可以约束法线方向。
+
+\textbf{光度校正。} PolarGS 首先利用 DoLP 阈值定位镜面反射区（DoLP $>$ 0.3 且亮度 $>$ 160）和过曝区（DoLP $<$ 0.1 且亮度 $>$ 160），然后构建偏振参考强度 $I_{\text{pri}}$——利用二色反射模型将不同波长通道的偏振图像做差，提取出与视角无关的漫反射分量。基于 $I_{\text{pri}}$，方法从非反射区域向反射区域传播可靠的漫反射颜色，生成颜色校正图（CRM），并在优化时用 $L_{\text{ref}}$ 损失替换反射区域的原始光度监督。
+
+\textbf{偏振增强致密化。} 在致密化中，PolarGS 将偏振信息融入 PatchMatch 立体匹配：利用 AoLP 推导四种法线方位角假设 $n^{\text{aolp}}_i$，结合 3DGS 渲染的深度/法线构建候选假设集，通过偏振一致性得分 $S_a$（根据 DoLP 值自动判断漫反射/镜面反射以消除 $\pi/2$ 歧义）和法线-深度对齐得分 $S_{nd}$ 筛选最优深度/法线。滤波后的深度图反投影生成新高斯，其朝向与偏振法线对齐，最终通过 TSDF 融合提取表面。
+
+\paragraph{光线段距离场的可泛化表面重建}
+
+触觉和偏振都为特定区域提供了额外约束，RayletDF（2025.08）~\cite{2508_09830} 则关注另一个维度：泛化能力。它提出一种可泛化的表面重建方法，可直接从点云或 3DGS 高斯中恢复精确表面，无需逐场景优化。
+
+\textbf{核心表示：光线段。} 核心表示是"光线段"（raylet）——由起点 $p_l$ 和方向单位向量 $d_l$ 参数化的局部光线片段。直觉上，一个 raylet 就是一条从已知位置出发的短光线，网络的任务是预测这条光线走多远才能碰到表面。网络直接预测从光线段起点到表面交点的距离：$(d_l, s_l) = \text{MLPs}(\phi_l, p_l, d_l)$，其中 $\phi_l$ 是 SparseConv 提取的局部几何特征，$s_l$ 是置信度分数。
+
+\textbf{三模块管线。} 管线包含三个模块：(1) \textbf{Raylet 特征提取器}——用 SparseConv 获取场景逐点特征，对查询光线段通过 KNN 找 $K$ 个最近邻点，拼接相对位置、距离和特征向量构成局部描述子；(2) \textbf{Raylet 距离场}——8 层 MLP 预测距离值和置信度，无输出层激活函数以支持正负距离；(3) \textbf{多光线段混合器}——沿每条光线采样 $T$ 个光线段，用 softmax 归一化的置信度加权融合多次估计：$D = \sum_{t=1}^{T}\omega_{l_t}(\|p_{\text{cam}} - p_{l_t}\| + d_{l_t})$，相当于让多个局部预测投票决定最终距离。训练时的采样策略为：基于每个点最近邻距离构建虚拟球体，选择光线穿过的球体的垂足作为光线段起点；若输入为 3DGS 高斯，则利用 $\alpha$-混合 权重最高的交点作为起点。RayletDF 在大规模场景上训练后可直接泛化到新场景，作为 3DGS 的后处理工具提取高质量表面。
+
+\paragraph{可微高斯泼溅替代硬投影的梯度恢复}
+
+本节最后一个方法 SplAttN（2026.05）~\cite{2605_01466} 回归到高斯泼溅的本质——可微渲染。它针对多模态点云补全中 2D-3D 跨模态对齐的梯度断裂问题，提出用可微高斯泼溅替代硬投影。
+
+\textbf{问题根源。} 理论分析表明，硬投影用 Dirac $\delta$ 函数建模几何点到图像平面的映射 $P_{\text{hard}}(v|P_{\text{in}}) = \frac{1}{N}\sum_p \delta(v - \pi(p))$，其支撑集测度为零，导致视觉域损失无法反传更新几何坐标。直觉上：硬投影把每个 3D 点"啪"一下映射到 2D 的一个像素上，这个映射是零宽度的，梯度无法流过。SplAttN 用连续高斯核替代：$P_{\text{soft}}(v|P_{\text{in}}) = \frac{1}{N}\sum_p G(v; \pi(p), \sigma)$，将信息支撑集从零测集扩展到正测集，恢复梯度流。
+
+\textbf{高斯泼溅桥。} 具体实现为"高斯泼溅桥"模块：对任意亚像素查询位置 $q$，聚合特征的权重 $w_k(q) = \exp(-\|u_k - q\|^2 / 2\sigma^2) \cdot (z_k + \epsilon)^{-1}$ 同时包含高斯空间平滑核（抑制投影量化噪声、提供非零梯度尾部）和逆深度项（近似可微 Z-buffer，优先近处几何）。在跨模态对齐中，几何特征 $F_{\text{geo}}$ 作为 Query 主动从泼溅生成的连续视觉流形 $V$ 中检索上下文，实现几何引导的视觉信息选择性吸收，避免背景杂波的干扰。全局-局部解码器通过分层上采样（$P_0 \to P_1 \to P_2$），结合不确定性感知的特征查询和残差流形学习，逐步细化补全结果。
+
+\begin{takeaway}
+其他几何重建方法从信息论、PDE 和物理感知等非传统角度丰富了几何重建的工具箱。SplAttN 的"高斯泼溅桥"模块是一个重要创新——用连续高斯核替代硬投影的 Dirac delta 映射，恢复了从视觉域到几何域的梯度流，为跨模态几何补全提供了理论基础。
+\end{takeaway}
+
+%=====================================================================
+
+%=====================================================================
+\section{2D 高斯与 Surfel 表示}
+\label{sec:04_2dgs}
+
+\subsection{问题背景：3D 椭球的维度冗余}
+
+标准 3DGS 使用 3D 高斯椭球作为基元。对于场景中的平面表面（墙壁、地面、桌面），3D 椭球在一个维度上几乎没有厚度，退化为准平面结构。此时 3D 协方差矩阵的一个特征值接近零，造成参数冗余。更严重的是，3D 高斯在投影时产生“厚度伪影”：垂直于表面的维度在投影中表现为半透明泄漏，影响表面重建质量。
+
+2D Gaussian Surfel（表面元素）通过将基元从 3D 降维到 2D 解决这一问题。每个 Surfel 定义为一个带方向的 2D 高斯分布，天然附着在表面上，不存在厚度维度的冗余。除了场景重建，2DGS 在图像表示、超分辨率和压缩领域展现出独特优势：自然图像本身是 2D 信号，2D 高斯基元无需 3D-2D 投影即可直接建模。
+
+本节按应用场景分为三个方向：2DGS 图像表示与压缩、2DGS 图像超分辨率，以及 2D/3D 混合表示。
+
+\subsubsection{2DGS 图像表示与压缩}
+
+本路线介绍将 2DGS 用于图像紧凑表示和压缩的方法，利用 2D 高斯基元的叠加重建图像以实现端到端优化。
+
+2DGS 用于图像表示时，将图像建模为一组 2D 高斯基元的叠加，每个基元由位置 $(x, y)$、协方差（旋转+缩放）、颜色和不透明度定义。通过可微光栅化重建图像，实现端到端优化。
+
+\paragraph{失真驱动致密化的图像表示}
+
+本方法修改了 3DGS 的场景表示与致密化控制两个环节——用 2D 高斯基元替代 3D 高斯椭球，用逐像素失真驱动的渐进致密化替代基于位置梯度阈值的自适应密度控制——可微光栅化与 $\alpha$-混合 混合渲染保持不变。
+
+\textbf{从 3D 到 2D：图像表示中的高斯降阶。} 读者已了解 3DGS 使用 3D 高斯椭球表示三维场景。当目标从”任意视角新视角合成”缩小为”单张图像的紧凑表示”时，3D 表示中的视角变换、深度排序和球谐函数颜色均不再需要——图像本身就是一个 2D 场景。GaussianImage++（2025.12）~\cite{2512_19108} 因此将高斯基元降阶为 2D：每个基元由位置 $\mu_i \in \mathbb{R}^2$、协方差 $\Sigma_i \in \mathbb{R}^{2 \times 2}$ 和颜色 $c_i \in \mathbb{R}^3$ 定义，渲染简化为 2D 高斯的直接叠加：
+
+\begin{equation}
+C(x) = \sum_{i=1}^{N} c_i \, G_i(x), \quad G_i(x) = e^{-\frac{1}{2}(x - \mu_i)^T \Sigma_i^{-1}(x - \mu_i)}
+\end{equation}
+
+直觉上，每个 2D 高斯就是图像平面上一块带颜色、带透明度的”软色块”，不同色块互相叠加即可拼出整幅图像。对于协方差 $\Sigma_i$，论文实验了三种参数化：旋转-缩放分解 $\Sigma = RSS^TR^T$（与 3DGS 相同）、Cholesky 分解 $\Sigma = LL^T$（GaussianImage 方案）和直接参数化 $\Sigma$（LIG 方案，不强制正半定）。GaussianImage++ 采用直接参数化，并证明 D$^3$ 与 CAF 两种核心机制对所有三种参数化均有效。
+
+\textbf{Baseline 的问题。} 3DGS 的自适应密度控制（ADC）依赖视图空间位置梯度的平均幅度触发致密化，但直接迁移到 2DGS 不可行——2D 场景中位置梯度累积的变化量通常过低，无法有效触发致密化机制。GaussianImage 缺乏渐进式致密化，导致大面积欠重建区域；LIG 虽采用分层策略拟合低分辨率图像与高分辨率残差，但在每个层级内部缺乏动态的高斯增长与剪枝。
+
+\textbf{D$^3$ 机制：按渲染误差分配高斯。} D$^3$ 将高斯总量上限设为用户指定的 $M$，用户可据此权衡渲染质量与内存开销。整个过程分三个阶段：
+
+（1）\textit{稀疏初始化。} 仅用 $N_0 = 2$ 个高斯开始，位置在图像坐标 $[0, H) \times [0, W)$ 内均匀随机采样，协方差直接参数化（不分解为旋转+缩放），颜色也随机初始化。如此少的初始高斯确保后续的致密化过程完全由误差驱动，而非初始化质量。
+
+（2）\textit{失真驱动增长。} 以固定间隔（每 5000 次迭代）执行致密化。核心思路是直接基于像素级重建误差 $D(X, \hat{X})$（而非 3DGS 的梯度阈值）决定新增高斯的位置——这正是”失真驱动”的含义。
+
+具体地，令当前高斯数为 $N_t$，新增高斯数 $k$ 由调度器决定：
+
+\begin{equation}
+k = \bigl\lfloor (M - N_t) / 2 \bigr\rfloor
+\end{equation}
+
+即在剩余额度的一半处取整，保证高斯增长不会一步耗尽额度。然后在重建失真最大的前 $k$ 个像素处放置新高斯：新高斯位置为 $\mu_{g_j} = \text{top-}k\bigl(D(X, \hat{X})\bigr)$ 的像素坐标，颜色直接取该像素的原图颜色 $c_{g_j} = X\bigl(\text{top-}k(D(X, \hat{X}))\bigr)$，协方差以与初始化相同的方式随机设定。实际中 $D(\cdot)$ 采用 L1 损失以保证计算效率。
+
+（3）\textit{剪枝。} 由于直接优化协方差矩阵 $\Sigma$ 可能破坏正半定性质（数学上等价于高斯退化为非椭圆的无效形状），这些无效高斯对渲染无贡献。系统每 100 次迭代检查 $\Sigma$ 的正半定性，剪除无效高斯以释放内存和高斯额度。
+
+\textbf{内容感知滤波（CAF）：自适应抗混叠。} 3DGS 使用 EWA splatting 进行抗混叠，对投影后的 2D 高斯施加一个方差为常数 $s$ 的高斯低通滤波：$G_i'(x) = e^{-\frac{1}{2}(x-\mu_i)^T(\Sigma_i + sI)^{-1}(x-\mu_i)}$，其中 3DGS 取 $s = 0.3$，GaussianImage 取 $s = 0.5$。问题在于，常数 $s$ 无法兼顾不同训练阶段的需求——早期高斯极少（$N_t \ll HW$），大量像素没有任何高斯覆盖，形成大面积空洞；后期高斯充足，需要的是精细细节而非模糊。
+
+\textbf{自适应滤波规则。} CAF 为每个高斯赋予一个自适应方差标量 $s_i$，核心是一条简洁的分段规则——新高斯获得较大的滤波强度 $s_t$（与当前训练步关联），之后保持不变：
+
+\begin{equation}
+s_i = \begin{cases} s_t, & i = N_t \text{（新加入的高斯）} \\ s_{i-1}, & i < N_t \text{（已存在的高斯）} \end{cases}
+\end{equation}
+
+直觉上，这就像画画时先用大笔刷铺底色、再换小笔刷勾细节：早期高斯的强滤波使它们覆盖更大的有效面积，快速填补空洞，生成可识别的粗略图像，为后续优化提供正确的梯度方向；随着致密化推进，新高斯的滤波强度逐渐减弱，让它们专注于精细细节。$s_i$ 不额外消耗存储空间，因为最终存储的是滤波后的协方差 $\Sigma_i + s_i I$。CAF 与 D$^3$ 协同工作：早期强滤波保证粗略图像可辨认，后期滤波减弱让新高斯专注于细节。
+
+\paragraph{深度高斯先验的快速 2DGS}
+
+GaussianImage++ 的 D$^3$ + CAF 框架通过迭代优化实现高质量图像表示，但收敛需要上万次迭代——核心瓶颈在于\textit{初始化}：稀疏的 2 个高斯随机起点迫使优化器缓慢迁移基元至高频区域。Fast 2DGS（2025.12）~\cite{2512_12774} 保留了 2D 高斯基元与可微光栅化渲染，但将迭代优化替换为\textit{前馈网络推理}：用两个轻量级 U-Net 分别预测高斯的空间位置和属性参数，单次前向推理即可获得接近最优的高斯配置，推理延迟仅 4.29 ms（对比 Instant-GI 的 156.39 ms），模型总大小仅 29 MB。
+
+\textbf{为什么不能直接用网络预测高斯集合。} 将迭代优化替换为前馈推理的直觉很简单——但直接从图像 $I$ 回归高斯集合 $\Theta = \{g_k\}_{k=1}^K$ 面临三个障碍。第一，集合是无序的（$K!$ 种排列对应同一组高斯），固定大小网络输出存在排列歧义。第二，逆问题 $R^{-1}(I)$ 不适定——多种高斯配置可渲染出相同图像。第三，即便假设网络输出一个连续空间概率热力图 $H$ 并从中采样离散位置 $P = S(H, K)$，从连续密度场到离散集合的采样操作不可微，导致重建损失的梯度无法回传至热力图：$\frac{\partial L_\text{rec}}{\partial H} = \frac{\partial L_\text{rec}}{\partial P} \cdot \underbrace{\frac{\partial P}{\partial H}}_{\text{梯度断裂}} \approx 0$。GaussianImage++ 通过迭代优化完全绕过了这个问题——它不需要网络，也就不存在梯度断裂。Fast 2DGS 选择了另一条路：将预测拆分为两个独立阶段，\textit{分别}解决梯度断裂与排列歧义。
+
+\textbf{阶段一：Deep Gaussian Prior——“高斯放在哪里”。} 与 GaussianImage++ 的随机初始化 + 失真驱动渐进致密化不同，Fast 2DGS 用一个轻量级 U-Net 直接预测高斯的最优空间分布。网络输入图像 $I$，输出单通道概率热力图 $H \in [0, 1]^{H \times W \times 1}$，表示每个像素位置被选为高斯中心的概率。一个关键设计是将高斯数量 $K$ 作为全局条件注入网络——这与 GaussianImage++ 中用户手动设定高斯上限 $M$ 的机制对应，但 Fast 2DGS 让网络\textit{根据 $K$ 自适应}地调整空间分布策略。具体地，先对 $K$ 做对数归一化 $\gamma = \frac{\ln(1+K)}{\ln(1+K_{\max})}$（$K_{\max}$ 为预设上界，如 $10^6$），再通过 MLP 投影为高维嵌入 $e_K \in \mathbb{R}^D$，最后在瓶颈层用 FiLM 调制空间特征：$F'_{c,h,w} = \gamma_c(e_K) \cdot F_{c,h,w} + \beta_c(e_K)$。对数归一化处理 $K$ 的巨大动态范围（从几百到数十万），使同一网络能覆盖不同压缩率场景——低码率时热力图侧重全局覆盖，高码率时集中到高频细节。这一自适应行为与 GaussianImage++ 中 CAF”大笔刷铺底、小笔刷勾细节”的哲学一致，但由网络自动完成而非靠时间步调度。
+
+\textbf{引导式学习：解决梯度断裂。} 训练先验网络时，Fast 2DGS 设计了一个\textit{引导循环}来绕开上述梯度断裂问题。先验网络预测热力图 $\hat{H}$，从中用多项式采样抽取 $K$ 个初始位置 $P_\text{init} = S(\hat{H}, K)$，然后对这些位置执行标准梯度优化（与 GaussianImage++ 的迭代优化相同）得到优化后位置 $P_\text{opt}$，再将离散位置投影回连续域 $H_\text{opt}$，以此监督先验网络：$L_\text{opt} = \|H_\text{opt} - \hat{H}\|_2^2$。直觉上，先验网络最初倾向于将高斯集中在局部高频区域，而优化过程会在欠表示区域产生强梯度，强制分散高斯以降低全局重建误差——这个”先预测、再纠正”的循环让先验网络逐步学会全局最优的空间分布。
+
+\textbf{阶段二：属性回归网络——“高斯长什么样”。} 给定先验网络输出的高斯中心集合 $P$，属性回归网络负责为每个高斯预测完整的几何与外观参数。与 GaussianImage++ 中直接参数化协方差矩阵不同，Fast 2DGS 回归分解后的属性——这简化了学习目标。网络是另一个轻量级 U-Net，输入图像，输出一个 8 通道张量 $M \in \mathbb{R}^{H \times W \times 8}$，包含：偏移量（2 通道，子像素位置精调）、缩放（2 通道，对数空间）、颜色（3 通道，RGB）、旋转角度（1 通道）。全卷积设计使其分辨率无关且高效。对于先验网络给出的每个高斯中心 $\mu_k = (u_k, v_k) \in P$，通过网格索引从 $M$ 中取出对应属性：$\delta_k = M_\text{offset}[v_k, u_k]$，$s_k = M_\text{scale}[v_k, u_k]$，最终位置精调为 $\mu'_k = \mu_k + \delta_k$。整个属性回归网络以端到端重建损失训练：$L_\text{rec} = \|I - R(\Theta')\|_2^2$。与先验网络的解耦保证属性回归的训练梯度不受位置采样的梯度断裂影响。
+
+\paragraph{种子驱动的结构化 2D 高斯}
+
+SGI（2026.03）~\cite{2603_07789} 在 GaussianImage++ 的基础上引入种子分组与神经熵编码，将独立的 2D 高斯重组为结构化表示并进一步压缩，实现高分辨率图像的高效紧凑表示。
+
+\textbf{动机：独立高斯的参数冗余。} GaussianImage++ 的 D$^3$ 机制已证明失真驱动的渐进致密化优于 3DGS 的梯度阈值方案，但其每个高斯仍独立存储全部参数（位置、协方差、颜色）。SGI 指出，图像中空间邻近的高斯往往具有相似的属性——例如天空区域的高斯颜色相近、纹理区域的高斯尺度相近——这种空间局部性未被利用，导致参数冗余。然而，直接将 Scaffold-GS 的锚点分组机制从 3D 迁移到 2D 效果有限：2DGS 已消除了不透明度等参数，种子化带来的直接存储缩减仅约 3\%。SGI 的核心洞察是，种子结构的真正价值不在于直接节省存储，而在于它引入的空间规律性为后续熵编码创造了条件。
+
+\textbf{种子驱动的 2D 神经高斯。} 相比 GaussianImage++ 逐个存储每个高斯的完整参数，SGI 将高斯按空间邻近性分组到种子下，通过共享的轻量 MLP 预测属性。给定 $N$ 个种子均匀覆盖图像，每个种子位于位置 $x_a \in \mathbb{R}^2$，关联属性集 $\mathcal{A} = \{f_a, \Delta, s_o, s_a\}$，其中 $f_a \in \mathbb{R}^D$ 是种子神经特征，$\Delta \in \mathbb{R}^{K \times 2}$ 包含 $K$ 个关联高斯的偏移量，$s_o, s_a \in \mathbb{R}^2$ 分别是偏移和缩放的全局调节因子。
+
+每个种子生成 $K$ 个高斯，其位置由种子位置加上偏移量再乘以缩放因子得到：$\{\mu^{(k)}\}_{k=0}^{K-1} = x_a + \{\Delta^{(k)}\}_{k=0}^{K-1} \cdot s_o$。$s_o$ 统一调节所有关联高斯的散布范围，使优化只需调整一个二维向量而非 $K$ 个独立的偏移量。与 GaussianImage++ 直接存储每个高斯的颜色和协方差不同，SGI 由两个轻量 MLP 从种子特征 $f_a$ 解码这些属性：MLP $\phi_c$ 输出不透明度加权颜色 $c' \in \mathbb{R}^3$，MLP $\phi_\Sigma$ 预测基础缩放 $s_b$ 和旋转角度 $\theta$，最终缩放 $s = s_b \cdot s_a$。协方差通过旋转-缩放分解保持正半定：$\Sigma = R(\theta) S(s) S(s)^T R(\theta)^T$。如此，$N$ 个种子共生成 $NK$ 个高斯（每个仅需 8 个参数），但实际存储的只是 $N$ 个种子属性和两个共享 MLP——参数从逐个存储变为结构化预测。
+
+\textbf{神经熵编码。} 这是 GaussianImage++ 完全不具备的组件。种子结构本身带来的压缩增益虽仅约 3\%，但种子属性的空间规律性为熵编码创造了条件。量化采用训练时噪声注入、测试时取整：$f_j^{(i),q} = (f_j^{(i)} / q_j^{(i)}) \cdot q_j^{(i)}$，量化步长 $q_j^{(i)} = Q_j(1 + \sigma(r_j^{(i)}))$，其中 $r_j^{(i)}$ 是上下文模型预测的精修因子。概率建模使用上下文模型 $\phi_p$ 结合可学习的二值哈希网格 $H$：$H$ 捕捉无序种子间的空间一致性，为每个种子生成均值 $\mu_j^{(i)}$ 和标准差 $\sigma_j^{(i)}$，以此估计量化后属性的概率分布，驱动算术编码实现无损压缩。总体损失为渲染保真度与码率的加权：$L = L_\text{img} + \lambda \cdot d_A(L_\text{entropy} + L_\text{hash})$，其中 $d_A = D + 4 + 2K$ 是每个种子的属性维度总数。
+
+\textbf{多尺度拟合。} GaussianImage++ 通过 D$^3$ 的稀疏初始化和渐进致密化逐步逼近目标高斯数，本质是"从少到多"的增长策略。SGI 采取了不同的路线：构建高斯金字塔（$M$ 级，每级下采样 2 倍），从最粗到最精细逐级优化。粗级的最优解作为细级的初始化，种子位置和缩放乘以 2 以适配分辨率翻倍，MLP 参数直接继承——这是"从粗到细"的层级策略，与 D$^3$ 的"从少到多"形成互补。
+
+\paragraph{PCA 特征空间中的 2DGS}
+
+\textbf{动机：从逐图像拟合到跨图像复用。} GaussianImage++ 的 D$^3$ 机制虽然通过失真驱动致密化显著改善了收敛效率，但每次拟合新图像仍从 2 个随机高斯开始，无法复用已学到的表示。EigenGS（2025.03）~\cite{2503_07446} 的核心洞察是：同类图像（如人脸、猫脸）在 PCA 特征空间中共享低维结构——如果同一组 2D 高斯学会表示这组特征基底，那么对新图像只需计算 PCA 投影系数即可获得高质量的初始高斯配置，实现从``随机冷启动''到``知识驱动热启动''的质变。
+
+\textbf{核心差异：从 RGB 空间到 PCA 特征空间。} 与 GaussianImage++ 对单张 RGB 图像独立拟合不同，EigenGS 将问题提升到 PCA 特征空间。对训练图像集 $D = \{I_1, \dots, I_m\}$ 计算均值图像 $I_0$ 并做 PCA，选取前 $k$ 个特征向量重塑为 $w \times h$ 的特征图像 $\{\Psi_j\}_{j=1}^k$。关键转变在于：GaussianImage++ 中每个高斯有 3 个颜色通道的权重（RGB），EigenGS 将其替换为 $k$ 个特征分量权重 $c'_{n,j}$，用同一组 $|N|$ 个 2D 高斯同时拟合所有 $k$ 个特征图像：
+
+\begin{equation}
+\hat{\Psi}_j(x, y) = \sum_{n=1}^{|N|} c'_{n,j} \, \exp\!\bigl(-\delta_n(x, y)\bigr),
+\end{equation}
+
+其中 $\delta_n = \tfrac{1}{2} d_n^T \Sigma_n^{-1} d_n$ 为马氏距离。这一公式的形式与 GaussianImage++ 的渲染方程完全一致，唯一区别是颜色权重从 3 维扩展到 $k$ 维。训练阶段联合优化所有高斯的几何参数（位置、协方差）和 $k$ 组特征权重，使这组高斯成为该类图像的``通用基底''。
+
+\textbf{即时初始化与微调。} 给定新图像 $I$，通过 PCA 投影得到系数 $\{w_j\}_{j=1}^k$ 后，可将特征空间的多组权重合并为图像域的等效权重：
+
+\begin{equation}
+\hat{I}^{(0)} = I_0 + \sum_{n=1}^{|N|} \Bigl(\underbrace{\sum_{j=1}^k w_j \, c'_{n,j}}_{c'_n}\Bigr) \exp(-\delta_n),
+\end{equation}
+
+即 $c'_n = \sum_{j=1}^k w_j \, c'_{n,j}$。直觉上，PCA 系数 $w_j$ 是``配方''，特征权重 $c'_{n,j}$ 是``食材''，二者线性组合即可得到渲染新图像所需的颜色权重。这一过程仅需一次矩阵乘法，无需任何迭代优化。在 FFHQ 数据集上，300 个特征分量的初始 PSNR 即达 28.0 dB（对比 GaussianImage++ 从随机初始化的近 0 dB），80\% 以上的测试图像在 1000 次迭代内即达到 35 dB。初始化后，EigenGS 继续以标准 2DGS 优化流程微调高斯属性（位置、协方差、颜色），快速收敛至最终重建质量。
+
+\textbf{频率感知分组：抑制便士瓷砖伪影。} 当所有 $|N|$ 个高斯统一拟合全部 $k$ 个特征分量时，优化倾向于让高斯过度缩小以捕获高频细节，产生密集的圆点图案（``便士瓷砖''伪影）。这与 GaussianImage++ 中 CAF 试图解决的问题类似——但 CAF 通过自适应滤波强度调节高斯的覆盖范围，而 EigenGS 采用正交策略：将高斯和特征分量按频率分组。约 10\% 的高斯 $N_l$ 专门拟合对应大特征值的低频分量 $\{\tilde{\Psi}_l\}$，由于只承担低频建模且高斯数量有限，这些高斯被迫学习较大的尺度以覆盖全局结构；其余 90\% 的高斯 $N_h$ 拟合高频分量 $\{\tilde{\Psi}_h\}$，专注于精细纹理。两组高斯的权重在各自频率范围内独立学习，但最终渲染时两组的输出直接混合，共同覆盖完整的频率范围。论文指出，频率分组对高分辨率图像（如 FFHQ 512$\times$512）尤为重要，可防止敏感区域的 PSNR 退化达 3--4 dB；但对低分辨率图像（如 CelebA 256$\times$256），由于伪影本身不明显，分组反而因减少了自由高斯数量而导致轻微质量下降。
+
+\textbf{YCbCr 颜色空间。} GaussianImage++ 在 RGB 空间直接工作。EigenGS 选择 YCbCr 颜色空间进行 PCA 分解和重建，原因有二：其一，PCA 重建值可能超出 $[0, 255]$ 范围（尤其对测试集图像），YCbCr 的亮度通道（16--235）和色度通道（16--240）提供了天然的超界余量，RGB 三通道等权处理则更容易受异常值影响；其二，YCbCr 将强度信息集中到 Y 通道、仅用两个通道处理色彩，减少了通道间干扰，使优化更稳定、收敛更快。
+
+\paragraph{前馈自适应初始化}
+
+GaussianImage++ 的 D$^3$ + CAF 框架将逐场景优化做到了接近最优，但每次拟合新图像仍需上万次迭代——瓶颈在于随机初始化迫使优化器缓慢探索空间。Instant-GI（2025.06）~\cite{2506_23479} 换了一条路：不再迭代优化，而是用前馈网络一次性预测全部高斯参数，将逐场景优化变为单次前向传播。它基于 GaussianImage（GI）的 RS 分解参数化与固定高斯数设定，但在三个环节引入前馈先验替代 GI 的随机初始化。
+
+\textbf{位置先验：从随机采样到概率图驱动的自适应采样。} GI 从 $[-1, 1]$ 均匀随机采样高斯位置，总数 $N$ 固定不变。Instant-GI 用 ConvNeXt-based UNet 提取图像特征后，通过 Position Field MLP 预测位置概率图（PPM），训练监督来自``伪 PPM''——对高质量 GI 拟合结果统计每个像素 $x$ 周围 $K=10$ 个最近邻高斯的最小包围半径 $r_K$，计算局部高斯密度 $D_x = K / (\pi \cdot r_K^2)$ 并归一化。然后，用 Floyd-Steinberg 抖动算法将连续 PPM 离散化为采样点：先将 PPM 分成 $k \times k$ 的图像块，每块取最大概率值作为代表值后执行误差扩散抖动，激活块的中心即为采样点。相比 ImageGS 的 CDF 采样（固定高斯数，高低熵区域失衡），抖动算法在高低熵区域间取得更平衡的空间分布，同时自然实现了自适应高斯数量——高熵图像激活更多块。
+
+\textbf{几何先验：Delaunay 三角剖分 + 椭圆拟合提供缩放参考值。} GI 直接从 $[0.5, 1.5]$ 随机初始化缩放，网络需从零学习绝对值。Instant-GI 对离散采样点执行 Delaunay 三角剖分并对每个三角面片做椭圆拟合，得到初始缩放 $(s_{x_e}, s_{y_e})$ 和旋转角 $\theta_e$ 作为参考值——这类似于 Scaffold-GS 用锚点提供邻域参考的思路，但 Instant-GI 从几何结构而非锚点网格获取参考。网络只需预测偏移量，最终缩放通过激活函数 $f_s$ 计算约束：
+
+\begin{equation}
+s_x = f_s(\Delta_{s_x}) \cdot s_{x_e}, \quad f_s(x) = \begin{cases} 0.5 \, e^{0.5x}, & x < 0, \\ -\tfrac{1}{2}(1 + e^{-0.5(x+5)}) + 3, & x \geq 0, \end{cases}
+\end{equation}
+
+椭圆拟合保证三角面片无重叠且覆盖全图，使参考缩放天然满足高斯间最小重叠与全图覆盖两个约束。
+
+\textbf{颜色先验：图像采样替代特征回归。} GI 从 $[0, 1]$ 随机初始化颜色。Instant-GI 发现直接从特征回归 RGB 在训练早期收敛困难甚至导致训练失败，因此改为从输入图像直接采样：$c_i = I(p_i) \cdot \sigma(o)$，其中 $o$ 是网络预测的 opacity——这相当于用图像本身作为颜色初始化的强先验，网络只需学习 opacity 调制。整体损失为 $L = L_{\text{rec}} + L_{\text{ppm}}$，其中 $L_{\text{rec}} = \lambda L_2 + (1 - \lambda) L_{\text{D-SSIM}}$，PPM 监督采用 Focal MSE Loss：$L_{\text{ppm}} = (1 - e^{-|P_{\text{pseudo}} - P_{\text{pred}}|})^\gamma \cdot (P_{\text{pseudo}} - P_{\text{pred}})^2$。
+
+\paragraph{层次化大图像 2DGS}
+
+GaussianImage++ 的 D$^3$ 机制以``从少到多''的渐进致密化逼近目标高斯数，在常规分辨率下效果良好，但当图像分辨率增大到数千像素、所需高斯点数达百万级时，D$^3$ 的逐批增量策略面临可扩展性瓶颈——每轮致密化后的重新优化需要遍历全部高斯，计算和显存开销随高斯数超线性增长。LIG（2025.02）~\cite{2502_09039} 保留 GaussianImage++ 的 8 参数 2D 高斯表示和 $\alpha$-混合 累加渲染，从协方差参数化和拟合策略两个层面做增量改进。
+
+\textbf{直接协方差优化。} GaussianImage（GI baseline）将协方差分解为旋转矩阵 $R$ 和缩放矩阵 $S$（$\Sigma = RSS^TR^T$，共 3 个参数）。LIG 发现，当高斯数量巨大时，$R$ 和 $S$ 的耦合使梯度信号分散到旋转与缩放两个方向，大量高斯同时竞争优化时难以收敛。LIG 改为直接优化对称协方差矩阵的三个独立元素 $\Sigma = \begin{pmatrix} \sigma_{11} & \sigma_{12} \\ \sigma_{12} & \sigma_{22} \end{pmatrix}$，并在 CUDA 中实现对应的正向和反向核函数。直接优化不保证正半定性，但 LIG 在渲染时过滤 $\delta_n = \tfrac{1}{2} d_n^T \Sigma_n^{-1} d_n < 0$ 的高斯点，等价于排除不正定的无效高斯：
+
+\begin{equation}
+C_i = \sum_{n \in N, \, \delta_n > 0} c'_n \, \exp(-\delta_n).
+\end{equation}
+
+GaussianImage++ 的实验已验证此直接参数化方案优于旋转-缩放分解和 Cholesky 分解，并将其作为默认选择。
+
+\textbf{Level-of-Gaussian 两级拟合。} 这是 LIG 相对于 D$^3$``从少到多''策略的核心差异。LIG 将总高斯数 $|N|$ 按 $|N| = |N_0| + |N_1| = (1+r)|N_1|$ 分配（$r = 0.125$，即约 11\% 给第一级），构建``从粗到细''的两级结构：第一级 $L_0$ 拟合下采样低分辨率图像 $T_0 = \mathrm{Down}(I)$，学习全局低频结构；第二级 $L_1$ 的拟合目标不是原图，而是残差信号 $T_1 = \mathrm{Norm}(I - \mathrm{UP}(\mathrm{Render}(L_0)))$——原图减去第一级渲染结果上采样后的差异图像，经 min-max 归一化到 $[0, 1]$。两级各自独立优化 MSE 损失，第二级训练时第一级参数冻结，峰值显存占用因此降低。与 D$^3$ 的渐进致密化相比，LoG 的``先结构后细节''分工仅需增加一轮额外泼溅，在百万级高斯场景下显著降低了优化难度并提升了重建质量。
+
+\subsubsection{2DGS 图像超分辨率}
+
+本路线介绍利用 2DGS 的连续表示特性实现任意尺度图像超分辨率的方法，将低分辨率图像表示为 2D 高斯场后以更高分辨率渲染输出。
+
+2DGS 的连续表示特性使其天然适合超分辨率任务：将低分辨率图像表示为 2D 高斯场，然后以任意分辨率渲染输出。
+
+\paragraph{2D 高斯超分辨率的开创性工作}
+
+本方法修改了 GaussianImage 的表示单元——用连续 2D 高斯场替代离散点值——编码器-解码器框架保持不变。读者已从 GaussianImage++ 了解到 2D 高斯可以紧凑表示单幅图像；GaussianSR 将这一连续表示能力引入超分辨率任务，使低分辨率图像中的每个像素不再是孤立的离散点，而是一团可以向任意方向扩散的连续场。
+
+\textbf{Baseline 的局限。}传统 INR-based 任意尺度超分辨率方法（如 LIIF）将低分辨率特征存储为离散潜码，推理时通过 MLP 插值生成连续输出。这种``先离散存储，再 MLP 插值''的范式有两个根本问题：（1）当查询坐标 $x_q$ 在 2D 平面上移动并跨越潜码边界时，被选中的潜码 $z_t$ 会突然切换，输出图像出现棋盘格伪影；（2）为缓解切换问题而引入的邻近潜码加权组合策略（如 LIIF 的局部集成），增加了推理时的计算开销，成为实时应用的瓶颈。核心矛盾在于——潜码是离散存储的，但超分辨率要求连续输出，MLP 插值只是``打补丁''而非根本解决。
+
+\textbf{从离散存储到连续场。}GaussianSR 的关键洞察是：与其离散存储特征再用 MLP``猜测''中间位置的值，不如一开始就用连续函数存储特征。具体做法是将每个低分辨率（LR）像素建模为一个自适应的 2D 高斯场。给定 LR 特征坐标 $(m_i, n_i)$ 和对应特征值 $v_i$，每个 LR 特征被表示为一个以 $(m_i, n_i)$ 为中心、振幅为 $v_i$ 的 2D 高斯分布。可以将其想象为：把每个离散像素点``撑开''成一团椭圆形的模糊光斑，光斑中心的亮度等于原始像素值，越往边缘越暗：
+
+\begin{equation}
+    f_i(p \mid \mu_i, \Sigma_i) = \frac{1}{2\pi|\Sigma_i|} \exp\!\left(-\frac{1}{2}(p-\mu_i)^T \Sigma_i^{-1} (p-\mu_i)\right)
+\end{equation}
+
+其中 $p$ 是 $\mathbb{R}^2$ 空间中的任意查询坐标，$\mu_i=(m_i, n_i)$ 是高斯中心（对应 LR 特征位置），$\Sigma_i \in \mathbb{R}^{2 \times 2}$ 是协方差矩阵，控制光斑的形状和扩散范围。为确保标准差始终为正，$\sigma_x, \sigma_y$ 通过 sigmoid 激活函数约束。任意坐标 $p$ 处的特征值通过 $\alpha$-混合所有重叠高斯场得到：
+
+\begin{equation}
+    C_{\text{2DGS}}(p) = \sum_i f_i(p \mid \mu_i, \Sigma_i) \cdot c_i
+\end{equation}
+
+即每个查询位置的特征值由所有覆盖该位置的高斯场按距离加权求和显式计算，无需任何 MLP 插值。与 3DGS 的 3D 高斯相比，2DGS 去除了投影变换和球谐函数等 3D 场景专用操作，仅保留位置、协方差和不透明度三个核心参数，流程更简洁。
+
+\textbf{选择式高斯泼溅（SGS）。}不同像素区域的特性差异很大：平坦区域（如天空）需要宽核来平滑覆盖大面积空间，而边缘区域（如建筑轮廓）需要窄核来精确定位。如果所有像素共用同一个核，要么平坦区域过度锐利，要么边缘区域过度模糊。为此 GaussianSR 提出了\emph{选择式高斯泼溅}（Selective Gaussian Splatting, SGS）：维护一个由 100 种预设高斯核组成的高斯核库（Gaussian Bank），每种核有不同的标准差 $\sigma$ 和不透明度 $\alpha$ 组合，训练一个分类器为每个像素从中选择最合适的一种。训练阶段使用 Gumbel Softmax 生成软标签以保证梯度回传，推理阶段切换为硬标签实现确定性选择。消融实验表明，100 种核中实际被频繁选中的不到 20 种，说明模型能有效聚焦于少数关键核形态；也正因为如此，增加核库规模至 400 或 900 反而损害性能，过多的选择增加了训练难度。
+
+\textbf{双流特征解耦。}高斯泼溅在处理高分辨率图像时面临严重的内存瓶颈——每个高斯场都需要生成一个 $[\text{batch size}, \text{channel}, \text{height}, \text{width}]$ 的张量，五维向量的内存开销极为庞大。为此 GaussianSR 引入双流特征解耦架构：将编码器输出的特征沿通道维度一分为二，一条流（默认 8 个通道）经过 feature unfolding 将空间分辨率降低后再做高斯泼溅，另一条流直接双三次上采样以保持效率；两条流的输出融合后通过解码器生成最终高分辨率 RGB 图像。消融实验证实，8 通道走 2DGS 路径的配置在 DIV2K 验证集上取得最高 PSNR，且所有使用 2DGS 的版本均显著优于纯双三次上采样的 baseline。
+
+\paragraph{前馈泛化超分辨率}
+
+GaussianSR 的 2D 高斯参数通过逐场景迭代优化获得——每输入一张新图像都要重新训练，无法泛化。GSASR（2025.01）~\cite{2501_06838} 的核心改动是用前馈网络\emph{一步预测}高斯参数，替代 GaussianSR 的迭代拟合：训练一个编码器-高斯解码器网络，对任意 LR 图像一次前向推理即可输出完整的 2D 高斯集合，无需逐场景优化。
+
+\textbf{图像条件高斯解码器。}GaussianSR 中高斯参数通过梯度下降逐场景优化，编码器只负责提取特征，不参与高斯参数的生成。GSASR 的关键改动是在编码器后插入一个\emph{Gaussian Decoder}，直接将图像特征映射为高斯参数集合。具体流程：给定 LR 图像 $I_{LR} \in \mathbb{R}^{H \times W \times 3}$，现成编码器（如 EDSR-Baseline 或 RDN）提取特征 $F \in \mathbb{R}^{H \times W \times C}$，Gaussian Decoder 接收 $F$ 和可学习高斯嵌入 $E \in \mathbb{R}^{N \times d}$，输出 2D 高斯集合 $\mathcal{G}$。高斯数量 $N = m \times (H \times W)$，与 LR 图像大小成正比（默认 $m=16$）；通过共享基础嵌入 $E_{\text{base}} \in \mathbb{R}^{mk^2 \times d}$ 复制到所有窗口，动态适配任意输入尺寸。
+
+Gaussian Decoder 由三个模块组成：（1）\emph{条件注入块}（Condition Injection Block）——基于窗口的交叉注意力，以高斯嵌入为 Query、图像特征为 Key/Value，将图像内容注入高斯嵌入，窗口大小 $k=12$；（2）\emph{高斯交互块}（Gaussian Interaction Block）——$L$ 层 Swin Transformer（交替窗口/移位窗口自注意力 + 尺度感知交叉注意力），使不同高斯嵌入之间充分交换信息；（3）\emph{高斯属性头}（Gaussian Primary Head）——五个解耦的轻量 MLP 头（各含 3 层线性层 + 2 层 ReLU），分别预测不透明度 $\alpha$（sigmoid）、颜色 $c$（sigmoid）、标准差 $\sigma$（sigmoid）、位置偏移 $o$（无激活）、相关系数 $\rho$（tanh）。与 GaussianSR 的选择式高斯核库（从 100 种预设核中分类选择）不同，GSASR 直接让网络回归 5 个连续属性（含相关系数 $\rho$ 以建模各向异性），省去了核库的分类开销。最终位置通过参考位置加偏移得到：$\mu_i = p_i + o_i$。消融实验表明，参考位置 $p_i$ 至关重要——若去掉参考位置而让所有高斯嵌入直接回归绝对位置，训练损失无法下降（停滞在 $4 \times 10^{-1}$），因为共享嵌入 $E_{\text{base}}$ 缺乏区分不同图像区域的能力；加入参考位置后损失可降至 $10^{-2}$ 量级。
+
+\textbf{CUDA 尺度感知光栅化。}GaussianSR 的泼溅基于 PyTorch 实现，端到端可微但效率有限。GSASR 将整个光栅化重写为 CUDA C++ 内核，并引入\emph{尺度感知}采样：给定缩放因子 $s$，在 $sH \times sW$ 分辨率下采样连续高斯场：
+
+\begin{equation}
+    I_{SR}(x, y; s) = \sum_{i=1}^{N} G_i\!\left(\frac{x}{s}, \frac{y}{s}\right)
+\end{equation}
+
+缩放因子 $s$ 仅控制采样间隔，光栅化本身无额外可学习参数，因此可泛化到训练中从未见过的缩放因子。为加速推理，GSASR 引入光栅化比例 $r$：每个高斯只渲染距其中心 $r \cdot sH$（或 $r \cdot sW$）范围内的像素，将计算复杂度从 $\mathcal{O}(s^2 HWN)$ 降至 $\mathcal{O}(r^2 s^2 HWN)$。默认 $r=0.1$，利用高斯响应从中心向边缘快速衰减的性质截断远端贡献，在几乎不损失质量（PSNR 降幅 $<0.05$ dB）的前提下大幅提升速度。CUDA 实现支持端到端可微，梯度通过光栅化回传优化整个网络。相比 GaussianSR 的 PyTorch 泼溅，CUDA 光栅化在计算资源消耗上显著降低。
+
+\paragraph{超快速连续超分辨率}
+
+Pixel-to-Gaussian（2025.03）~\cite{2503_06617} 沿用 GaussianSR「用 2D 高斯场建模连续信号」的基本范式——连续信号重建公式 $f_c(x, y) = \sum_{i=1}^{N} G_i(x, y)$ 和高斯核求值 $G_i(x, y) = \frac{c_{\text{rgb}}}{2\pi|\Sigma_i|} \exp(-\frac{1}{2} d^T \Sigma_i^{-1} d)$ 保持不变——但在两个核心环节做出了根本性改进，将渲染速度推进到 1ms 级别。
+
+\textbf{设计动机：为什么不能直接端到端学习高斯参数？}GaussianSR 用 SGS（100 种核的分类器硬选择）回避了直接学习协方差的问题，但未对这一回避策略给出理论解释。Pixel-to-Gaussian 首先通过严格对照实验揭示了直接端到端预测高斯参数\emph{为什么}必然失败：用端到端网络从 LR 图像直接预测高斯参数时，训练损失始终无法下降（PSNR 停滞在约 10 dB）。原因有两个：（1）\emph{解空间过大}——协方差矩阵理论上只需满足正定条件，实际取值范围从 $0$ 到 $+\infty$，导致解空间远大于传统图像空间，局部最优陷阱密布；（2）\emph{高敏感性}——在高斯空间中，单个高斯的位置或协方差微调会影响整幅图像的像素值，而图像空间中一个像素只影响自身。定量验证：对图像空间和高斯空间施加同分布噪声后，图像空间 PSNR 为 26.31 dB，高斯空间仅 13.83 dB。这一实验结论为 GaussianSR 使用 SGS 核库而非直接学习提供了事后理论支撑。
+
+\textbf{深度高斯先验与协方差字典。}GaussianSR 的 SGS 为每个像素\emph{硬选择}一种预设核（100 选 1），表征灵活性受限。Pixel-to-Gaussian 的核心改进是从统计先验出发构建\emph{软组合}机制：对约 40,000 张高分辨率图像进行统计分析（耗时超过 700 GPU 小时），发现高斯空间中协方差参数具有高度可追溯的分布规律——约 99\% 的 $\sigma_x^2$ 落在 $[0, 2.4]$，$\sigma_y^2$ 落在 $[0, 2.2]$，$\sigma_x\sigma_y\rho$ 落在 $[-0.9, 1.5]$，且三者近似服从高斯分布。这一发现被定义为\emph{深度高斯先验}（Deep Gaussian Prior, DGP）。基于 DGP，Pixel-to-Gaussian 从统计分布中采样构建 $N$ 个预定义高斯核组成字典 $K = \{G_1, G_2, \ldots, G_N\}$，网络学习一组权重 $W = \text{Softmax}(M_{\text{weight}}(F_{LR}))$ 对预定义核做加权组合而非硬选择：
+
+\begin{equation}
+    G_{\text{target}} = \sum_{i=1}^{N} w_i \cdot G_i
+\end{equation}
+
+相比 GaussianSR 的 Gumbel Softmax 硬选择，这种软组合有两个优势：（1）目标协方差是多个预定义核的连续插值，表征空间从 100 个离散点扩展为凸包内的连续区域；（2）权重学习是有界的 softmax 输出，天然规避了无约束协方差优化的局部最优问题。
+
+\textbf{自适应位置漂移。}GaussianSR 将高斯位置固定在 LR 像素中心，牺牲了空间自适应能力。Pixel-to-Gaussian 引入偏移机制：以 LR 像素中心作为初始位置 $P_{\text{init}}$，通过 5 层 MLP 从 LR 特征预测偏移量 $P_{\text{off}} = \text{Tanh}(M_{\text{pos}}(F_{LR}))$（范围限制在 $[-1, 1]$），最终位置为 $P_{\text{final}} = P_{\text{init}} + P_{\text{off}}$。这使得高斯核在纹理丰富区域自动聚集得更密集，在平坦区域保持稀疏。RGB 参数由于取值范围有限（$[0, 1]$）且优化难度低，直接用 5 层 MLP 从特征映射。一旦高斯场构建完成，任意尺度的渲染仅需按目标分辨率采样高斯场，整个过程仅需约 1ms。
+
+\subsubsection{其他 2DGS 应用}
+
+本节介绍 5 种 2DGS 的其他应用：EGGS（可交换 2D/3D 高斯）、GaussianToken（图像分词器）、2DGS 语义修复、GaussianVision（视觉-语言对齐）和 Contour Aware 2DGS（轮廓信息感知）。
+
+\paragraph{可交换 2D/3D 高斯}
+
+本方法修改了 3DGS 的\emph{基元表示与光栅化管线}——用可动态切换类型的 2D/3D 混合高斯基元替代单一 3D 高斯——$\alpha$-混合 渲染和球谐颜色解码保持不变。动机很直观：3D 高斯擅长捕捉高频外观细节（毛发、纹理），但其仿射投影近似在偏离高斯中心处引入畸变，几何精度受限；2D 高斯擅长表面建模但难以表达半透明烟雾等体效果。与其让用户在两种表示之间二选一，EGGS（2025.12）~\cite{2512_02932} 让每个高斯在训练中\emph{动态切换类型}——"可交换"的含义正在于此：一个高斯今天可以是 3D 的（捕捉半透明区域），明天发现自己变扁了就自动转为 2D（贴合表面），后天需要表达体积感时再切回来。
+
+\textbf{混合光栅化。}要让两类基元在同一个前向传播中渲染，关键是统一它们的贡献计算方式。每个基元 $G$ 增加类型标识符 $t \in \{0,1\}$：3D 高斯（$t=1$）走仿射投影管线，2D 高斯（$t=0$）走射线-Surfel 交叉管线，但最终都归约为同一种 $\alpha$-混合 贡献公式
+\begin{equation}
+\alpha_i = o_i \, e^{-\frac{1}{2}d_i},
+\end{equation}
+
+其中 $o_i$ 为不透明度，距离 $d_i$ 的计算因类型而异：对 3D 基元是像空间 Mahalanobis 距离 $d_i = (x_p - \mu'_{3d,i})^T \Sigma_i^{\prime-1}(x_p - \mu'_{3d,i})$，对 2D 基元是射线-切平面交叉的局部坐标 $(u_i, v_i)$ 之平方和 $d_i = u_i(x_p)^2 + v_i(x_p)^2$。换言之，无论基元类型如何，距离 $d_i$ 始终是一个标量，后续的 $\alpha$-混合 流程完全相同，因此两类基元可以在同一轮渲染中无缝混合。
+
+\textbf{自适应类型交换。}固定类型分配会限制表达能力——例如 3D 高斯在优化中可能逐渐变扁以贴合表面，本应转为 2D 却被类型标签卡住。为检测这种"类型与实际几何特征不匹配"的情况，EGGS 引入\emph{有效秩}（effective rank）作为几何维度指示器。直觉上，一个球状高斯沿三个轴都"伸展"了，维度为 3；一个被压扁的高斯只沿两个轴伸展，维度接近 2。形式化地，给定缩放 $\mathbf{s}=(s_x,s_y,s_z)$，令 $\mathbf{q}=(s_x^2,s_y^2,s_z^2)$，有效秩定义为
+\begin{equation}
+\mathrm{erank}(G) = \frac{\left(\sum_{i} q_i\right)^2}{\|\mathbf{q}\|_2^2},
+\end{equation}
+
+各向同性 3D 高斯的 $\mathrm{erank}=3$（三个缩放轴同等重要），扁平高斯趋近 $2$（一个轴的权重接近零）。当 3D 基元的有效秩低于阈值 $\tau_e$ 时自动转为 2D，反之亦然。
+
+直接翻转类型标签会导致数值不稳定，因为 2D 高斯在渲染时忽略 $s_z$，直接丢弃会破坏已学好的协方差结构。因此两个转换方向各有专门策略。
+
+\textbf{3D$\to$2D 方向}：先用置换矩阵 $P$ 将最小缩放轴对齐到 $z$ 轴，得到 $S^* = PSP^T$，同时更新旋转 $R^* = RP^T$ 以保持协方差 $\Sigma = RSS^TR^T = R^*S^*S^{*T}R^{*T}$ 不变，再丢弃 $s_z^*$。
+
+\textbf{2D$\to$3D 方向}：2D 基元在渲染时从未收到 $s_z$ 的梯度，直接激活会导致剧烈跳变。EGGS 通过基于不透明度的软调制逐步"唤醒"$z$ 轴缩放：
+
+\begin{equation}
+s_z^* = \sigma(\beta_z - \beta_{z_T}) \cdot s_z, \quad \hat{s}_z = o_i \cdot e^{-\beta_z} \cdot s_z^*,
+\end{equation}
+
+其中 $\sigma$ 为 sigmoid 函数，$\beta_z$ 是可学习参数，$\beta_{z_T}$ 是阈值。直觉上，不透明度低的基元（半透明区域）更需要体积表达能力，因此 $o_i$ 越小，激活的 $s_z$ 有效值越大，使扁平基元平滑过渡为体效果表示。
+
+\textbf{频率解耦优化。}混合渲染解决了"能同时用"的问题，但还需解决"怎么分别优化"的问题。关键观察是：2D 高斯更适合低频几何监督（表面形状、多视角一致性），3D 高斯更适合高频细节监督（纹理、毛发）。EGGS 用离散小波变换（DWT）将 GT 图像分解为低频分量 $I_l$ 和高频分量 $I_h$，分别构建损失 $L_\text{low}=\|I_l-\hat{I}_l\|_2^2$ 和 $L_\text{high}=\|I_h-\hat{I}_h\|_2^2$，加上标准外观损失 $L_\text{color} = (1-\lambda)L_1 + \lambda L_\text{D-SSIM}$，总损失为 $L = L_\text{color} + \lambda_\text{low} L_\text{low} + \lambda_\text{high} L_\text{high}$。频率损失权重随训练进度调度：$\lambda_\text{low}^{init} > \lambda_\text{low}^{final}$（低频监督先强后弱），$\lambda_\text{high}^{init} < \lambda_\text{high}^{final}$（高频监督先弱后强），匹配"先搭几何骨架、再雕细节纹理"的自然优化顺序。
+
+然而，即使频率已解耦，两类基元仍可能收到方向相反的梯度——低频损失想让高斯更扁（贴合表面），高频损失同时想让同一高斯更厚（捕捉纹理）。EGGS 检测这种\emph{冲突梯度}（$g_i^\text{low} \cdot g_i^\text{high} < 0$），并按类型做非对称处理：对 2D 基元，保留低频梯度 $g_i^\text{low}$，将高频梯度 $g_i^\text{high}$ 投影到 $g_i^\text{low}$ 的法方向以移除冲突分量；对 3D 基元反过来——保留高频梯度，投影低频梯度。这确保每类基元沿最相关的频率方向更新，同时最小化另一频率信号的干扰。
+
+\paragraph{高斯基元作为图像分词器}
+
+如果说 EGGS 展示了 2D 高斯在 3D 场景重建中的几何优势，那么 GaussianToken（2025.01）~\cite{2501_15619} 则走出了另一条路——将 2D 高斯泼溅的连续性引入\emph{图像分词}（image tokenization）这一纯 2D 任务。传统 VQ-VAE 将编码器输出量化为离散编码本中的最近邻向量 $z_i = e_k,\; k = \arg\min_j \|f_i - e_j\|_2$，编码本大小 $N$ 直接限制了重建能力——特征向量只能从 $N$ 个离散码字中选择，无法表达码字之间的连续过渡。GaussianToken 的核心洞察是：用带特征的 2D 高斯分布替代固定网格上的离散码字作为量化单元，构建一个\emph{半离散表示空间}——特征系数保持离散量化，而空间位置和协方差是连续可优化的。
+
+具体地，每个\emph{GaussianToken} $g_k$ 由位置 $\mu_k \in \mathbb{R}^2$、协方差 $\Sigma_k \in \mathbb{R}^{2\times 2}$（分解为旋转角 $\theta_k$ 和缩放 $s_k \in \mathbb{R}^2$）以及特征系数 $f_k \in \mathbb{R}^D$ 参数化，总维度为 $d = 5 + D$。量化时不再做最近邻查找，而是聚合 $K$ 个 GaussianToken 对位置 $p_i$ 的加权贡献：
+
+\begin{equation}
+z_i = \sum_{k=1}^{K} c_{ki}, \quad c_{ki} = \pi_{ki} \cdot f_k, \quad \pi_{ki} = \exp\!\left(-\tfrac{1}{2}(p_i-\mu_k)^T\Sigma_k^{-1}(p_i-\mu_k)\right),
+\end{equation}
+
+即每个 GaussianToken 以 2D 高斯概率 $\pi_{ki}$ 为权重，将其离散特征系数 $f_k$ 贡献给周围所有位置。关键区别在于：$f_k$ 仍走标准 VQ 最近邻量化保持离散性，但 $\mu_k$ 和 $\Sigma_k$ 是连续可优化的——同一个码字可以出现在特征图上任意位置和尺度，等效编码本容量远超 $N$ 个固定码字。此外，由于每个 $g_k$ 的影响覆盖一个连续区域而非单个像素，反向传播时一个单元可同时接收其覆盖范围内所有位置的梯度加权和，加速收敛。
+
+为学习 GaussianToken 参数，论文设计了 \emph{Gaussian Embedding} 模块：编码器提取的特征图先经 Deformable Attention 压缩为高维序列（保留更多图像信息），随机初始化的 $K$ 个 GaussianToken 锚点通过基于 Deformable Attention 的交叉注意力从图像特征序列中采样信息——对每个锚点 $g_k$ 生成一组偏移量 $\{\delta_{ki}\}$，以 $\mu_k + \delta_{ki}$ 为参考点从图像特征中加权聚合，再用 MLP 预测对锚点参数的调整量 $\Delta = \text{MLP}(g_k)$。位置 $\mu_k$ 采用残差更新 $\mu_k^{\text{new}} = \mu_k + \Delta\mu$ 以保持训练稳定性（频繁替换位置会干扰所有其他属性的优化），而旋转角、缩放和特征系数则直接替换。最终量化后的特征图通过 2D 高斯泼溅（CUDA 实现）高效渲染重建图像。整个模型仅需替换 VQ-VAE 的量化模块即可插入现有框架（如 VQGAN），训练损失为 $L_\text{GS-GAN} = L_r + \lambda_c L_c + \lambda_g L_g$。
+
+\paragraph{2DGS 语义修复}
+
+GaussianToken 将 2D 高斯泼溅用于图像分词——在生成端利用连续场的优势。同一个思路也可用于\emph{修复}端：图像修复要求修复区域与周围像素\emph{局部连贯}、修复内容与全局场景\emph{语义一致}，传统卷积或扩散方法在像素网格上逐块处理，难以同时满足两者。2DGS Semantic Alignment（2025.09）~\cite{2509_01964} 的核心思路是将修复问题转化为高斯泼溅的连续渲染问题——不完整图像被编码为一组 2D 高斯泼溅系数的连续场，通过可微光栅化重建完整图像。由于连续渲染范式下每个像素由周围多个高斯加权混合而成，局部像素级连贯性天然成立，无需额外的后处理或边界融合。
+
+方法包含两个关键组件。
+
+\textbf{2D 高斯泼溅编码}：编码器将输入的不完整图像（含掩码）映射为 2D 高斯参数场——每个空间位置预测一组高斯参数（位置、协方差、颜色、不透明度），掩码区域的参数通过周围已知区域的高斯参数插值和全局约束来推断。为降低内存开销并加速推理，引入\emph{分块光栅化}（patch-wise rasterization）策略，将大图像划分为小块分别渲染，显著减少了高斯泼溅的内存峰值。
+
+\textbf{DINO 语义对齐}：局部连贯性由泼溅机制保证，全局语义一致性则需显式建模。方法利用预训练 DINO 模型提取全局语义特征，约束修复区域的高斯参数在语义空间中与周围区域对齐。关键发现是 DINO 的全局特征对小面积缺失区域具有天然鲁棒性，且可通过适当的适配策略扩展到大面积掩码场景。训练采用渐进式掩码策略：CelebA-HQ 上每 20 个 epoch 逐步增大掩码比例（20\%$\to$40\%$\to$60\%），Places2 上每 epoch 递增，先让模型学会小区域修复再扩展到大面积缺失。
+
+\paragraph{视觉-语言对齐的高斯表示}
+
+前面各方法将 2DGS 用于图像层面的重建与编辑，GaussianVision（2025.09）~\cite{2509_22615} 则更进一步——用 2D 高斯基元替代像素作为视觉编码器的输入基底，探索高斯表示在视觉-语言对齐中的可行性。动机直指现代 CLIP 流水线的两个结构性瓶颈：像素域传输开销大（$224 \times 224$ 图像含 50176 个 patch），且 patch-based 分词使序列长度爆炸、消耗注意力预算。核心方案分两步。
+
+\textbf{2DGS 拟合}：每张图像离线预拟合为 $N$ 个 2D 高斯基元，每个仅 8 维参数 $(x, y, \text{cov}_{xx}, \text{cov}_{xy}, \text{cov}_{yy}, R, G, B)$，相对像素实现 $3\times$--$23.5\times$ 的压缩。拟合管线引入结构化初始化（基于空间布局而非随机，迭代 0 即产出有意义的粗逼近）和亮度感知剪枝（3136 点下可剪除 23.7\% 高斯，PSNR 仅从 37.43 降至 31.1），配合批量 CUDA 核实现比先前实现快 90 倍以上的拟合速度。
+
+\textbf{GaussianSplatEncoder}：将无序高斯集映射为 CLIP 兼容嵌入——先对协方差做 signed-log 归一化、对 $(x,y)$ 做分辨率缩放，经 Fourier 编码和线性投影进入 Perceiver 空间，$M$ 个可学习 latent queries 通过 cross-attention 从 $N$ 个高斯中聚合信息，输出经 Transformer backbone 和 CLS token 提取最终嵌入。整个编码器复用冻结的 RGB 预训练 Transformer，仅训练 9.7\%--13.8\% 的参数。在 12.8M 图像的 DataComp 上预训练后，GaussianVision 在 38 个零样本分类基准上与 RGB ViT-B/16 基线持平或更优，其中 19 个基准由 GS 变体取得最佳——即使 400 点的极端压缩配置也保留了可观的语义信号，表明 2DGS 表示在视觉-语言对齐场景中兼具传输效率与语义保真度。
+
+\paragraph{轮廓信息感知的 2DGS}
+
+与 EGGS 通过混合 2D/3D 基元提升几何精度不同，Contour Information Aware 2DGS（2025.12）~\cite{2512_23255} 走了一条更轻量的路线——不修改 2DGS 的基元参数化或光栅化管线，而是在渲染阶段引入语义区域约束，以零额外参数解决有限高斯预算下的边缘模糊问题。问题根源在于：标准 2DGS 对所有像素执行全局 $\alpha$-混合，当一个高斯跨越两个不同物体的语义边界时，其颜色同时渗入两侧像素，且高斯预算越小，每个高斯覆盖的空间范围越大，边界伪影越严重。
+
+\textbf{区域感知渲染掩码。}核心改进是利用现成分割模型（SAM、DINO 或 LSeg）为每个像素 $(x,y)$ 生成区域标签 $r_{xy} = M(x,y) \in \{1, \ldots, R\}$，同时根据高斯中心在分割图上的投影为其分配固定区域 ID $r_i = M(\mu_i^x, \mu_i^y)$——$r_i$ 不是可学习参数，而是由分割掩码直接查表得到的固定值。渲染时仅允许同区域的高斯参与混合：
+
+\begin{equation}
+I_{\text{pred}}(x, y) = \sum_{i:\, r_i = r_{xy}} \alpha_i \, \mathcal{N}((x,y); \boldsymbol{\mu}_i, \boldsymbol{\Sigma}_i) \, \mathbf{c}_i,
+\end{equation}
+
+即只有区域 ID 与目标像素一致的高斯基元才贡献颜色，从渲染机制层面杜绝跨边界混合。掩码通过整数 ID 比较实现，不需要修改可微光栅化器的核心逻辑，渲染保持完全并行化。区域分配采用 warm-up 策略：每 1000 迭代根据高斯当前位置刷新 $r_i$，直至训练过半后固定，兼顾早期位置更新和后期稳定性。损失函数保持标准的 $L = \|I_{\text{gt}} - I_{\text{pred}}\|_1$，不做任何修改——全局重建损失驱动整体质量，区域掩码约束自动引导局部边缘精度。
+
+\textbf{无裁剪训练。}标准 2DGS 将渲染像素值裁剪到 $[0,1]$ 以稳定训练，但这限制了中间色（暗绿、橙、紫、青）的表达力——这些颜色通常需要多个高斯以不同权重叠加才能忠实再现，裁剪迫使模型消耗更多高斯预算来逼近。作者移除了裁剪操作：通常情况下，移除裁剪会加剧低预算下的边界模糊；但区域掩码从语义层面隔离了不同区域的渲染，即使无裁剪也能在极少高斯下保持清晰轮廓。最终效果是：在高斯预算受限时，既释放了中间色的表达力，又维持了边缘保真度。
+
+\subsection{2D 高斯小结}
+
+2DGS 的发展展现出两条并行的应用主线：（1）\textbf{3D 场景重建}——2D Surfel 作为 3D 椭球的降维替代，在表面重建中表现更好（EGGS 将 2D/3D 混合使用）；（2）\textbf{2D 图像处理}——2D 高斯作为图像的连续表示，在超分辨率、压缩和分词中展现出独特优势。第二条主线是 3DGS 技术向 2D 视觉领域的自然扩展，将连续高斯场的优势（任意尺度渲染、参数化压缩）引入传统图像处理任务。
+
+\begin{takeaway}
+2D 高斯与 Surfel 表示通过维度降阶消除了 3D 椭球表示平面表面时的参数冗余，在表面重建中天然优于 3D 高斯。2DGS 发展出两条并行主线：3D 场景重建（2D Surfel 替代 3D 椭球）和 2D 图像处理（高斯作为连续图像表示），后者将 3DGS 技术向 2D 视觉领域自然扩展。区域掩码和感知色调映射等创新使 2DGS 在低基元预算下仍能保持高质量。
+\end{takeaway}
+
+%=====================================================================
+
+\input{chapters/recent/ch04}
+
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+\begin{futurebox}{本章总结与展望}{ch04_summary}
+本章围绕”如何从高斯基元获得精确表面”这一核心问题，系统梳理了五条技术路线。深度与法线正则化（\S\ref{sec:04_1}）是最直接的路线，通过外部几何先验约束高斯的空间分布，在不改变基元表示的前提下提升几何质量。SDF 与隐式表面引导（\S\ref{sec:04_2}）更根本地解决了问题，通过引入隐式 SDF 场让高斯沿零水平集排列，但双分支优化的复杂性是主要挑战。多视角几何与平面约束（\S\ref{sec:04_3}）利用传统 MVS 的成熟理论增强 GS 的多视角一致性，在视角充足的场景中效果显著。网格提取与优化（\S\ref{sec:04_4}）解决了从高斯到 mesh 的”最后一公里”问题，混合 Mesh-Gaussian 表示成为兼顾渲染和几何的有前景方向。其他方法（\S\ref{sec:04_5}）从信息论、PDE、物理感知等非传统角度丰富了几何重建的工具箱。
+
+从技术趋势看，几何与表面重建正从”正则化引导的高斯优化”向”几何与渲染的统一表示”演进——最新的工作（如 MILo、OMeGa、Gaussian-Voxel Duet）不再将几何和渲染视为两个独立任务，而是在统一框架中联合优化。这一趋势与第~\ref{ch:03}~章中高斯基元的改进方向一致：更紧凑的基元表示、更精确的几何约束、更紧密的渲染-几何耦合。
+\end{futurebox}

@@ -1,0 +1,39 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (24.0, 5.6) {人体化身与动画方法分类};
+  \node[route=techblue] (b0) at (10.4, 3.1) {人脸重建与动画};
+  \node[method=techblue] (b0_l0) at (1.7, 0.6) {参数化化身\\{\tiny GaussianBlendshapes, NPGA, GraphAvatar}};
+  \node[method=techblue] (b0_l1) at (6.2, 0.6) {单图/生成重建\\{\tiny FaceLift, FastAvatar, SEGA, GGHead}};
+  \node[method=techblue] (b0_l2) at (10.4, 0.6) {头发建模\\{\tiny MeGA, 3DGH, HairGaussian}};
+  \node[method=techblue] (b0_l3) at (14.0, 0.6) {眼动控制\\{\tiny ScaffoldAvatar, HyperGaussians, STAvatar}};
+  \node[route=techgreen] (b1) at (24.0, 3.1) {身体与运动};
+  \node[method=techgreen] (b1_l0) at (18.1, 0.6) {化身表示驱动\\{\tiny GaussianAvatars, GauHuman, HUGS}};
+  \node[method=techgreen] (b1_l1) at (22.2, 0.6) {单图创建\\{\tiny HumanSplat, EliGS, ExAvatar}};
+  \node[method=techgreen] (b1_l2) at (25.8, 0.6) {物理衣物\\{\tiny PhysAvatar, ClothGS, DressCode-GS}};
+  \node[method=techgreen] (b1_l3) at (29.4, 0.6) {压缩流式\\{\tiny CompactAvatar, StreamAvatar}};
+  \node[route=techorange] (b2) at (34.8, 3.1) {语音驱动与局部};
+  \node[method=techorange] (b2_l0) at (33.0, 0.6) {音频驱动\\{\tiny GaussianTalker, Talk3D, GSTalker}};
+  \node[method=techorange] (b2_l1) at (36.6, 0.6) {手部建模\\{\tiny HandGS, Dextrous-GS}};
+  \node[method=techorange] (b2_l2) at (40.2, 0.6) {服装试穿\\{\tiny GarmentGS, TryOn-GS}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b0) -- (b0_l3);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b1) -- (b1_l2);
+  \draw[arr] (b1) -- (b1_l3);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b2) -- (b2_l2);
+\end{tikzpicture}

@@ -1,0 +1,55 @@
+% 图4.2: 网格提取技术路线对比
+\begin{tikzpicture}[
+  node distance=0.6cm and 1.0cm,
+  stage/.style={rectangle, rounded corners=2pt, draw=#1, fill=#1!10,
+    text width=2.8cm, minimum height=0.7cm, align=center, font=\small},
+  arr/.style={-{Stealth[length=4pt]}, thick, techgray},
+  milestone/.style={stage=#1, font=\small\bfseries, draw=#1, line width=1pt},
+  label/.style={font=\scriptsize\color{techlightgray}},
+]
+
+% Row 1: Traditional extraction
+\node[font=\small\bfseries\color{techblue}] (t1) {传统提取};
+\node[milestone=techblue, right=0.8cm of t1] (sugar) {SuGaR\\Poisson 重建};
+\node[stage=techblue, right=0.5cm of sugar] (gof) {GOF\\不透明度场};
+\node[stage=techblue, right=0.5cm of gof] (gs2mesh) {GS2Mesh\\立体匹配};
+\node[stage=techblue, right=0.5cm of gs2mesh] (conf) {Confidence\\置信度};
+
+\draw[arr] (sugar) -- (gof);
+\draw[arr] (gof) -- (gs2mesh);
+\draw[arr] (gs2mesh) -- (conf);
+
+% Row 2: Differentiable mesh
+\node[font=\small\bfseries\color{techgreen}, below=1.2cm of t1] (t2) {可微渲染};
+\node[milestone=techgreen, right=0.8cm of t2] (direct) {端到端\\mesh学习};
+\node[stage=techgreen, right=0.5cm of direct] (tri) {Triangle\\Splatting+};
+\node[stage=techgreen, right=0.5cm of tri] (milo) {MILo\\循环提取};
+\node[stage=techgreen, right=0.5cm of milo] (wrap) {Gaussian\\Wrapping};
+
+\draw[arr] (direct) -- (tri);
+\draw[arr] (tri) -- (milo);
+\draw[arr] (milo) -- (wrap);
+
+% Row 3: Hybrid representation
+\node[font=\small\bfseries\color{techorange}, below=1.2cm of t2] (t3) {混合表示};
+\node[milestone=techorange, right=0.8cm of t3] (mesh3dgs) {Mesh+GS\\室内重建};
+\node[stage=techorange, right=0.5cm of mesh3dgs] (omega) {OMeGa\\联合优化};
+\node[stage=techorange, right=0.5cm of omega] (halo) {HaloGS\\松耦合};
+\node[stage=techorange, right=0.5cm of halo] (hybrid) {Hybrid\\Mesh-GS};
+
+\draw[arr] (mesh3dgs) -- (omega);
+\draw[arr] (omega) -- (halo);
+\draw[arr] (halo) -- (hybrid);
+
+% Row 4: Domain-specific
+\node[font=\small\bfseries\color{techpurple}, below=1.2cm of t3] (t4) {特定领域};
+\node[milestone=techpurple, right=0.8cm of t4] (brep) {BrepGaussian\\CAD B-Rep};
+\node[stage=techpurple, right=0.5cm of brep] (plant) {GaussianPlant\\植物};
+\node[stage=techpurple, right=0.5cm of plant] (city) {City-Mesh3R\\城市};
+\node[stage=techpurple, right=0.5cm of city] (gs2m) {GS-2M\\反射面};
+
+\draw[arr] (brep) -- (plant);
+\draw[arr] (plant) -- (city);
+\draw[arr] (city) -- (gs2m);
+
+\end{tikzpicture}

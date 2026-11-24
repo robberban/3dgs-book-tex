@@ -1,0 +1,19 @@
+% Part 4 导言：效率与泛化
+\vspace{1em}
+\begin{center}
+\textcolor{techgray}{\small 本部分解决3DGS走出实验室的核心瓶颈——模型压缩与加速、稀疏条件下的鲁棒重建、可泛化前馈重建。}
+\end{center}
+\vspace{0.5em}
+
+\noindent\textbf{本部分包含：}
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+\item[\textcolor{techpurple}{\textbullet}] \textbf{第11章}（压缩与加速）— 剪枝、编码压缩、训练加速、流式渲染、结构化表示
+\item[\textcolor{techpurple}{\textbullet}] \textbf{第12章}（稀疏与鲁棒）— 稀疏视角NVS、位姿估计、退化处理、主动视觉
+\item[\textcolor{techpurple}{\textbullet}] \textbf{第13章}（前馈重建）— 多视角/单图前馈、无标定、大规模重建模型
+\end{itemize}
+
+\noindent\textbf{阅读建议：}第11章是实时应用的基础，建议工程师优先阅读。第12章和第13章分别处理``数据不够''和``逐场景优化太慢''两个问题，逻辑上互补。第13章的前馈模型可直接用于第17章（机器人）的在线建图。
+
+\noindent\textbf{与其他部分的联系：}第11章的压缩策略在第15章（SLAM）和第17章（机器人）中被广泛采用；第12章的位姿估计是第14章（大规模重建）的输入；第13章的前馈模型为第8章（3D生成）提供了替代方案。
+
+\vspace{1em}

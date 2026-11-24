@@ -1,0 +1,33 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=2.8cm, align=center, font=\small, minimum height=1cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+]
+  \node[box=techblue] (input) at (7.1,-13.7) {输入图像集\\(+ 相机参数)};
+  \node[box=techblue] (sfm) at (7.1,-11.4) {SfM 预处理\\(COLMAP)};
+  \node[box=techblue] (init) at (7.1,-9.2) {高斯基元初始化\\(各向同性高斯)};
+  \node[box=techgreen] (grad) at (7.1,-6.5) {梯度更新\\(位置/协方差/不透明度/SH)};
+  \node[box=techorange] (adc) at (5.5,-4.0) {自适应密度控制\\(每100次迭代)};
+  \node[box=techorange] (clone) at (2.0,-1.2) {克隆\\(填补空白)};
+  \node[box=techorange] (split) at (5.2,-1.2) {分裂\\(细化细节)};
+  \node[box=techorange] (prune) at (8.4,-1.2) {剪枝\\(移除冗余)};
+  \node[box=techpurple] (converge) at (12.5,-4.0) {收敛模型\\(100万--500万高斯)};
+  \node[box=techpurple] (render) at (12.5,-1.2) {实时渲染\\(\textgreater{}100 FPS, 1080p)};
+
+  \draw[arr] (input) -- (sfm);
+  \draw[arr] (sfm) -- (init);
+  \draw[arr] (init) -- (grad);
+  \draw[arr] (grad) -- (adc) node[midway, right, font=\scriptsize, techgray] {每100 iter};
+  \draw[arr] (adc) -- (grad) node[midway, left, font=\scriptsize, techgray] {继续优化};
+  \draw[darr] (adc) -- (clone);
+  \draw[darr] (adc) -- (split);
+  \draw[darr] (adc) -- (prune);
+  \draw[arr] (grad) -- (converge) node[midway, right, font=\scriptsize, techgray] {收敛};
+  \draw[arr] (converge) -- (render);
+
+  % ADC 子框
+  \begin{scope}[on background layer]
+    \node[draw=techorange, dashed, rounded corners, inner sep=8pt, fit=(clone)(split)(prune), fill=techorangebg!30] {};
+  \end{scope}
+\end{tikzpicture}

@@ -1,0 +1,66 @@
+\begin{tikzpicture}[
+  part/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    font=\small, text width=1.6cm, minimum height=0.8cm, align=center},
+  chapter/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!8,
+    font=\footnotesize, minimum height=0.6cm, align=center},
+  arr/.style={-{Stealth[length=4pt]}, techgray!70},
+]
+  \node[chapter=techblue] (c1) at (7.5,-19.2) {Ch1 基础};
+  \node[chapter=techblue] (c2) at (7.5,-18.3) {Ch2 渲染};
+  \node[part=techblue] (p1) at (3.0,-17.8) {Part I\par\scriptsize 表示与渲染};
+  \node[chapter=techblue] (c3) at (7.5,-17.4) {Ch3 基元};
+  \node[chapter=techgreen] (c4) at (7.5,-16.5) {Ch4 几何};
+  \node[chapter=techgreen] (c5) at (7.5,-15.6) {Ch5 材质};
+  \node[part=techgreen] (p2) at (3.0,-14.7) {Part II\par\scriptsize 外观与动态};
+  \node[chapter=techgreen] (c6) at (7.5,-14.7) {Ch6 动态};
+  \node[chapter=techgreen] (c7) at (7.5,-13.8) {Ch7 物理};
+  \node[chapter=techorange] (c8) at (7.5,-12.9) {Ch8 生成};
+  \node[chapter=techorange] (c9) at (7.5,-12.0) {Ch9 编辑};
+  \node[part=techorange] (p3) at (3.0,-11.5) {Part III\par\scriptsize 生成与交互};
+  \node[chapter=techorange] (c10) at (7.5,-11.1) {Ch10 分割};
+  \node[part=techgray] (book) at (0.5,-10.7) {\textbf{3DGS 技术综述}};
+  \node[chapter=techpurple] (c11) at (7.5,-10.2) {Ch11 压缩};
+  \node[part=techpurple] (p4) at (3.0,-9.3) {Part IV\par\scriptsize 系统与优化};
+  \node[chapter=techpurple] (c12) at (7.5,-9.3) {Ch12 稀疏};
+  \node[chapter=techpurple] (c13) at (7.5,-8.4) {Ch13 前馈};
+  \node[chapter=techpurple] (c14) at (7.5,-7.5) {Ch14 大规模};
+  \node[chapter=techgray] (c15) at (7.5,-6.6) {Ch15 SLAM};
+  \node[chapter=techgray] (c16) at (7.5,-5.7) {Ch16 人体};
+  \node[chapter=techgray] (c17) at (7.5,-4.8) {Ch17 机器人};
+  \node[part=techgray] (p5) at (3.0,-4.3) {Part V\par\scriptsize 应用领域};
+  \node[chapter=techgray] (c18) at (7.5,-3.9) {Ch18 自动驾驶};
+  \node[chapter=techgray] (c19) at (7.5,-3.0) {Ch19 医学};
+  \node[chapter=techgray] (c20) at (7.5,-2.1) {Ch20 遥感};
+  \node[part=techgray] (p6) at (3.0,-1.6) {Part VI\par\scriptsize 总结};
+  \node[chapter=techgray] (c21) at (7.5,-1.2) {Ch21 安全};
+  \node[chapter=techgray] (c22) at (7.5,-0.3) {Ch22 总结};
+
+  \draw[arr] (book) -- (p1);
+  \draw[arr] (book) -- (p2);
+  \draw[arr] (book) -- (p3);
+  \draw[arr] (book) -- (p4);
+  \draw[arr] (book) -- (p5);
+  \draw[arr] (book) -- (p6);
+  \draw[arr] (p1) -- (c1);
+  \draw[arr] (p1) -- (c2);
+  \draw[arr] (p1) -- (c3);
+  \draw[arr] (p2) -- (c4);
+  \draw[arr] (p2) -- (c5);
+  \draw[arr] (p2) -- (c6);
+  \draw[arr] (p2) -- (c7);
+  \draw[arr] (p3) -- (c8);
+  \draw[arr] (p3) -- (c9);
+  \draw[arr] (p3) -- (c10);
+  \draw[arr] (p4) -- (c11);
+  \draw[arr] (p4) -- (c12);
+  \draw[arr] (p4) -- (c13);
+  \draw[arr] (p4) -- (c14);
+  \draw[arr] (p5) -- (c15);
+  \draw[arr] (p5) -- (c16);
+  \draw[arr] (p5) -- (c17);
+  \draw[arr] (p5) -- (c18);
+  \draw[arr] (p5) -- (c19);
+  \draw[arr] (p5) -- (c20);
+  \draw[arr] (p5) -- (c21);
+  \draw[arr] (p6) -- (c22);
+\end{tikzpicture}

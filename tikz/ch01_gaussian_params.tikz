@@ -1,0 +1,43 @@
+\begin{tikzpicture}[
+  param/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!10,
+    font=\small, text width=2.2cm, minimum height=0.7cm, align=center},
+  ann/.style={font=\scriptsize, techgray},
+  >=Stealth
+]
+  % 中心椭球体（用 ellipse 模拟）
+  \draw[thick, fill=techbluebg, draw=techblue, rotate=25]
+    (0,0) ellipse (2.2cm and 1.2cm);
+
+  % 中心点
+  \fill[techblue] (0,0) circle (3pt);
+  \node[ann, below right=1pt] at (0.1,-0.1) {$\boldsymbol{\mu}_k$};
+
+  % 位置标注
+  \draw[->, thick, techblue] (0,0) -- ++(0,2.5)
+    node[above, param=techblue] {位置 $\boldsymbol{\mu}_k$\\(3D坐标)};
+
+  % 协方差标注
+  \draw[->, thick, techgreen] (0,0) -- ++(-3.2,0.8)
+    node[left, param=techgreen, text width=2.5cm, align=center]
+    {协方差 $\boldsymbol{\Sigma}_k$\\[2pt]
+     $\mathbf{R}_k$: 旋转 (四元数)\\
+     $\mathbf{S}_k$: 缩放 (对角阵)};
+
+  % 不透明度标注
+  \draw[->, thick, techorange] (0,0) -- ++(3.2,0.8)
+    node[right, param=techorange] {不透明度 $\alpha_k$\\$\in [0, 1)$};
+
+  % SH 系数标注
+  \draw[->, thick, techpurple] (0,0) -- ++(0,-2.5)
+    node[below, param=techpurple] {球谐系数 (SH)\\3阶 $\to$ 48个参数};
+
+  % 右下角参数汇总（与 SH 球谐系数框水平对齐）
+  \node[draw=techgray, rounded corners, fill=techbg, font=\footnotesize,
+    text width=3.5cm, align=left, anchor=west]
+    at (4.5, -3.0) {%
+    \textbf{每个高斯总参数量：59}\\[2pt]
+    位置 3 + 四元数 4\\
+    + 缩放 3 + 不透明度 1\\
+    + SH颜色 48 = \textbf{59}%
+  };
+\end{tikzpicture}

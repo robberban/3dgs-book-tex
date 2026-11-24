@@ -1,0 +1,24 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10, text width=3cm, align=center, font=\small, minimum height=0.75cm},
+  widebox/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10, text width=3.5cm, align=center, font=\small, minimum height=0.75cm},
+  diam/.style={diamond, draw=#1, fill=#1!8, font=\scriptsize, text width=1.8cm, align=center, aspect=2},
+  biglabel/.style={font=\bfseries\small, #1},
+  arr/.style={-{Stealth[length=5pt]}, thick, #1},
+  >=Stealth
+]
+  \node[biglabel=techblue] at (1.7, 7.1) {原始 3DGS};
+  \node[biglabel=techgreen] at (6.2, 7.1) {AbsGS};
+  \node[box=techblue] (o_px) at (1.7, 5.6) {像素子梯度：$+2,\ {-3},\ +1$};
+  \node[box=techblue] (o_sum) at (1.7, 3.1) {代数和：$+2 + (-3) + 1 = 0$};
+  \node[box=techblue, draw=red!60, fill=red!8] (o_result) at (1.7, 0.6) {\textbf{结果}：$|0| < \tau$\\不触发致密化};
+  \node[box=techgreen] (m_px) at (6.2, 5.6) {像素子梯度取绝对值：$|{+2}|,\ |{-3}|,\ |{+1}|$};
+  \node[box=techgreen] (m_sum) at (6.2, 3.1) {绝对值之和：$2 + 3 + 1 = 6$};
+  \node[box=techgreen] (m_result) at (6.2, 0.6) {\textbf{结果}：$|6| > \tau$\\\textbf{正确触发}致密化};
+  \draw[arr=techblue] (o_px) -- (o_sum);
+  \draw[arr=techblue] (o_sum) -- (o_result);
+  \draw[arr=techgreen] (m_px) -- (m_sum);
+  \draw[arr=techgreen] (m_sum) -- (m_result);
+  \node[rectangle, rounded corners=3pt, draw=techorange, fill=techorange!8, font=\scriptsize, text width=2.4cm, align=center] at (3.9, 4.6) {
+    \textbf{关键改动}\\取绝对值后累加
+  };
+\end{tikzpicture}

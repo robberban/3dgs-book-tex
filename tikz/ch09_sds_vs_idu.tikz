@@ -1,0 +1,47 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!8, line width=0.7pt, text width=2.6cm, minimum height=0.6cm, align=center, font=\scriptsize\bfseries},
+  arr/.style={-{stealth[length=3.5pt]}, line width=0.5pt, draw=techgray},
+  lbl/.style={font=\scriptsize, text=techgray},
+]
+% SDS pipeline (top)
+\node[font=\small\bfseries, text=techblue] at (-5.5, 3.8) {SDS 迭代优化};
+
+\node[box=techblue] (s1) at (-5.5, 2.5) {3DGS 渲染\\$I^p = R(\theta, p)$};
+\node[box=techblue] (s2) at (-5.5, 1.5) {加噪 $z_t$\\扩散模型\\预测残差};
+\node[box=techblue] (s3) at (-5.5, 0.5) {SDS 梯度\\$\nabla_\theta \mathcal{L}_{\text{SDS}}$};
+\node[box=techorange] (s4) at (-5.5, -0.5) {更新 3DGS\\参数 $\theta$};
+
+\draw[arr] (s1) -- (s2);
+\draw[arr] (s2) -- (s3);
+\draw[arr] (s3) -- (s4);
+\draw[arr, dashed, bend left=60] (s4.east) to node[lbl, right] {迭代循环} (s1.east);
+
+% IDU pipeline (bottom)
+\node[font=\small\bfseries, text=techgreen] at (2, 3.8) {迭代数据集更新 (IDU)};
+
+\node[box=techgreen] (d1) at (2, 2.5) {3DGS 渲染\\选定视角图像};
+\node[box=techgreen] (d2) at (2, 1.5) {2D 扩散模型\\编辑图像\\(IP2P/\allowbreak ControlNet)};
+\node[box=techgreen] (d3) at (2, 0.5) {编辑后图像\\作为新训练集};
+\node[box=techorange] (d4) at (2, -0.5) {3DGS 重建\\$\min_\theta \|I'_t - R(\theta)\|$};
+
+\draw[arr] (d1) -- (d2);
+\draw[arr] (d2) -- (d3);
+\draw[arr] (d3) -- (d4);
+\draw[arr, dashed, bend right=60] (d4.west) to node[lbl, left] {迭代更新数据集} (d1.west);
+
+% Key difference
+\draw[{stealth[length=4pt]}-{stealth[length=4pt]}, thick, draw=techpurple] (-2.5, 1.5) -- (-0.5, 1.5)
+  node[midway, above, font=\scriptsize\bfseries, text=techpurple] {核心差异};
+\node[font=\scriptsize, text=techpurple, align=center] at (-1.5, 0.8) {SDS: 直接优化3D参数\\IDU: 解耦2D编辑+3D重建};
+
+% Pros/cons
+\node[font=\scriptsize, align=left, text=techblue] at (-5.5, -1.6) {
+  \textbf{优点}: 端到端优化\\
+  \textbf{缺点}: 梯度偏差, 视角不一致
+};
+\node[font=\scriptsize, align=left, text=techgreen] at (2, -1.6) {
+  \textbf{优点}: 各模块各司其职\\
+  \textbf{缺点}: 2D不一致→3D抖动
+};
+
+\end{tikzpicture}

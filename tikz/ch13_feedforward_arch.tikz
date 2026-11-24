@@ -1,0 +1,22 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (f1) at (3.0, 0.6) {多视角输入(N张图像)};
+  \node[box=techblue] (f2) at (10.1, 0.6) {特征提取(CNN/ViT)};
+  \node[box=techgreen] (f3) at (18.2, 0.6) {跨视角聚合(Epipolar/注意力)};
+  \node[box=techorange] (f4) at (28.5, 0.6) {高斯参数预测(位置/协方差/SH/$\alpha$)};
+  \node[box=techpurple] (f5) at (37.7, 0.6) {可微分渲染(光栅化)};
+  \node[font=\scriptsize, text=techgray] at (10.1, -0.6) {深度先验};
+  \node[font=\scriptsize, text=techgray] at (37.7, -0.6) {新视角图像};
+  \draw[arr] (f1) -- (f2);
+  \draw[arr] (f2) -- (f3);
+  \draw[arr] (f3) -- (f4);
+  \draw[arr] (f4) -- (f5);
+\end{tikzpicture}

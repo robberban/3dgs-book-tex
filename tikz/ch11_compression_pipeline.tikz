@@ -1,0 +1,19 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (s1) at (3.7, 0.6) {高斯剪枝(评分/掩码/正则化)};
+  \node[box=techgreen] (s2) at (12.3, 0.6) {编码压缩(向量量化/熵编码)};
+  \node[box=techorange] (s3) at (20.7, 0.6) {渲染加速(LOD/流式/Web)};
+  \node[font=\scriptsize, text=techgray] at (3.7, 1.8) {高斯数$\downarrow$90\%};
+  \node[font=\scriptsize, text=techgray] at (12.3, 1.8) {存储$\downarrow$50$\times$};
+  \node[font=\scriptsize, text=techgray] at (20.7, 1.8) {渲染$\rightarrow$实时};
+  \draw[arr] (s1) -- (s2);
+  \draw[arr] (s2) -- (s3);
+\end{tikzpicture}

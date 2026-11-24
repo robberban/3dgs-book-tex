@@ -1,0 +1,1121 @@
+\chapter{高斯表示与基元设计}
+\label{ch:03}
+
+\paragraph*{本章阅读锚点}
+本章的锚点是高斯基元本身。原始 3DGS 用自由 3D 椭球表达场景；后续方法要么限制基元形状，要么换成锚点、平面、曲面、层级或混合表示，以换取更稳定的几何或更低的存储。
+
+
+3D Gaussian Splatting 将场景表示为一组 3D 高斯基元，每个基元由中心位置、3D 协方差（控制形状和尺寸）、球谐系数（控制颜色）和不透明度组成。这一简洁的参数化使 3DGS 兼具高效的光栅化渲染能力和基于梯度的端到端优化能力。然而，标准高斯基元存在三个根本性限制。第一，每个高斯只能表示一种均匀颜色，无法捕捉表面上的纹理变化。第二，高斯核函数的无限支撑和平滑性使其难以精确表示锐利边缘和薄结构。第三，3D 椭球在表示平面表面时存在固有的几何冗余。
+
+本章从五个方向系统梳理高斯基元的改进。第~\ref{sec:03_1}~节讨论基于 SH 坐标和纹理图的空间变化外观。第~\ref{sec:03_2}~节介绍基于神经场的纹理化与其他增强方法。第~\ref{sec:03_3}~节讨论有界支撑与非对称分布等替代核函数。第~\ref{sec:03_4}~节介绍多边形基元与通用核框架。第~\ref{sec:03_5}~节讨论特殊频谱与高维表示。2D 高斯与 Surfel 表示的内容移至第~\ref{ch:04}~章。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.95\textwidth}{!}{\input{tikz/ch03_primitive_taxonomy.tikz}}
+\caption{高斯基元改进的技术路线。§3.1-3.2 纹理高斯增强外观表达力，§3.3-3.4 替代核函数改变基元几何，§3.5 高维表示扩展到非RGB域。2D高斯内容移至第4章。}
+\label{fig:03_taxonomy}
+\end{figure}
+
+%=====================================================================
+
+%=====================================================================
+\section{纹理高斯与空间变化外观}
+\label{sec:03_1}
+
+\subsection{问题背景：单一颜色的表达力瓶颈}
+
+标准 3DGS 中，每个高斯基元通过球谐系数（SH）对其颜色进行参数化。给定观察方向 $\mathbf{d}$，基元的颜色由球谐系数 $\{c_l^m\}$ 计算得到，是一个关于方向的函数 $C(\mathbf{d}) = \sum_{l=0}^{L} \sum_{m=-l}^{l} c_l^m Y_l^m(\mathbf{d})$。这意味着：对于固定视角，同一个高斯基元在屏幕上的所有像素都呈现相同的颜色，无法表示表面上的空间颜色变化（如棋盘格、文字、砖墙纹理）。
+
+当场景包含丰富纹理时，3DGS 必须使用大量微小高斯基元来逼近空间变化的颜色，导致存储开销急剧增加。以 Mip-NeRF 360 数据集为例，标准 3DGS 平均需要约 500 万个高斯点才能达到 25 dB 的 PSNR，其中相当一部分仅仅是为了编码纹理细节。
+
+纹理高斯的核心思路是\textbf{解耦外观和几何}：让少数高斯基元承载丰富的纹理信息，而非用大量高斯点去逼近空间颜色变化。具体而言，将每个高斯基元的颜色从”一个方向相关的标量值”升级为”一个空间位置相关的纹理图”，使单个基元即可表示复杂的表面纹理。按照纹理参数化方式，这一方向的论文可分为三个技术路线：（1）基于球谐空间坐标的纹理化；（2）基于 2D 纹理图的纹理化；（3）基于神经场的纹理化。
+
+\subsubsection{基于球谐空间坐标的纹理化}
+
+本节介绍 2 种基于球谐空间坐标的纹理化方法：Textured-GS（用表面交点替代视角方向作为 SH 输入）和 SVGS（高斯 Surfel 上的空间变化函数）。
+
+\paragraph{用表面交点替代视角方向}
+
+Textured-GS（2024.07）~\cite{2407_09733} 是首个将空间变化颜色引入 3DGS 的工作。本方法修改了 3DGS 的颜色表示——用射线与高斯椭球面的交点坐标替代视角方向作为 SH 的输入变量——SH 参数量保持不变。
+
+\textbf{Baseline 的局限。} 在标准 3DGS 中，颜色由球谐系数和视角方向共同决定：$c = \sum_{l=0}^{L} \sum_{m=-l}^{l} c_l^m Y_l^m(\mathbf{d})$，其中 $\mathbf{d}$ 是从高斯中心指向相机的单位方向向量。这意味着对于固定视角，同一个高斯基元覆盖的所有像素都获得相同的 SH 颜色，无论射线击中高斯表面的哪个位置。当场景包含丰富的表面纹理（如棋盘格、砖墙、文字）时，3DGS 被迫用大量微小高斯去逼近空间颜色变化，导致存储膨胀。
+
+\textbf{核心洞察：换输入不换函数。} SH 函数本身是一种通用的基函数逼近器，问题不在于 SH 的表达能力，而在于输入变量的选择。如果将求值变量从视角方向 $\mathbf{d}$ 替换为射线与高斯椭球面的交点坐标，同一套 SH 就能编码表面上的空间纹理，而非视角相关的颜色变化。
+
+\textbf{射线-椭球交点计算。} 给定像素射线 $\mathbf{r}(t) = \mathbf{o} + t\mathbf{d}$（其中 $\mathbf{o}$、$\mathbf{d}$ 已变换到高斯局部坐标系），将其代入椭球方程 $x^2/s_x^2 + y^2/s_y^2 + z^2/s_z^2 = 1$（其中 $s_x, s_y, s_z$ 是高斯三个轴的缩放因子），得到关于参数 $t$ 的二次方程 $At^2 + Bt + C = 0$，其中：
+
+\begin{equation}
+A = \frac{d_x^2}{s_x^2} + \frac{d_y^2}{s_y^2} + \frac{d_z^2}{s_z^2}, \quad
+B = 2\left(\frac{o_x d_x}{s_x^2} + \frac{o_y d_y}{s_y^2} + \frac{o_z d_z}{s_z^2}\right), \quad
+C = \frac{o_x^2}{s_x^2} + \frac{o_y^2}{s_y^2} + \frac{o_z^2}{s_z^2} - 1
+\end{equation}
+
+取较小的根 $t = (-B - \sqrt{B^2 - 4AC}) / 2A$（即更靠近射线原点的交点），再用各轴缩放因子归一化，得到归一化交点坐标 $\mathbf{n}$——它标记了射线击中椭球表面的"哪里"，是纹理空间中的位置坐标。
+
+\textbf{纹理化 SH 公式。} 用 $\mathbf{n}$ 替代视角方向 $\mathbf{d}$ 作为 SH 的输入：
+
+\begin{equation}
+c_i = \sum_{l=0}^{L} \sum_{m=-l}^{l} c_{l,m}^i \, Y_l^m(\mathbf{n}), \quad
+\alpha_i = \sum_{l=0}^{L} \sum_{m=-l}^{l} \alpha_{l,m}^i \, Y_l^m(\mathbf{n})
+\end{equation}
+
+即颜色和透明度都通过同一套 SH 机制在表面位置上求值，每个像素因交点坐标不同而获得不同的颜色。纹理的复杂度由 SH 阶数 $L$ 决定——论文选择 $L=3$（与标准 3DGS 相同），因此\textbf{不增加任何额外参数}。
+
+\textbf{透明度纹理化与”单向高斯”。} Textured-GS 进一步将透明度也纳入 SH 纹理化：同一个高斯可以在一侧不透明、另一侧透明（论文称为”directional Gaussian”），有效改变高斯的视觉轮廓。这一能力使得单个高斯能够表示非凸的形状边界，而不仅仅是椭球投影。
+
+\textbf{优化策略。} 由于纹理化高斯基元的表达能力显著增强，Textured-GS 取消了 3DGS 的自适应密度控制（分裂/克隆），而是以 Mini-Splatting 的输出作为初始点云，直接在更少的高斯上优化纹理。对 SH 系数施加 sigmoid 激活以保证梯度平滑，损失函数与标准 3DGS 一致：$\mathcal{L} = (1-\lambda)\mathcal{L}_1 + \lambda\mathcal{L}_{\text{D-SSIM}}$，$\lambda=0.2$。值得注意的一个实现细节是：标准 3DGS 中视角方向 $\mathbf{d}$ 对同一高斯的所有像素相同，因此 SH 系数的梯度在迭代末尾统一更新；而 Textured-GS 中每个像素的交点坐标 $\mathbf{n}$ 不同，因此 SH 系数的梯度必须逐像素增量更新。
+
+\textbf{效果。} 在不增加高斯数量的条件下，Textured-GS 在多个数据集上将 PSNR 提升了 0.2--0.5 dB，同时将存储需求降低了约 30\%。代价仅是光栅化时需要多算一次射线-椭球交点（一次二次方程求解），而非标准 3DGS 中只做高斯中心投影。
+
+\paragraph{高斯 Surfel 上的空间变化函数}
+
+Textured-GS 用表面位置\textbf{替换}视角方向作为 SH 输入，实现了空间纹理但牺牲了视角相关效果。SVGS（2024.11）~\cite{2411_18966} 在此基础上提出一个更一般化的策略：\textbf{叠加而非替换}——保留标准 $\text{SH}(\mathbf{d})$ 处理视角相关光照，同时引入独立的空间变化函数 $F_c(\mathbf{p})$ 编码表面纹理。
+
+与 Textured-GS 基于 3D 高斯椭球不同，SVGS 采用 2D Gaussian Surfel 作为基元。交点计算因此简化为射线与 2D 平面的求交（而非 Textured-GS 的射线-椭球二次方程），交点坐标 $\mathbf{p} = (u, v)$ 定义在 Surfel 局部坐标系中。颜色和透明度函数被分解为：
+
+\begin{equation}
+c(\mathbf{p}, \mathbf{d}) = \text{SH}(\mathbf{d}) + F_c(\mathbf{p}), \quad
+\alpha(\mathbf{p}) = F_\alpha(\mathbf{p})
+\end{equation}
+
+其中 $\text{SH}(\mathbf{d})$ 是标准 3DGS 的视角相关球谐颜色，$F_c(\mathbf{p})$ 和 $F_\alpha(\mathbf{p})$ 是空间变化函数，分别编码颜色残差和透明度。注意 $F_c$ 和 $F_\alpha$ 不施加值域约束，允许负值输出——因为最终颜色和透明度经 sigmoid 激活后才归一化到有效范围，负值在中间表示中是合理的。SVGS 指出，先前工作 3D-HGS 和 NegGS 实际上都是这一框架的特例。
+
+SVGS 提供了三种 $F_c$、$F_\alpha$ 的具体实现。
+
+\textbf{双线性插值}将每个椭圆 Surfel 划分为四个象限，每个象限拥有独立的颜色 $c_i$ 和透明度 $\alpha_i$（$i=0,1,2,3$），通过双线性插值计算任意位置的值：$F_c(\mathbf{p}) = (1-u')(1-v')c_0 + (1-u')v'c_1 + u'(1-v')c_2 + u'v'c_3$，其中 $u' = \sigma(\beta_s \cdot u)$，$v' = \sigma(\beta_s \cdot v)$ 是经 sigmoid 重映射到 $[0,1]$ 的坐标（默认 $\beta_s = 5.0$），避免异常坐标值。每个 Surfel 仅增加 $4 \times 4 = 16$ 个参数。
+
+\textbf{可移动核}将双线性插值中的四个固定核推广为 $k$ 个可学习位置的核 $K_i = (K_i^x, K_i^y)$，颜色和透明度通过加权求和计算：$F_c = \sum_{i=0}^{k-1} \exp(-\beta_e \| \mathbf{p} - K_i \|^2) \cdot c_i$，默认 $k=4$，$\beta_e = 0.1$。核的位置可学习，使 Surfel 的纹理模式更加灵活。
+
+\textbf{微型 MLP}为每个 Surfel 配备一个独立的三层 MLP，输入局部坐标 $(u,v)$，输出颜色和透明度。虽然表达能力最强，但参数量远大于前两种方案。
+
+三种实现中，双线性插值在参数效率和重建质量之间取得了最佳平衡。SVGS 的核心贡献在于将空间变化的颜色和透明度统一到同一框架中，使单个 Surfel 可以在空间上平滑地过渡从完全透明到完全不透明的状态，并且同时保留视角相关的光照效果。
+
+\subsubsection{基于 2D 纹理图的纹理化}
+
+本节介绍 7 种基于 2D 纹理图的纹理化方法：Textured Gaussians（逐高斯纹理图）、GStex（2D 高斯的逐基元纹理）、HDGS（逐曲面纹理 + 视锥体采样）、Gaussian Billboards（UV 纹理映射）、BBSplat（可学习纹理的平面基元）、ASAP-Textured Gaussians（自适应采样对齐）和 A$^2$TG（自适应各向异性纹理分配）。
+
+\paragraph{逐高斯纹理图}
+
+本方法修改了 3DGS 的颜色与透明度表示环节——用逐高斯的 2D 纹理图替代全局单一颜色与固定透明度——高斯基元的几何属性（位置、旋转、缩放）和渲染管线（$\alpha$-混合）保持不变。
+
+\textbf{Baseline 的局限。}在标准 3DGS 中，第 $i$ 个高斯的颜色完全由球谐系数确定：$c_i = \mathrm{SH}(\mathbf{c}_i, \mathbf{d})$，与像素在高斯投影内的具体位置无关；其透明度为 $\alpha_i = G_i^{2D}(\mathbf{p}) \cdot o_i$，仅由一个标量不透明度 $o_i$ 和 2D 高斯核衰减共同决定。Textured Gaussians（2024.11）~\cite{2411_18625} 指出这带来两个根本性限制：（1）同一高斯覆盖的所有像素具有相同颜色（仅差一个高斯衰减因子），无法表达基元内部的空间纹理变化；（2）逐高斯的单一不透明度使高斯只能表示椭球形轮廓，无法刻画任意形状的边界。这两个约束严重限制了单个基元的表达能力——面对纹理丰富的表面，标准 3DGS 只能依赖密集堆叠大量小高斯来逼近。
+
+\textbf{核心改造。}为突破上述瓶颈，Textured Gaussians 为每个高斯基元分配一个固定分辨率 $T \times T \times K$ 的 2D 纹理图（texture map），其中 $K \in \{1, 3, 4\}$ 分别对应仅透明度、RGB 和 RGBA 纹理。直觉上，纹理图就像贴在高斯表面的一张"贴纸"：不同位置可以拥有不同颜色和不同透明度。这使单个基元能同时表达复杂外观和任意形状。
+
+\textbf{射线-平面交点。}纹理图建立在高斯局部坐标系上。纹理映射平面 $P$ 由高斯的两个最大缩放轴张成（法线 $\mathbf{n}_i$ 对应最小缩放轴方向）。渲染时，对每个像素 $\mathbf{p}$ 从相机原点 $\mathbf{o}$ 投射一条射线，射线与平面 $P$ 的交点 $\mathbf{x}$ 给出像素在高斯表面上的"落点"位置：
+
+\begin{equation}
+\mathbf{x} = \mathbf{o} + \frac{(\boldsymbol{\mu}_i - \mathbf{o}) \cdot \mathbf{n}_i}{(\mathbf{p} - \mathbf{o}) \cdot \mathbf{n}_i} (\mathbf{p} - \mathbf{o})
+\end{equation}
+
+直观地理解，分子部分计算相机到高斯中心沿法线方向的投影距离，分母部分计算相机到像素方向沿法线的投影距离。两者之比确定了射线到达平面所需的参数 $t$。
+
+\textbf{UV 映射与纹理查询。}得到交点 $\mathbf{x}$ 后，需要将其转换为纹理坐标 $(u,v)$——即将三维交点投影到 2D 纹理图上的像素位置（这一过程称为 UV 映射）：
+
+\begin{equation}
+u = \frac{1}{2} + \frac{(\mathbf{x} - \boldsymbol{\mu}_i) \cdot \mathbf{r}_i^1}{2 \, m \, s_i^1} (T-1), \quad
+v = \frac{1}{2} + \frac{(\mathbf{x} - \boldsymbol{\mu}_i) \cdot \mathbf{r}_i^2}{2 \, m \, s_i^2} (T-1)
+\end{equation}
+
+其中 $s_i^1, s_i^2$ 是两个主轴的缩放因子，$\mathbf{r}_i^1, \mathbf{r}_i^2$ 是主轴方向，$m$ 是控制纹理覆盖范围的乘子（实现中 $m=3$，即纹理覆盖 $3\sigma$ 范围，对应高斯 $99.7\%$ 的概率质量）。交点在高斯局部坐标系下沿两个主轴的偏移量被归一化到 $[0, T-1]$ 的纹理像素坐标范围。系统通过双线性插值查询纹理值 $c_i^{\text{tex}}(u,v) \in \mathbb{R}^3$ 和 $\alpha_i^{\text{tex}}(u,v) \in \mathbb{R}$，获得空间变化的颜色和透明度。
+
+\textbf{广义 $\alpha$-混合。}最终的像素颜色采用广义的 $\alpha$-混合公式。对比标准 3DGS 的 $c_i = \mathrm{SH}(\mathbf{c}_i, \mathbf{d})$ 和 $\alpha_i = G_i^{2D}(\mathbf{p}) \cdot o_i$，Textured Gaussians 将第 $i$ 个高斯对像素 $\mathbf{p}$ 的颜色和透明度改为：
+
+\begin{equation}
+c_i(\mathbf{p}) = c_i^{\text{SH}} + c_i^{\text{tex}}(u,v), \quad
+\alpha_i(\mathbf{p}) = \alpha_i^{\text{tex}}(u,v) \cdot G_i(\mathbf{x}) \cdot o_i
+\end{equation}
+
+颜色公式将原来的单一球谐颜色 $c_i^{\text{SH}}$ 与纹理残差 $c_i^{\text{tex}}(u,v)$ 相加。直觉上，SH 负责低频颜色和视角相关效果（如镜面反射），纹理图负责高频空间纹理（如砖缝、文字、毛发等细节）。透明度公式用空间变化的纹理透明度 $\alpha_i^{\text{tex}}(u,v)$ 替代了原来的常数 1，使高斯可以表达非椭球的复杂轮廓。当 $c_i^{\text{tex}} = 0$ 且 $\alpha_i^{\text{tex}} = 1$ 时，公式精确退化为标准 3DGS。
+
+\textbf{两阶段优化。}该方法采用两阶段优化策略，先学几何再学纹理，避免联合优化的病态性：
+
+\textit{第一阶段（几何 + 全局颜色）：}先用标准 3DGS 训练 30000 次迭代，学习高斯位置、旋转、缩放、球谐系数等全部属性。损失函数为 $\mathcal{L} = \mathcal{L}_1 + (1-\lambda)\mathcal{L}_{\text{D-SSIM}}$，其中 $\lambda = 0.8$。
+
+\textit{第二阶段（联合优化纹理）：}以第一阶段的高斯为初始化，固定高斯数量（禁用自适应密度控制），联合优化所有高斯属性和逐高斯纹理图，再训练 30000 次迭代。纹理图的学习率设为 0.001；RGB 通道初始化为低值 $25/255$（因为 SH 已捕获了平均颜色，纹理只需学习残差），alpha 通道初始化为 1（初始时透明度均匀，无形状变化）。
+
+推理阶段，由于自定义 CUDA 核实现射线-高斯交点和纹理查询的额外开销极小，推理速度与标准 3DGS 基本持平。
+
+\paragraph{2D 高斯的逐基元纹理}
+
+\textbf{动机。}Textured Gaussians 在 3DGS 框架中验证了逐基元纹理图的有效性，但 3D 高斯基元的纹理映射需要额外的射线-平面交点计算，且 3D 椭球在表示平面表面时存在几何冗余。2D Gaussian Splatting（2DGS）通过将基元直接定义为 2D 平面圆盘，天然消除了这些冗余。GStex（2024.09）~\cite{2409_12954} 沿用 Textured Gaussians 的逐基元纹理思路，将其移植到 2DGS 框架中，两者的核心辐射分解公式在形式上相似——都是"空间变化纹理 + 球谐残差"——但 GStex 有三个关键差异。
+
+\textbf{差异一：纹理分辨率由全局纹素尺寸驱动。}Textured Gaussians 使用固定分辨率 $T \times T$ 的纹理图，所有高斯共享同一分辨率。GStex 则引入一个全局超参数 $\tau$（世界空间纹素尺寸），根据每个高斯的尺度自适应确定纹理分辨率：$U_i = 6\sigma_{1,i}/\tau$，$V_i = 6\sigma_{2,i}/\tau$，覆盖 $\pm 3\sigma$ 区域。大高斯分配更多纹素，小高斯分配更少，纹理精度在世界空间中保持一致。UV 映射采用与锚点方法相同的射线-高斯交点 + 投影策略，将交点 $\mathbf{x}_i$ 沿局部旋转轴 $(\mathbf{a}_u, \mathbf{a}_v)$ 投影后除以 $\tau$：
+
+\begin{equation}
+    u_i(\mathbf{x}_i) = \frac{\mathbf{x}_i \cdot \mathbf{a}_u}{\tau} + \frac{U_i - 1}{2}, \quad
+    v_i(\mathbf{x}_i) = \frac{\mathbf{x}_i \cdot \mathbf{a}_v}{\tau} + \frac{V_i - 1}{2}.
+\end{equation}
+
+\textbf{差异二：球谐残差排除零阶系数。}Textured Gaussians 的球谐项保留全部阶数（包括零阶），纹理图只学习残差。GStex 则将零阶系数完全移入纹理图 $T_i$，球谐残差 $\mathrm{SH}(c_i, d)$ 仅保留一阶及以上分量，专门建模视角相关效果（如镜面反射）。渲染辐射度为：
+
+\begin{equation}
+    \psi_i(\mathbf{x}_i, d) = \mathrm{bilerp}\bigl(T_i,\; u_i(\mathbf{x}_i),\; v_i(\mathbf{x}_i)\bigr) + \mathrm{SH}(c_i, d).
+\end{equation}
+
+这一设计使纹理图承载了完整的空间颜色信息，而非仅仅作为 SH 的补充残差。
+
+\textbf{差异三：周期性纹理重分配。}第二阶段优化中高斯尺度仍在变化，固定的纹理分辨率会导致纹素拉伸或畸变。GStex 周期性地根据当前尺度重新计算每个高斯的纹理分辨率，并通过双线性插值从旧纹理图迁移到新纹理图，保持外观连续性。此外，GStex 对高斯位置施加梯度停止（stop gradient），防止高频纹理变化干扰已收敛的几何。
+
+优化同样采用两阶段策略：第一阶段用标准 2DGS 训练 15000 次迭代获得初始几何；第二阶段分配纹理图（初始化为已学到的零阶球谐值），再训练 15000 次迭代。GStex 在 2DGS 基础上将 PSNR 提升了 1--2 dB，尤其在近距离观察时效果显著。
+
+\paragraph{逐曲面纹理与视锥体采样}
+
+\textbf{动机。}逐基元纹理在提升渲染质量方面已被 GStex 验证，但进一步提高纹理分辨率时暴露了两个管线层面的瓶颈：tile 内排序导致远距离高斯错误遮挡近距离细节（弹出伪影），以及单射线采样无法充分捕获高频纹理（锯齿）。解决这两个问题需要同时升级纹理表示和渲染管线。
+
+HDGS（2024.12）~\cite{2412_01823} 在 GStex 的基础上同时升级了纹理表示和渲染管线。在纹理表示层面，HDGS 延续了 GStex 的 2DGS + 逐基元纹理路线，但做了两项关键改造。其一，纹理图大小与 surfel 缩放因子成正比——$C[u,v]$ 的尺寸为 $(Ts_u, Ts_v, c)$，其中 $T$ 是纹理密度超参数，$c$ 是颜色通道数——纹理查询时，射线-曲面交点坐标 $(u,v)$ 经截断范围 $r=4.5$ 的归一化后双线性采样纹理图，纹理值作为球谐第 0 阶分量的残差。这与 GStex 的纹理分配逻辑（$U_i = 6\sigma_{1,i}/\tau$）一脉相承，但参数化方式更直接。其二，在球谐视角方向的计算上，HDGS 使用精确的相机-交点方向 $d = H(u,v,1)^\top - O$（其中 $H$ 是 surfel-to-world 变换矩阵，$O$ 是相机中心），而非 GStex 和 Textured Gaussians 所用的近似方向（相机中心到高斯中心）——对于覆盖大面积表面的 surfel，交点可能与高斯中心相距甚远，近似方向会显著模糊视角依赖效果。
+
+在渲染管线层面，HDGS 提出了两个互补的改进。首先是视锥体采样（Frustum-based Sampling）：GStex 和 Textured Gaussians 对每个像素只投射一条中心射线查询纹理，而 HDGS 意识到每个像素实际接收的是一段视锥体（frustum）内的全部光线。因此，对每个尺寸为 $(2\Delta_x, 2\Delta_y)$ 的像素，HDGS 投射中心射线和四条角射线共 5 个交点，加权平均高斯密度作为最终采样值：
+
+\begin{equation}
+    \hat{G}(\mathbf{x}) = w_m \cdot G(\mathbf{x}) + \sum_{i,j \in \{1,-1\}} w_c \cdot G\bigl(\mathbf{x} + (i\Delta_y, j\Delta_x)\bigr),
+\end{equation}
+
+其中 $w_m$ 和 $w_c$ 分别是中心和角落的权重。关键在于，这并非独立追踪 5 条子像素射线（那样将带来 5 倍计算量），而是复用中心射线已命中的 surfel，仅额外计算角射线的交点。由于视锥体随距离发散，远处的高频基元自然获得较小的权重——这等价于一个低通滤波器，从物理层面抑制了锯齿。
+
+其次是逐射线排序（Per-Ray Sorting）：GStex 沿用了 3DGS 在 tile 内按高斯中心深度排序的方式，所有像素共享同一顺序——这在处理大而薄的高斯或高频纹理时会产生明显的弹出伪影。HDGS 利用 2DGS 的精确射线-曲面交点深度，为每条射线独立维护一个 $k$-buffer 排序（$k=24$ 用于合成场景，$k=16$ 用于真实场景），确保正确的遮挡关系。逐射线排序虽然解决了伪影，但带来了两方面副作用：计算开销增大，以及相邻射线排序顺序不一致可能影响优化收敛。为此，HDGS 引入了基于 Fisher 信息的剪枝策略：对每个高斯 $G_i$，仅考虑位置 $\mathbf{x}_i$ 和尺度 $s_i$ 参数（与几何不确定性最相关），计算其 Fisher 信息矩阵对角元素之 $L_1$ 范数作为敏感度得分：
+
+\begin{equation}
+    U_i = \Bigl\| \log\bigl(\mathrm{diag}\bigl(\textstyle\sum_{\mathbf{P} \in P_{\mathrm{gt}}} J_{\mathbf{x}_i, s_i}^\top J_{\mathbf{x}_i, s_i}\bigr)\bigr) \Bigr\|_1,
+\end{equation}
+
+敏感度低的高斯对重建误差影响小，可以安全剪枝——这不仅加速了渲染，也通过减少基元数量间接缓解了逐射线排序的开销。
+
+整体优化同样分两阶段，策略与 GStex 类似但引入了 Fisher 剪枝和高分辨率训练图像：第一阶段用标准 2DGS 损失 $L = L_c + \lambda_n L_n + \lambda_d L_d$（其中 $L_c$ 包含 $L_1$ 和 SSIM 损失，$L_n$ 和 $L_d$ 分别是法线一致性和深度平滑正则化）训练单色基元并执行 Fisher 剪枝；第二阶段冻结位置、旋转、尺度参数，仅优化纹理图，并按需使用更高分辨率的训练图像。
+
+\paragraph{UV 纹理映射}
+
+前面几种逐基元纹理方法（Textured Gaussians、GStex、HDGS）虽已引入空间变化的颜色表示，但各自带来了额外的建模复杂度：Textured Gaussians 需要射线-平面交点计算和独立的透明度通道，GStex 和 HDGS 依赖两阶段优化与特定正则化。Gaussian Billboards（2024.12）~\cite{2412_12734} 提出一个更简洁的思路：能否在保持逐基元纹理表达能力的同时，将方法设计得尽可能正交于其他 3DGS/2DGS 改进技术？
+
+\textbf{与 Textured Gaussians 的关键差异。}两者的核心区别在于基元骨架与纹理融合方式：Textured Gaussians 基于 3DGS，纹理作为 SH 残差叠加（$c = c^{\text{SH}} + c^{\text{tex}}$），并引入空间变化的纹理透明度来修改 $\alpha$-混合；Gaussian Billboards 则基于 2DGS，直接用颜色网格替换常数颜色，不使用 SH 残差，也不修改 $\alpha$-混合公式——透明度仍由标准 2D 高斯核衰减和不透明度决定。简言之，Textured Gaussians 同时改造了颜色和透明度两个通道，而 Gaussian Billboards 仅改造颜色通道，保持渲染管线其他部分不变。
+
+\textbf{颜色网格与双线性插值。}Gaussian Billboards 保留 2DGS 的位置 $p_k$、朝向 $(t_{u,k}, t_{v,k})$、尺度 $S=(s_u, s_v)$ 等几何参数不变，将常数颜色 $c_k$ 替换为一个 $N \times N$ 的可学习颜色网格 $C_k$。像素颜色直接通过双线性插值获得：
+
+\begin{equation}
+    c(u,v)_k = \mathrm{bilerp}\bigl(C_k,\; u/\sigma^+,\; v/\sigma^+\bigr),
+\end{equation}
+
+其中 $(u,v)$ 是射线-高斯交点在 2DGS 局部切平面上的固有坐标（无需额外计算射线-平面交点，因为 2DGS 的渲染本身就基于该参数化），$\sigma^+$ 定义了纹理网格在 $uv$ 平面上的空间范围 $[-\sigma^+, \sigma^+]^2$。由于高斯分布具有无限支撑域，必须显式指定纹理的有效区域，在范围之外进行边界钳位（border clamp）。
+
+\textbf{纹理范围 $\sigma^+$ 与硬件约束。}$\sigma^+$ 的选取直接影响性能：直觉上应让纹理覆盖高斯的大部分可见区域以减少钳位面积，但实验发现最优值为 $\sigma^+ = 0.5$，对应高斯 0.8 不透明度等值线处——此时纹理集中在高斯最不透明的核心区域，避免了边缘处低透明度区域的纹理浪费。纹理分辨率 $N$ 受限于 GPU 共享内存：$N=2$ 和 $N=4$ 可以直接适配 gsplat 的 $16 \times 16$ tile 大小；$N=8$ 需将 tile 缩小为 $8 \times 8$，显著增加渲染和训练时间；$N=16$ 在当前硬件上不可行。
+
+\textbf{端到端训练与正交性。}Gaussian Billboards 仅使用光度损失（L1 + D-SSIM）进行端到端训练，所有参数（包括颜色网格和 $uv$ 坐标，进而位置、尺度和朝向）都接收梯度。这种方法的设计初衷是正交性——它不依赖特定的训练策略、正则化或两阶段优化，可以与其他 3DGS/2DGS 改进技术自由组合。
+
+\paragraph{可学习纹理的平面基元}
+
+BBSplat（2024.11）~\cite{2411_08508} 继承了 Textured Gaussians ``逐基元纹理图替代全局颜色/透明度''的核心思路，但将基础表示从 3D 高斯基元切换为 2D 平面基元（即 2DGS 的扁平椭圆），并围绕平面基元重新设计了纹理映射、密度控制和压缩管线。两者的关键差异在于：Textured Gaussians 的纹理图建立在高斯局部坐标系的两个最大缩放轴张成的平面上，纹理查询依赖于射线与该平面的交点；BBSplat 则直接以 2D 平面为基元，纹理映射天然定义在平面坐标系上，无需额外的平面构造步骤。
+
+\textbf{参数化与纹理映射。}BBSplat 保留 2DGS 的基元参数 $\{\mu_i, s_i, r_i, SH_i\}$，但移除全局不透明度 $o_i$，代之以两张可学习的纹理图：RGB 纹理 $T_i^{\text{RGB}}$ 控制颜色偏移，alpha 纹理 $T_i^{\alpha}$ 控制透明度——这与 Textured Gaussians 的逐高斯纹理图方案在功能上完全一致。区别在于射线-平面求交的具体实现：Textured Gaussians 通过射线与高斯法线平面直接求交获得 $(u,v)$，而 BBSplat 采用齐次平面参数化方法，将相机射线表示为两个 4D 齐次平面的交线 $h_x = (-1, 0, 0, x)^T$ 和 $h_y = (0, -1, 0, y)^T$，再将它们变换到平面的 $uv$ 坐标系中求交点。所得 $(u,v)$ 坐标范围为 $[-1, 1]$（中心为 0），缩放到纹理分辨率 $[0, S_T]$ 后通过双线性插值采样纹理值。最终颜色同样采用``球谐 + 纹理偏移''的叠加公式：
+
+\begin{equation}
+c_i[\mathbf{u}(x)] = T_i^{\text{RGB}}(\mathbf{u}) + \text{RGB}(SH_i, d_i)
+\end{equation}
+
+其中 $d_i$ 是从相机到基元中心的视线方向。球谐捕捉视角相关的高光效果，纹理负责静态空间细节，二者解耦使纹理在训练后趋于稀疏，有利于后续压缩。累积渲染沿光线从前到后执行，$T_i^{\alpha}(\mathbf{u})$ 直接替代了 2DGS 中的高斯加权不透明度。
+
+\textbf{正则化与 MCMC 密度控制。}由于纹理参数量远大于全局不透明度，BBSplat 引入两项正则化防止过拟合。首先定义每个基元的渲染影响力 $I_i$（该基元在所有被覆盖像素上的 $\alpha$-混合权重之和），对影响力低于阈值 $\gamma=500$ 的基元施加正则化：将其 RGB 纹理推向零、alpha 纹理推向标准高斯分布。这确保低贡献基元不会学到退化的纹理浪费存储，同时使高贡献基元自由学习任意形状轮廓。在致密化阶段，BBSplat 用 MCMC 采样（2024.06）~\cite{2406_04451} 替代传统的分裂/克隆策略。标准 MCMC（Markov Chain Monte Carlo，马尔可夫链蒙特卡洛）会对不透明度和协方差矩阵同时调整以保持渲染状态，但 BBSplat 发现尺度调整对任意形状的纹理化基元会破坏状态保持。因此简化为仅调整 $T_i^{\alpha}$（因为 alpha 贴图已完全控制透明度，无需额外的尺度修改），使状态保持公式更简洁：
+
+\begin{equation}
+T_{1,..,N}^{\alpha,\text{new}} = 1 - \sqrt[N]{1 - T_N^{\alpha,\text{old}}}
+\end{equation}
+
+同时，将``死亡基元''的判定标准从全局不透明度阈值改为 alpha 纹理均值 $\bar{T}_i^{\alpha} < \epsilon$。
+
+\textbf{存储压缩与网格提取。}BBSplat 的压缩管线利用了正则化带来的稀疏性：先将纹理量化到 8-bit（$\tilde{T} = \lfloor T \times 255 \rfloor$），再将 alpha 纹理减去高斯模式 $T^{\alpha} - G$ 以增加零值比例，最后通过 ZIP 字典压缩，平均压缩比约 7 倍。结合 TSDF（Truncated Signed Distance Function，截断符号距离函数）融合，BBSplat 还能从深度图提取高质量网格，实现``渲染 + 建模''一体化——这与 Textured Gaussians 仅关注渲染质量形成互补。
+
+\paragraph{自适应采样对齐纹理}
+
+Textured Gaussians、BBSplat 等前述方法都将高斯局部坐标 $(u,v)$ 直接用作纹理坐标——规范空间即纹理空间，采样密度均匀分布。ASAP-Textured Gaussians（2025.12）~\cite{2512_14039}（同样构建在 2DGS 框架之上）指出这种等距映射存在根本性的效率浪费：高斯的不透明度从中心向边缘按指数衰减，但纹理采样密度却是均匀分布的，结果大量 texel 被浪费在几乎没有渲染贡献的尾部区域，而真正需要精细表达的中心区域反而 texel 不足。ASAP 从\textbf{基元内部}和\textbf{跨基元}两个正交维度改进纹理效率，分别对应自适应采样翘曲和各向异性纹理增长。
+
+\textbf{自适应采样翘曲。}ASAP 引入翘曲函数 $w(\mathbf{u}) = \boldsymbol{\xi}$，将规范坐标映射到``质量感知''的纹理域，使 texel 密度跟随高斯的概率密度分布。作者提出两种翘曲变体。\textit{轴向 CDF 翘曲}沿每个轴分别做 1D 高斯 CDF 变换：
+
+\begin{equation}
+w_{\text{axis}}(a) = \frac{1}{2}\left(1 + \text{erf}\left(\frac{a}{\sqrt{2}}\right)\right)
+\end{equation}
+
+误差函数 $\text{erf}(\cdot)$ 将坐标按累积概率重分布——距离中心越近的区间被拉伸（分配更多 texel），尾部被压缩。\textit{径向 CDF 翘曲}则沿径向距离应用 Rayleigh CDF：
+
+\begin{equation}
+r = \sqrt{u^2 + v^2}, \quad \xi_r = 1 - e^{-r^2/2}, \quad w_{\text{radial}}(a) = \frac{\xi_r}{r} \cdot a
+\end{equation}
+
+两种翘曲本质上都是基于重要性的采样：texel 密度集中在对渲染贡献最大的区域，避免浪费纹理容量。翘曲函数与具体的外观表示（纹理图或 MLP）无关，可以即插即用地嵌入任何纹理高斯方法。
+
+\textbf{误差驱动的各向异性纹理增长。}除基元内部的采样效率外，ASAP 还解决了跨基元的纹理参数化问题——Textured Gaussians 为所有高斯分配固定分辨率的纹理，忽略了场景不同区域的外观复杂度差异。ASAP 的增长策略受到 3DGS 自适应密度控制的启发：沿每个轴统计纹理梯度 $\mathbf{g}_u[i] = \sum_j |\partial L / \partial T(i,j)|$，计算归一化的轴向梯度压力 $\bar{g}_u = \frac{1}{n_g T_v}\sum_i \mathbf{g}_u[i]$（$n_g$ 是该高斯的可见次数，$T_v$ 是该轴的当前 texel 数，归一化消除了观察频率和纹理尺寸的偏差），当 $\bar{g}_u$ 或 $\bar{g}_v$ 超过阈值 $g_{\text{thr}}$ 时触发对应轴的纹理分辨率翻倍。增长检查每隔固定迭代次数执行一次以抑制梯度波动，且限制最大增长步数以控制内存。每次增长时通过双线性插值重采样到新分辨率，确保参数传递平滑。这意味着沿高梯度方向分配更多 texel，低梯度方向保持低分辨率——纹理变成各向异性的长条形，精准匹配每个高斯的外观复杂度。纹理的初始化策略也体现了``按需分配''的思想：高斯初始时无纹理，先累积基础属性的梯度以判断是否需要激活纹理；激活时采用极小的各向异性网格（如 $1 \times 2$ 或 $2 \times 1$），长宽比由高斯的轴向尺度比决定。为了保持 CUDA 并行渲染的高效性，ASAP 设定一个全局最大纹理分辨率，通过可微双线性重采样将各高斯的实际各向异性纹理映射到统一的纹理网格传给 CUDA 核函数——推理时重采样只执行一次，不改变标准纹理高斯的渲染管线，额外开销极小。
+
+\paragraph{自适应各向异性纹理分配}
+
+A$^2$TG（2026.01）~\cite{2601_09243} 继承了 Textured Gaussians 的逐高斯纹理图框架（颜色 $c_i^{\text{SH}} + T_i^{\text{RGB}}$，透明度 $o_i \cdot G \cdot T_i^A$），但指出其核心效率瓶颈：\textbf{为所有高斯统一分配固定分辨率的方形纹理}（如 $4 \times 4$），忽视了场景中不同区域外观复杂度的巨大差异。实际上，均匀颜色区域的高斯只需 $1 \times 1$ 纹理（即无纹理），而薄长条形高斯的纹理长宽比应匹配其几何形状。A$^2$TG 从\textbf{哪些高斯需要纹理}和\textbf{需要什么形状的纹理}两个层面解决这一问题，分别对应梯度驱动的基元筛选和各向异性纹理增长。
+
+\textbf{梯度驱动的基元筛选。}A$^2$TG 监控的是高斯\textbf{位置梯度}——渲染损失 $L_j$ 对基元位置 $\mu_i$ 的偏导 $\|\nabla_{\mu_i} L\|_2$——而非纹理参数本身的梯度。这一设计有明确的物理含义：位置梯度大意味着该基元在当前位置无法很好拟合观测图像。但梯度大的原因有两种——外观不够精细（需要纹理增强），或被前景遮挡（不需要纹理）。A$^2$TG 从梯度公式的解析结构中提取遮挡信息：位置梯度的计算 $\partial L_j / \partial \mu_{i,x}$ 自然包含了透明度累积权重 $\prod_{l=1}^{i-1}(1-\alpha_l)$（前景遮挡因子），使被遮挡基元的梯度自动衰减。只有累积梯度超过阈值 $\tau$ 的高斯才被选为纹理增强的候选。这一策略与 ASAP 监控纹理参数梯度的思路形成互补——ASAP 事后判断纹理是否``学不动了''，A$^2$TG 事前判断高斯是否``需要纹理''。
+
+\textbf{两阶段训练。}A$^2$TG 的训练分两个阶段，整体流程与 Textured Gaussians 相似但有重要差异。第一阶段（30K 次迭代）采用 MCMC 致密化训练 2DGS，纹理固定为 $1 \times 1$（$T^{\text{RGB}}=0$, $T^A=0$），即不启用纹理。选用 MCMC 而非标准自适应密度控制，是为了通过马尔可夫链的随机游走机制自然控制高斯总数，避免过度致密化。第二阶段（30K 次迭代）冻结高斯数量，将 alpha 纹理设为 $T^A=1$（初始均匀透明），启用纹理训练并运行上述自适应纹理控制。纹理颜色 $T^{\text{RGB}}$ 初始化为低值（因为 SH 已捕获低频颜色，纹理只需学习残差），每 500 次迭代检查梯度并触发增长，上采样采用最近邻插值初始化。
+
+\textbf{各向异性纹理增长。}被选中的候选高斯，其纹理分辨率的增长方向由高斯的\textbf{几何形状}决定。设高斯的两条半轴长为 $s_x$、$s_y$，预定义阈值 $\tau_{\text{ratio}}$ 和 $\tau_{\text{size}}$，增长规则为：若 $s_x/s_y > \tau_{\text{ratio}}$ 且 $s_y < \tau_{\text{size}}$，则仅将宽度 $T^u$ 翻倍；若 $s_y/s_x > \tau_{\text{ratio}}$ 且 $s_x < \tau_{\text{size}}$，则仅将高度 $T^v$ 翻倍；否则双向同时翻倍。这一策略使纹理的长宽比匹配高斯的几何形状——沿长轴方向分配更多 texel，避免在短轴方向浪费容量。最终纹理分辨率在 $\{1,2,4\} \times \{1,2,4\}$ 范围内变化，包括方形和非方形。实验统计表明，梯度驱动的筛选使 62.4\% 的高斯保持 $1 \times 1$（即完全不分配纹理），仅沿锐利边缘的薄条形高斯获得非方形纹理——内存效率显著优于 Textured Gaussians 的统一 $4 \times 4$ 分配。相比 ASAP 基于纹理梯度的各向异性决策，A$^2$TG 依赖几何先验（半轴比例）而非外观梯度，计算开销更低但对外观复杂度的感知稍弱。
+
+%=====================================================================
+
+
+\section{神经场纹理化与其他增强}
+\label{sec:03_2}
+
+本节介绍 4 种基于全局神经场的纹理化方法：Neural Texture Splatting（全局三平面神经场）、Neural Shell Texture（全局壳纹理）、Nexels（全局神经场驱动的 Surfel 纹理）和 Neural Harmonic Textures（虚拟支架 + 谐波纹理）。
+
+\paragraph{全局三平面神经场纹理}
+
+本方法修改了 3DGS 的\textbf{外观纹理}环节——用全局三平面神经场预测的逐基元纹理替代逐基元独立优化的三平面纹理——高斯基元的几何表示与体渲染框架保持不变。
+
+\smallskip
+\noindent\textbf{Baseline 与前身的局限。}
+在标准 3DGS 中，每个高斯基元仅用单一颜色和球谐（SH）系数表示外观，无法表达基元内部的空间颜色变化。Textured Gaussian Splatting（NTS 的前身）为此引入了逐基元的局部 RGBA 纹理场：将世界空间点 $\mathbf{p}$ 通过基元的中心 $\boldsymbol{\mu}_k$、缩放矩阵 $\mathbf{S}_k$ 和旋转矩阵 $\mathbf{R}_k$ 变换到局部坐标 $\mathbf{x}_k = \mathbf{S}_k^{-1}\mathbf{R}_k(\mathbf{p} - \boldsymbol{\mu}_k)$，再查询纹理场获得颜色修正 $c_k^{\text{tex}}$ 和不透明度修正 $\alpha_k^{\text{tex}}$。直觉上，这相当于在每个高斯内部铺设一层“纹理贴图”，让一个高斯就能表达内部复杂的空间颜色变化。渲染方程相应修改为在颜色和不透明度上叠加纹理修正：
+
+\begin{equation}
+C(\mathbf{p}) = \sum_{k=1}^{K} (c_k + c_k^{\text{tex}})(\alpha_k P(G_k, \mathbf{p}) + \alpha_k^{\text{tex}}) \prod_{j=1}^{k-1}(1 - \alpha_j P(G_j, \mathbf{p}) - \alpha_j^{\text{tex}})
+\end{equation}
+
+即纹理值作为原始颜色和不透明度的加性修正，混入体渲染的 $\alpha$-混合过程（不透明度项被裁剪到 $[0, 0.99]$ 以保证透射率非负）。局部纹理场采用三平面（tri-plane）表示——将一个 3D 体纹理压缩为三个正交可学习平面 $F_{xy}^k, F_{xz}^k, F_{yz}^k \in \mathbb{R}^{D \times D \times 4}$，通过双线性插值查询后取均值输出，用 $O(3D^2)$ 参数代替 $O(D^3)$ 的完整体素网格。
+
+\smallskip
+\noindent\textbf{设计动机。}
+然而，逐基元的三平面纹理存在两个问题。其一，每个基元独立优化纹理平面，缺乏跨基元信息共享，相邻基元可能学习到冗余的纹理模式，导致泛化能力差——论文实验表明，直接优化局部纹理在新视角合成上有提升，但在表面重建和稀疏视图重建等任务上效果显著退化。其二，纹理是视角无关、时间无关的静态 RGBA 值，无法建模高光反射等视角依赖效果或动态场景中的外观变化。Neural Texture Splatting (NTS)（2025.11）~\cite{2511_18873} 正是为了解决这两个问题。
+
+\smallskip
+\noindent\textbf{全局神经场预测局部纹理。}
+NTS 的核心改动是将局部三平面纹理从“逐基元独立参数”转变为“由全局神经场根据空间位置动态预测”。直觉上，如果场景中相邻区域的基元共享相似的纹理模式（例如同一块砖墙），用一个全局特征场为它们”按需生成”纹理，比让每个基元从零独立学习更高效。
+
+具体而言，NTS 首先在全局三平面 $G_{xy}, G_{xz}, G_{yz} \in \mathbb{R}^{H \times W \times C}$ 上，根据每个基元的中心位置 $\boldsymbol{\mu}_k = (\mu_x^k, \mu_y^k, \mu_z^k)$ 提取全局特征 $g_k \in \mathbb{R}^C$。直觉上，这相当于在三个正交的"照片墙"上找到基元中心对应的像素位置，取出三段特征向量后拼接在一起——空间中越接近的基元，取出的特征越相似：
+
+\begin{equation}
+g_k = \text{concat}\big(G_{xy}(\mu_x^k, \mu_y^k),\; G_{xz}(\mu_x^k, \mu_z^k),\; G_{yz}(\mu_y^k, \mu_z^k)\big)
+\end{equation}
+
+这一操作的含义是：基元中心在三个正交投影平面上的坐标分别索引对应平面，取出三段特征后拼接。空间中相近的基元自然获得相似的全局特征。随后，$g_k$ 与基元中心位置 $\boldsymbol{\mu}_k$、旋转矩阵 $\mathbf{R}_k$（提供基元朝向信息）、视角方向 $\mathbf{d}_k$（以及动态场景的时间步 $t$）拼接后送入浅层神经网络，预测该基元的局部三平面纹理：
+
+\begin{equation}
+\{F_{xy}^k, F_{xz}^k, F_{yz}^k\} = \text{NN}(g_k, \boldsymbol{\mu}_k, \mathbf{R}_k, \mathbf{d}_k, t)
+\end{equation}
+
+其中 $t$ 仅用于动态场景。颜色网络和不透明度网络使用独立的全局三平面和解码器，视角方向仅输入颜色网络——这确保了视角依赖效果（如高光）仅影响颜色而不影响几何透明度。对于动态场景，额外将时间步 $t$ 作为网络输入，实现时序一致的纹理动画。
+
+\smallskip
+\noindent\textbf{CP 分解压缩局部纹理。}
+直觉上，一张 $D \times D$ 的纹理图就像一张图片——如果这张图片的结构可以用几条横线加几条竖线来近似描述，那么存储这些线条远比存储完整图片高效。CP 分解正是实现这一直觉的数学工具。为进一步降低计算开销、支持更高分辨率的纹理平面，NTS 引入 CP 分解（Canonical Polyadic decomposition）参数化每个局部平面。直观理解：一个 $D \times D$ 的纹理平面可以用两个 $D$ 维向量的外积来近似——类似用“横条”和“竖条”相乘生成一张图。网络不再直接输出 $D \times D \times 4$ 的完整平面，而是输出一对 1D RGBA 向量 $\mathbf{v}^{0,k}, \mathbf{v}^{1,k} \in \mathbb{R}^4$，通过外积重建平面：
+
+\begin{equation}
+F_{xy}^k = \mathbf{v}^{0,k}_{xy} \otimes \mathbf{v}^{1,k}_{xy}, \quad F_{xz}^k = \mathbf{v}^{0,k}_{xz} \otimes \mathbf{v}^{1,k}_{xz}, \quad F_{yz}^k = \mathbf{v}^{0,k}_{yz} \otimes \mathbf{v}^{1,k}_{yz}
+\end{equation}
+
+将每个平面的参数量从 $D \times D \times 4$ 降至 $2D \times 4$（从二次降为线性）。
+
+\smallskip
+\noindent\textbf{训练目标。}
+NTS 在原始 3DGS 损失（$\lambda=0.2$ 的 L1 + D-SSIM 组合）之外，额外添加 L1 稀疏正则化 $\mathcal{L}_{\text{norm}}$（权重 0.01），鼓励纹理场只在需要时产生非零贡献。直觉上，这个正则化就像一个"节能开关"——它惩罚纹理场的总能量，迫使网络在平坦区域输出接近零的纹理值，仅在真正需要细节的位置"打开"纹理修正：
+
+\begin{equation}
+\mathcal{L}_{\text{norm}} = \frac{1}{N D^2} \sum_{u,v} \big(\|F_{xy}(u,v)\| + \|F_{xz}(u,v)\| + \|F_{yz}(u,v)\|\big)
+\end{equation}
+
+其中 $N$ 为基元数量，$D$ 为纹理平面分辨率。这一正则化使网络倾向于在平坦区域输出接近零的纹理值，仅在真正需要细节的位置激活纹理修正，避免纹理场对渲染质量产生负面影响。
+
+\paragraph{全局壳纹理}
+
+Neural Shell Texture Splatting（2025.07）~\cite{2507_20200} 沿着 NTS 的解耦方向走了更激进的一步。NTS 虽然引入了全局特征场来预测局部纹理，但仍保留了基元自身的 SH 颜色，纹理仅作为加性修正——几何与外观的耦合并未完全解除。Neural Shell Texture 则彻底去掉 SH 系数，基元退化为纯粹的几何采样器，仅存储 10 个浮点数的几何参数（位置、旋转、尺度），外观完全交由全局神经纹理场提供。
+
+\smallskip
+\noindent\textbf{基元表示与外观建模。}
+与 NTS 基于 3DGS 不同，Neural Shell Texture 选择了 2DGS 的 Surfel 表示——每个基元是一张有向 2D 平面圆盘，其局部切平面由齐次变换矩阵 $\mathbf{H} \in \mathbb{R}^{4 \times 4}$ 定义，平面上的点通过 $\mathbf{p}_u = \mathbf{H}(u,v,1,1)^T$ 映射到世界空间。外观建模方面，NTS 用全局三平面查询基元中心获得特征、再由 MLP 预测局部三平面纹理；Neural Shell Texture 则改用 Instant-NGP 的多分辨率哈希网格——对于每条射线与 Surfel 的交点 $(u,v)$，计算其世界空间位置 $\mathbf{p}_u$ 后直接在哈希网格中查询多分辨率特征 $f(\mathbf{p}_u)$ 作为纹理特征。直觉上，NTS 的纹理场附着在每个基元局部坐标系内，而 Shell Texture 的纹理场铺设在整个三维空间中。空间中相邻的基元（即便属于不同物体表面）自然会共享相似的哈希特征桶，跨基元的信息共享由哈希函数的结构隐式实现。
+
+\smallskip
+\noindent\textbf{延迟神经渲染。}
+NTS 将纹理修正叠加到逐基元的体渲染方程中，每个基元在 $\alpha$-混合时需要独立计算颜色和不透明度修正。Neural Shell Texture 改用延迟神经渲染（deferred neural rendering，即将多个基元的特征先混合为一张图，再统一解码）。具体地，先将各交点的纹理特征按 $\alpha$ 权重混合为一张特征图像 $\Phi \in \mathbb{R}^{L_F \times H \times W}$，再由一个轻量 MLP $M$ 解码为最终 RGB：
+
+\begin{equation}
+\Phi = \sum_i T_i \alpha_i G(u_i) f_i, \quad C = M(\Phi, \mathbf{d})
+\end{equation}
+
+这一设计的关键优势在于：MLP 解码的批量大小从 $K \times H \times W$（每个射线-基元交点都要解码）降至 $H \times W$（逐像素解码一次），计算开销大幅降低。同时，由于外观完全由全局纹理场提供且无基元级 SH 参数，模型天然避免了后量化（post-quantization，即训练完成后的参数压缩步骤）。NTS 等仍保留基元级参数的方法在压缩时则需要额外处理这一步骤。
+
+\smallskip
+\noindent\textbf{训练策略。}
+NTS 使用 L1 稀疏正则化鼓励纹理场在平坦区域输出零值。Neural Shell Texture 则采用特征层级退火（feature level annealing）策略：参数 $\beta$ 控制活跃的哈希编码层级数量，每 3000 次迭代递增一次，实现从粗到细的渐进学习——低分辨率特征先收敛以捕捉大尺度纹理结构，再逐步激活高分辨率层级以精化细节。总体损失函数 $\mathcal{L} = \mathcal{L}_c + \mathcal{L}_d + \mathcal{L}_n + \lambda_\alpha \mathcal{L}_\alpha$ 结合了 RGB 损失（L1 + D-SSIM）、2DGS 的深度和法线正则化、以及 alpha map 损失，其中 $\lambda_\alpha$ 在有界场景中设为 1000，无界场景中设为 100。
+
+\paragraph{全局神经场驱动的 Surfel 纹理}
+
+Nexels（2025.12）~\cite{2512_13796} 与 NTS 同属"全局神经场驱动基元纹理"的技术路线，但沿两个方向做了根本性的架构重构——将 3D 高斯基元替换为带广义核的 2D Surfel，并将"全局场预测局部纹理平面"替换为"全局场直接查询任意位置辐射度"。
+
+\smallskip
+\noindent\textbf{从 3D 高斯到广义 Surfel 核。}
+几何表示从 NTS 所继承的 3D 高斯椭球改为 2DGS 的 Surfel，并在此基础上引入广义高斯核（generalized Gaussian kernel）替换标准高斯衰减。直觉上，广义核就像是高斯核的"变形版"——通过参数 $\gamma$ 控制衰减速率：$\gamma=1$ 时退化为标准高斯的钟形衰减，$\gamma$ 越大则基元越接近矩形，边缘越锐利。这种设计使得少量 Surfel 即可紧凑覆盖不透明平坦表面：
+
+\begin{equation}
+\alpha_i(u,v) = \alpha_i \exp\!\bigg(-\frac{|u|^{2\gamma_{i,1}}}{2}\bigg)\exp\!\bigg(-\frac{|v|^{2\gamma_{i,2}}}{2}\bigg)
+\end{equation}
+
+其中 $\gamma_i \in \mathbb{R}^2$（约束 $\gamma \geq 1$）控制基元的矩形程度——$\gamma = 1$ 退化为标准高斯核，$\gamma \to \infty$ 趋近于带锐利边缘的矩形。这一替换的设计动机是：NTS 的 3D 高斯基元存在低效长尾（大部分区域不透明度远低于 1），需要堆叠大量重叠基元才能覆盖不透明平坦表面；广义核在大 $\gamma$ 下于大部分支撑域内保持接近 1 的不透明度，用少量 Surfel 即可紧凑地表示不透明表面。论文报告在室外场景中实现了 $9.7\times$ 的基元数量缩减。
+
+\smallskip
+\noindent\textbf{从全局三平面到直接查询 Instant-NGP。}
+纹理机制上，Nexels 跳过了 NTS 的"全局三平面 $\to$ 浅层网络预测局部三平面 $\to$ CP 分解"的间接路径，改为直接使用共享的 Instant-NGP 全局神经场 $F$ 查询任意 3D 位置 $\mathbf{x} \in \mathbb{R}^3$ 的球谐系数辐射度。二者的本质差异在于：NTS 的全局三平面是"纹理参数的生成器"——为每个基元预测一套独立的局部三平面，纹理仍依附于基元局部坐标系；Nexels 的全局场是"纹理值的查询表"——直接在世界空间中查询颜色，纹理完全脱离基元参数化。这一选择使纹理参数量固定为哈希网格配置（$L \times T \times F$ 个参数），不随基元数量增长，而 NTS 的 CP 分解虽将每个基元的纹理参数从 $O(D^2)$ 降至 $O(D)$，但仍与基元总数线性相关。
+
+\smallskip
+\noindent\textbf{两趟渲染与选择性纹理查询。}
+在 NTS 的方案中，系统对所有基元都执行纹理计算并混入 $\alpha$-混合，计算开销与基元数量直接成正比。为了打破这一瓶颈，Nexels 引入了一种精心设计的两趟渲染方案。
+
+第一趟被称为 Collection Pass，使用非纹理外观（与 2DGS 相同的球谐颜色）进行初步渲染，同时为每个像素维护一个大小为 $K$ 的 per-pixel buffer，用来收集混合权重 $w_i = \alpha_i \tau_i$ 最高的 $K$ 个基元，并从初步渲染中移除这些基元的非纹理颜色贡献，得到 $C_{\text{plain}}$。第二趟被称为 Texturing Pass，仅针对上述 $K$ 个被选中的基元计算世界空间交点 $\mathbf{x}_i^*(\mathbf{r}) = \mathbf{o} + t_i^* \mathbf{r}$，随后查询神经场以获得纹理辐射度 $\tau_{p,j} = G(\sigma(\mathbf{d}_{p,j}), H(\mathbf{x}_{p,j}^*))$。最终渲染结果由如下公式给出：
+
+\begin{equation}
+C = C_{\text{plain}} + \sum_{j=0}^{K-1} w_{p,j}\, \tau_{p,j}
+\end{equation}
+
+直觉上，混合权重最高的基元正是对像素颜色贡献最大的"前景"基元，只需对这些基元查询精细纹理即可逼近全纹理渲染质量。由于 $K \ll M$（总基元数），神经场查询次数从 $M$ 降至固定常数 $K$，渲染速度提升近一倍。抗锯齿方面，Nexels 沿用 Zip-NeRF 的降权策略：对哈希网格第 $\ell$ 级的特征乘以 $w_i(\ell) = 1 - \exp(-\frac{1}{2}(\ell \cdot t_i^*)^2)$（$t_i^*$ 为交点深度），以抑制高频层级的混叠伪影。
+
+\smallskip
+\noindent\textbf{训练目标。}
+Nexels 的损失函数在 NTS 的基础上做了针对性调整。图像损失沿用 3DGS 标准组合（$\lambda_{\text{D-SSIM}}=0.2$ 的 L1 + D-SSIM）。纹理损失 $\mathcal{L}_{\text{texture}}$（$\lambda_{\text{texture}}=0.5$）直接约束非预乘纹理颜色拟合 GT 图像，而非 NTS 中对纹理平面值的 L1 稀疏正则——因为 Nexels 的纹理是神经场直接输出而非可学习的局部平面，无需通过稀疏正则"关闭"不需要的纹理。Alpha 损失 $\mathcal{L}_\alpha$（$\lambda_\alpha=0.005$）惩罚非纹理渲染的总混合权重，驱动模型尽可能依赖纹理而非球谐颜色，间接鼓励基元表面被纹理覆盖。此外还有 opacity 稀疏正则（$\lambda_{\text{opacity}}=0.01$）和网格权重正则（$\lambda_{\text{grid}}=0.01$，鼓励哈希网格零均值以配合抗锯齿降权）。总体而言，Nexels 通过几何与外观的完全解耦，在稀疏基元条件下实现了高保真纹理渲染，尤其适合从少量视图重建纹理丰富的场景。
+
+\paragraph{虚拟支架与谐波纹理}
+
+Neural Texture Splatting（NTS）用全局三平面为基元预测局部纹理，Neural Shell Texture 和 Nexels 用全局哈希网格驱动 Surfel 纹理——它们共享一个隐含约束：特征锚定在世界坐标系中的全局网格上。这在静态、尺度均匀的场景中运行良好，但当场景经历运动、变形或编辑时，全局网格与拉格朗日基元之间需要持续的坐标同步，随场景规模增长，网格分辨率与内存开销的矛盾也日益尖锐。Neural Harmonic Textures（2026.04）~\cite{2604_01204} 的核心改动是彻底放弃全局网格，转而将特征直接锚定在基元本身上，并用谐波分解替代 MLP 逐基元解码，实现了一种”随基元运动”的局部特征表示。
+
+\smallskip
+\noindent\textbf{从全局网格到基元绑定虚拟支架。}
+第一个关键差异是特征的空间锚定方式。NTS 在全局三平面上根据基元中心坐标查询特征，Neural Harmonic Textures 则将特征锚定在每个基元自身的\textbf{虚拟支架}（virtual scaffold）上。具体而言，各向异性 3D 高斯经白化变换后成为球体，方法在该球体外接正四面体的 4 个顶点各放置一个可学习特征向量 $f^j \in \mathbb{R}^{N_f}$（$j=0..3$）。当射线与基元相交时，取射线上高斯响应最大的点 $p^*$，通过重心坐标插值获得该点的特征：
+
+\begin{equation}
+    f = \mathrm{interpolate}(\{f^j\}, p^*)
+\end{equation}
+
+这一设计的直接结果是特征随基元移动、变形和删除而自然联动——基元删除时其顶点特征随之消失，基元移动时特征无需重新映射到全局网格。相比 NTS 的全局三平面查询，虚拟支架放弃了跨基元的全局信息共享，但换来了对动态场景和场景编辑的原生支持。
+
+\smallskip
+\noindent\textbf{谐波纹理：用周期编码替代 MLP 逐基元解码。}
+第二个关键差异是特征的解码策略。NTS 和 Nexels 都依赖 MLP 将特征解码为颜色后进行体渲染，这意味着每条射线需要为每个相交基元执行一次 MLP 前传（数十次评估）。标准 3DGS 省去了 MLP，但代价是假设颜色在基元内部空间恒定。Neural Harmonic Textures 借鉴傅里叶变换的思想，开辟了第三条路线：不直接解码特征为颜色，而是用周期函数对插值特征进行编码后再沿射线混合，将特征转化为频率和振幅——即\textbf{谐波分解}（harmonic decomposition）。直觉上，顶点特征之间的差异充当频率调制器：差异越大，产生的纹理振荡越快、空间变化越剧烈；每个基元的核加权不透明度则充当谐波振幅。这一设计使得纹理的空间频率信息直接编码在基元自身的特征参数中，无需 MLP 即可产生丰富的空间变化。
+
+\smallskip
+\noindent\textbf{延迟神经着色。}
+谐波纹理经体渲染后产生高维混合信号，只需在图像空间一次前传即可解码为最终颜色：
+
+\begin{equation}
+    c = \mathrm{MLP}_\theta \!\left( \sum_{i \in \mathcal{G}} \alpha_i\, T_i\, \Phi(f_i)\, \psi(f_i),\; k \cdot SH_2(d) \right)
+\end{equation}
+
+其中 $f_i = \mathrm{interpolate}(\{f^j\}, p_i^*)$ 是基元 $i$ 在最大响应点处的插值特征，$\Phi$ 为周期编码函数，$\psi$ 为谐波振幅，$\alpha_i$ 和 $T_i$ 分别为基元不透明度和累积透射率，$SH_2(d) \in \mathbb{R}^9$ 为二阶球谐编码的射线方向，$k$ 为缩放系数。这一延迟着色策略与 Neural Shell Texture 的思路一致——将 MLP 解码从逐基元提升到逐像素——但由于谐波纹理已经将空间频率信息编码在混合信号中，解码 MLP 可以更浅（无需额外的位置编码），复杂度从”射线-基元交点数”降至”每像素一次”。
+
+\subsection{纹理化与其他增强方法}
+\label{ss:03_3a}
+
+本节讨论利用图像残差、内容感知纹理和选择性文本策略来增强高斯基元外观表达的技术路线。
+
+\subsubsection{其他纹理增强方法}
+
+本节介绍 3 种其他纹理增强方法：IBGS（基于图像的颜色残差）、Content-Aware Texturing（内容感知纹理分辨率）和 STRinGS（选择性文本纹理增强）。
+
+\paragraph{基于图像的颜色残差}
+
+\textbf{动机。}逐基元纹理图虽然增强了空间细节表达能力，但引入了额外的可学习参数，增加了存储和优化负担。一个自然的问题是：训练图像本身已经包含了丰富的高频细节和视角相关信息，能否直接利用这些现成信息，而非从头学习纹理？IBGS（2025.11）~\cite{2511_14357} 提出了一条截然不同的路径：不引入任何额外的可学习纹理存储，而是直接从训练图像中"借用"高频细节和视角相关信息。直觉上，Textured Gaussians 相当于给每个高斯贴一张自己学出来的"贴纸"，而 IBGS 则把训练图像当作现成的高分辨率纹理源，通过网络从邻近视角中实时提取所需的细节。
+
+IBGS 不修改高斯参数化，而是将最终像素颜色建模为基础颜色与颜色残差之和：
+
+\begin{equation}
+    \mathbf{c}^{\mathrm{final}}(\mathbf{p}) = \underbrace{\sum_{i=1}^{N} w_i \, \Psi_l(\mathbf{h}_i, \mathbf{v}_i)}_{\text{基础颜色 } \mathbf{c}(\mathbf{p})} + \underbrace{\mathcal{F}\!\bigl(\mathbf{c}(\mathbf{p}), \mathbf{d}(\mathbf{p}), \{\Delta\mathbf{c}_m\}_{m=1}^{M}, \{\Delta\mathbf{d}_m\}_{m=1}^{M}\bigr)}_{\text{颜色残差 } \Delta\mathbf{c}(\mathbf{p})}
+\end{equation}
+
+其中基础颜色 $\mathbf{c}(\mathbf{p})$ 是标准 3DGS 光栅化通过 SH 函数与 $\alpha$-混合得到的结果，$\mathcal{F}(\cdot)$ 是一个轻量级网络，输入包括基础颜色、射线方向 $\mathbf{d}(\mathbf{p})$、以及从 $M$ 幅邻近源视图提取的外观特征 $\Delta\mathbf{c}_m$ 和相机特征 $\Delta\mathbf{d}_m$，预测残差项 $\Delta\mathbf{c}(\mathbf{p})$ 专门补偿基础颜色无法捕捉的细粒度纹理和视角相关效果。
+
+颜色残差的预测过程分为两步。
+
+\textbf{特征提取：}对于每个像素对应的射线，IBGS 计算射线与各高斯基元局部平面的交点（与 Textured Gaussians 的射线-平面交点计算方式一致），但并非投影所有交点，而是只选取 $K$ 个中值交点——即累积透射率 $T_i$ 接近 0.5 的点，这些点最接近真实表面。将这些中值交点投影到 $M$ 幅邻近训练图像上，通过双线性插值获取变形颜色 $\mathbf{c}^{\mathrm{warp}}_{k,m}$，再按 $\alpha$-混合权重加权平均后减去基础颜色，得到外观特征 $\Delta\mathbf{c}_m = \mathbf{c}^{\mathrm{warp}}_m - \mathbf{c}(\mathbf{p})$。
+
+\textbf{残差预测：}对于每幅源视图，外观特征 $\Delta\mathbf{c}_m$ 与相机特征 $\Delta\mathbf{d}_m$（编码源视图与目标视图的位置和朝向差异）经两层线性层提取为 32 维向量，再对所有源视图做 max-pooling 聚合为逐像素特征图 $\mathbf{F} \in \mathbb{R}^{H \times W \times 32}$。最终，该特征图与光栅化图像 $\mathbf{C}$、射线方向图 $\mathbf{D}$ 拼接后，送入 9 层 $3 \times 3$ 卷积网络预测残差图 $\Delta\mathbf{C}$，输出图像为 $\mathbf{C}^{\mathrm{final}} = \mathbf{C} + \Delta\mathbf{C}$。相比 NeRF-based IBR（Image-Based Rendering，基于图像的渲染）方法中使用的大型 Transformer 网络，IBGS 只需处理射线与高斯的稀疏交点（而非沿射线均匀采样大量点），且只学习残差而非完整颜色，因此网络可以非常轻量。此外，IBGS 引入图像合成损失（image synthesis loss），利用变形颜色同时约束几何精度和图像质量，促使高斯参数收敛到高不透明度、集中在真实表面附近的位置，从而允许更激进地剪枝低不透明度高斯。该方法还在渲染时通过模仿最近源视图的曝光设置来校正不一致的相机曝光。
+
+\paragraph{内容感知纹理分辨率}
+
+Content-Aware Texturing（2025.12）~\cite{2512_02621} 沿续了 Textured Gaussians 的逐基元纹理增强思路，但将固定分辨率纹理替换为内容感知的自适应分辨率方案，解决了前者无法区分平坦表面与纹理丰富区域、统一分配纹理资源的问题。
+
+\textbf{基线做法与问题。}Textured Gaussians（2024.11）~\cite{2411_18625} 为每个基元附加一张固定分辨率 $T \times T$ 纹理图，使单个高斯能表达空间变化的颜色与形状（见上文）。然而，固定分辨率无法适应优化过程中基元尺寸的动态变化——基元缩小时纹理分辨率过剩（浪费存储），基元放大时又不足（细节模糊）。更关键的是，Textured Gaussians 的 UV 映射将纹理坐标直接绑定在基元局部坐标系上（$u \propto p^c / s_i$），优化过程中高斯尺度的微小变化会导致纹理拉伸（texture stretching），将优化推入局部最优。
+
+\textbf{纹理坐标与 texel 尺度解耦。}Content-Aware Texturing 的核心改造是将纹理坐标从基元的优化参数中解耦。对比 Textured Gaussians 的 UV 映射（$u \propto p^c / s_i$，纹理坐标随缩放因子 $s_i$ 变化而拉伸），Content-Aware Texturing 改用世界空间坐标 $p^l$ 计算 UV：
+
+\begin{equation}
+    \mathbf{u} = \lfloor p^l \rfloor / k_i + \mathbf{t}_0
+\end{equation}
+
+其中 $k_i$ 是以世界空间单位度量的 texel 尺寸，$\mathbf{t}_0$ 为纹理偏移。由于 $p^l$ 和 $k_i$ 都定义在世界空间中，纹理坐标不再受基元尺度参数变化的影响，消除了优化过程中的纹理拉伸问题。
+
+\textbf{自适应 texel 尺寸确定。}方法引入 texel 尺寸与像素尺寸之比 $t_{2p\_r}$ 来控制纹理精度。基础 texel 尺寸由最近训练视图的像素反向投影到世界空间确定（$k^p_{\min}$），最终 texel 尺寸为：
+
+\begin{equation}
+    k = k^p_{\min} \cdot t_{2p\_r}
+\end{equation}
+
+$t_{2p\_r}$ 只能取 2 的幂次，通过两个互补操作动态调整：（1）\textbf{降尺度}——对纹理施加低通滤波，若滤波后误差 $E_d$ 低于阈值 $\tau_d$，则将 $t_{2p\_r}$ 翻倍（参数量减为 $1/4$）；（2）\textbf{升尺度}——取渲染误差最高的前 10\% 基元，将 $t_{2p\_r}$ 减半（纹理分辨率提升 4 倍）。这一渐进式策略使低频区域的纹理自动粗化、高频区域自动细化，无需预先知道场景的频率分布。
+
+\textbf{纹理增强渲染方程。}与 Textured Gaussians 一样，每个 2D 高斯基元的颜色由 SH 基础颜色与纹理偏移叠加：
+
+\begin{equation}
+    c_i = \mathbf{c}(\mathbf{d}) + \Delta^T(T_i, \mathbf{u})
+\end{equation}
+
+其中 $\mathbf{c}(\mathbf{d})$ 是视角相关的 SH 颜色，$\Delta^T$ 是纹理图的空间变化偏移（仅建模漫反射，无方向依赖）。纹理值经 sigmoid 激活后约束在 $[-1, 1]$ 范围，配合稀疏正则化 $\mathcal{L}_{\mathrm{texture}} = \lambda_{\mathrm{texture}} \sum_i | \Delta^T_i |$ 迫使 SH 学习基础颜色、纹理仅补充高频细节。
+
+\paragraph{选择性文本纹理增强}
+
+前述 Textured Gaussians、GStex 等方法通过为每个高斯基元引入纹理图来增强纹理表达能力，本质上是修改\textbf{表示}——让单个基元能承载更丰富的空间信息。STRinGS（2025.12）~\cite{2512_07230} 则走了一条截然不同的路线：它不改变高斯的颜色或纹理表示，而是针对\textbf{特定类型的高频纹理——文本}，设计了一套选择性训练策略。这一差异源于对问题的不同诊断：Textured Gaussians 认为瓶颈在于基元内部的均匀颜色假设，而 STRinGS 发现即使使用标准 SH 颜色表示，只要基元数量足够且位置精确，文本细节也可以被很好地重建——真正的障碍在于标准 3DGS 的训练流程对文本区域缺乏特殊照顾。具体而言，文本具有极高的空间频率（笔画宽度仅 1--2 像素），而标准 3DGS 的自适应密度控制对所有区域一视同仁，导致高频文本结构的基元严重不足；同时位置参数的学习率在训练初期较高，容易使基元从文本区域漂移到非文本区域。STRinGS 提出两阶段选择性优化策略，从 3D 分割、损失函数、密度控制和位置学习率四个环节对文本区域施加专门处理。
+
+\textbf{3D 文本点分割。}给定 COLMAP 输出的稀疏点云 $\mathcal{P}$ 及可见性集合 $\mathcal{V}$，STRinGS 首先用 Hi-SAM（Hierarchical Segment Anything Model，层次化分割万物模型）对每张输入图像 $I_j$ 生成文本二值掩码 $M_j$。然后将每个 3D 点投影到所有可见图像中，检查其 2D 投影是否落入对应的文本掩码。若一个点在至少 $\tau$ 张图像（$\tau=1$）中被判定为文本，则归类为文本点，由此将点云划分为文本子集 $\mathcal{P}_T$ 和非文本子集 $\mathcal{P}_{NT}$，相应的高斯基元也分为 $\mathcal{G}_T$ 和 $\mathcal{G}_{NT}$。
+
+\textbf{阶段一：选择性文本重建（$T_1 = 3000$ 次迭代）。}此阶段仅使用文本高斯 $\mathcal{G}_T$，并在含有文本掩码的图像子集上优化。由于稀疏点云对高频结构的表达不足（尤其当观测视角较少时），STRinGS 引入基于可见性的密度增强策略：每个文本高斯的复制数量 $N_i$ 与其可见度 $c_i = |V_i|$ 成反比，
+\begin{equation}
+N_i = \left\lfloor \frac{1/c_i - \min_k(1/c_k)}{\max_k(1/c_k) - \min_k(1/c_k)} \cdot (\beta - 1) + 1 \right\rfloor,
+\end{equation}
+
+其中 $\beta \in [15, 25]$ 是最大密度增强因子，根据场景中文字密度选取。可见度越低的点获得越多复制——直觉上，从少量视角看到的文本区域需要更多基元来补偿信息不足。复制策略采用 split-and-perturb：在高斯中心附近添加轻微扰动后分裂为多个小高斯，保持覆盖体积不变。损失函数方面，将标准 3DGS 的全图 $L_1 + \text{D-SSIM}$ 损失替换为仅在文本掩码内计算的 $L_1$ 损失：
+
+\begin{equation}
+\mathcal{L}_1^{\text{text}} = \| I_j \odot M_j - R_j \odot M_j \|_1,
+\end{equation}
+
+其中 $\odot$ 表示逐元素乘法。这一改动的动机是让优化仅聚焦于文本区域，避免非文本区域的大面积平滑损失稀释对文本细节的梯度信号。此外，文本高斯的位置学习率被锁定为零，防止位置漂移，仅更新颜色、不透明度、缩放和旋转参数。
+
+\textbf{阶段二：全场景联合优化（$T_2 = 30000$ 次迭代）。}将阶段一产出的精炼文本高斯 $\mathcal{G}_T^*$ 与非文本高斯 $\mathcal{G}_{NT}$ 合并，恢复标准 3DGS 损失函数（含 D-SSIM 项）和标准密度控制流程。核心设计在于区域感知的学习率调度：文本高斯的位置学习率采用 sigmoid 渐进因子，
+\begin{equation}
+\lambda_r(t) = \begin{cases} \frac{1}{1 + e^{-\alpha(t - \delta)}} & \mathbf{g}_i \in \mathcal{G}_T^*, \\ \lambda_0 & \mathbf{g}_i \in \mathcal{G}_{NT}, \end{cases}
+\end{equation}
+
+其中 $\alpha$ 控制增长速率，$\delta$ 控制拐点位置。这意味着文本高斯在阶段二初期几乎不移动（保留阶段一的精确定位），后期逐步放松以融入全局结构。最终有效学习率为 $\lambda_{\text{effective}}(\mathbf{g}_i, t) = \lambda_r(t) \cdot \lambda_{\text{opt}}(t)$，其中 $\lambda_{\text{opt}}(t)$ 是基准 3DGS 的学习率调度（偏移 $T_1$ 个迭代）。这是首个专门解决 3DGS 文本渲染质量的工作。
+
+\begin{takeaway}
+神经场纹理化将纹理参数从逐基元独立存储转变为由全局神经场根据空间位置动态预测。NTS 用全局三平面预测局部纹理并引入 CP 分解压缩参数量，Neural Shell Texture 彻底去掉 SH 让基元退化为纯几何采样器，Nexels 用 Instant-NGP 直接查询世界空间辐射度实现基元数9.7倍缩减，Neural Harmonic Textures 用虚拟支架将特征锚定在基元自身上实现动态场景原生支持。
+\end{takeaway}
+
+% 纹理高斯方向小结
+
+纹理高斯方向的技术演进呈现出清晰的三个阶段：（1）\textbf{SH 变量替换}（Textured-GS）——零额外参数，但表达能力有限；（2）\textbf{逐基元纹理图}（Textured Gaussians, GStex, Gaussian Billboards）——直观的参数化，但内存开销随基元数增长；（3）\textbf{全局神经场}（NTS, Nexels, Neural Harmonic Textures）——跨基元共享纹理，参数效率最高，但引入了神经网络的推理开销。目前，逐基元纹理图和全局神经场两种路线各有优势：前者与现有光栅化管线兼容性好，后者在极低基元数量下表现更优。
+
+\begin{takeaway}
+纹理高斯的核心思路是解耦外观和几何，让少数高斯基元承载丰富的纹理信息。技术路线从零额外参数的 SH 变量替换（Textured-GS），到逐基元纹理图（Textured Gaussians、GStex），再到跨基元共享的全局神经场（NTS、Neural Harmonic Textures），参数效率逐步提升。当前逐基元纹理图与全局神经场各有优势，前者兼容现有光栅化管线，后者在极低基元数量下更优。
+\end{takeaway}
+
+%=====================================================================
+
+%=====================================================================
+
+\subsection{近期方法脉络：对象级与混合原语}
+
+这一组近期工作延续 3DGS，主要把改动集中在增量改进等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{MLP Splatting}
+MLP Splatting（2026.06）~\cite{2606_03877} 延续 3DGS 在“对象级与混合原语”上的基本设定，主要改变是：MLP-Splatting：每个局部primitive由紧凑MLP表示radiance和opacity，通过稀疏组合渲染。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：提出少量表达能力更强的对象中心神经primitive，试图在可分解性、可编辑性和照片级渲染之间取得平衡。
+具体而言，每个primitive是具有局部空间支撑的独立MLP，预测辐射和不透明度；渲染时只激活相关primitive，避免单一全局场或大量低级高斯难以对象化的问题。
+适用边界是：不是标准3DGS；MLP primitive的训练和渲染成本、对象自动发现能力仍需验证。
+\section{替代核函数：有界支撑与非对称分布}
+\label{sec:03_3}
+
+\subsection{问题背景：高斯核的固有局限}
+
+3DGS 使用 3D 高斯函数作为场景的基本构建单元。每个高斯由中心 $\boldsymbol{\mu} \in \mathbb{R}^3$ 和正定协方差矩阵 $\boldsymbol{\Sigma} \in \mathbb{R}^{3\times 3}$ 定义，其密度函数为 $\mathcal{N}(\mathbf{x}; \boldsymbol{\mu}, \boldsymbol{\Sigma}) \propto \exp\left(-\frac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^\top \boldsymbol{\Sigma}^{-1} (\mathbf{x}-\boldsymbol{\mu})\right)$。高斯核有两个固有的几何特性：（1）\textbf{无限支撑}——高斯函数在无穷远处才趋近于零，导致每个基元对远处像素都有非零贡献，增加了渲染时的排序和混合负担；（2）\textbf{径向对称}——高斯函数的等值面是椭球面，在形状/颜色不连续处（边缘、角落）产生模糊，需要大量小高斯来逼近锐利边界。
+
+这两个局限性引发了一个根本性的问题：\textbf{是否可以用其他数学函数替代高斯核？}替代核函数需要满足三个条件：（1）可微分（支持端到端优化）；（2）具有高效的 2D 投影公式（支持光栅化渲染）；（3）在形状表达能力上优于或互补于高斯核。
+
+本节按技术路线分为六组展开：有界支撑核、非对称分布、多边形基元、通用核框架、理论推广，以及相关的新型表示。图~\ref{fig:03_kernel} 展示了各类核函数从标准高斯出发的谱系关系。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.95\textwidth}{!}{\input{tikz/ch03_kernel_spectrum.tikz}}
+\caption{替代核函数的谱系关系。从标准高斯核（中心）出发，六条改进路线各有侧重：有界化解决无限支撑问题，非对称化解决径向对称问题，多边形化完全脱离高斯框架，理论推广建立通用核函数理论，神经参数化和频域设计从不同角度增强核的表达能力。}
+\label{fig:03_kernel}
+\end{figure}
+
+\subsubsection{有界支撑核}
+
+本路线介绍通过将高斯核替换为有限支撑域的衰减函数来解决无限支撑问题的方法。高斯核的无限支撑是渲染效率的瓶颈之一。有界支撑核函数在达到一定距离后密度精确为零，使得每个像素只需处理有限数量的基元。
+
+\paragraph{线性核函数消除软边界}
+
+本方法修改了 3DGS 的核函数——用线性衰减核替代高斯指数衰减核——基元参数化（中心 $\boldsymbol{\mu}$、协方差 $\boldsymbol{\Sigma}$、不透明度 $o$）和 $\alpha$-混合渲染管线保持不变。作为有界支撑核路线的锚点方法，3DLS（2024.11）~\cite{2411_12440} 首次证明：仅替换核函数的衰减模式，就能显著改善渲染质量。
+
+\textbf{问题：高斯核的软边界。}在标准 3DGS 中，每个基元的密度由高斯核 $G(\mathbf{x}) = \exp(-\frac{1}{2}D_M^2)$ 定义，其中 $D_M = \sqrt{(\mathbf{x}-\boldsymbol{\mu})^\top \boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})}$ 是马氏距离。高斯核的指数衰减意味着密度只在无穷远处趋近零——它永远不会精确等于零。这一特性被称为``无限支撑''：每个 splat 对图像上所有像素都有微小但非零的贡献，形成模糊的``软边界''。后果是前景与背景基元难以干净分离，产生浮动基元（floater）和边缘过度平滑两类典型伪影，尤其在高频细节区域（细密纹理、锐利边缘）表现明显。
+
+\textbf{方案：线性核替换。}3DLS 的核心观察是：核函数的行为完全由其``衰减函数''决定，因此可以将指数衰减替换为其他衰减模式，而保留马氏距离的参数化结构不变。从几何上看，线性核相当于一个密度从中心向边缘均匀递减的圆锥体——在到达底面时密度骤降为零，形成一个硬边界椭球。具体地，3DLS 将高斯核替换为线性核：
+
+\begin{equation}
+L(\mathbf{x}) = \max(0,\, 1 - D_M(\mathbf{x}; \boldsymbol{\mu}, \boldsymbol{\Sigma}))
+\end{equation}
+
+即密度沿马氏距离 $D_M$ 线性递减，在 $D_M = 1$ 处精确截断为零。这意味着每个 splat 的影响范围被严格限制在一个有限椭球内——椭球之外的像素完全不受到影响，无需参与排序和混合计算。投影到 2D 图像平面后，2D 线性核为 $L'(\mathbf{x}') = \max(0,\, 1 - D'_M)$，其中 $D'_M = \sqrt{(\mathbf{x}'-\boldsymbol{\mu}')^\top \boldsymbol{\Sigma}_{2D}^{-1}(\mathbf{x}'-\boldsymbol{\mu}')}$。由于线性核和高斯核共享相同的马氏距离参数化，3DLS 可以直接复用 3DGS 的前向后序累积混合操作，无需修改渲染管线。
+
+\textbf{效果补偿：分布对齐（Distribution Alignment, DA）。}线性核的衰减更陡峭，直接替换后覆盖范围比高斯核窄，可能导致大尺度结构的表示出现空洞。为确保线性核的总覆盖面积与高斯核一致，3DLS 引入对齐因子 $\alpha$ 缩放马氏距离：
+
+\begin{equation}
+L(\mathbf{x}) = \max(0,\, 1 - \alpha \cdot D_M)
+\end{equation}
+
+$\alpha$ 越大，线性核的展开范围越宽。实验中 $\alpha = 2.5$ 可使线性核的覆盖区域近似匹配高斯核，在不损失细节的前提下保证结构完整性。
+
+\textbf{训练稳定：自适应梯度缩放（Adaptive Gradient Scaling, AGS）。}线性核带来一个微妙的训练问题：在其支撑域内，梯度是均匀常数——距离核中心近和远的像素获得相同大小的梯度信号。这与高斯核截然不同：高斯核的梯度自然随距离衰减，近处大、远处小。线性核的均匀梯度导致远处像素对参数更新施加不合理的过大影响，引发训练振荡和收敛困难。AGS 引入基于马氏距离的高斯缩放函数来修正梯度分布：
+
+\begin{equation}
+\phi(D'_M) = \exp(-{D'_M}^2)
+\end{equation}
+
+将参数 $\theta$ 的梯度从 $-\nabla_\theta L'(\mathbf{x}')$ 修改为 $-\nabla_\theta L'(\mathbf{x}') \cdot \phi(D'_M)$。直观上，这相当于在线性核的均匀梯度上叠加了一层距离衰减权重——距核中心越远的像素，对参数优化的影响越小。这一机制在物理直觉上恢复了高斯核``近处贡献大、远处贡献小''的梯度行为，从而稳定训练收敛，减少过冲和振荡。
+
+\paragraph{有界支撑与自适应频率 Beta 核}
+
+3DLS 用线性核替代高斯核，实现了有界支撑，但线性核的衰减形状是固定的——永远是均匀递减。这意味着线性核无法根据场景内容自适应调节形态：在平坦表面上需要更平缓的衰减以覆盖更大区域，在锐利边缘处需要更陡峭的衰减以集中表达。
+\textbf{动机。}有界支撑核的价值已被 3DLS 验证，但线性核的固定衰减形态限制了其在复杂场景中的适应性。需要一个既能保持有界支撑优势、又能根据局部场景特征自适应调节衰减形态的核函数。Deformable Beta Splatting (DBS)（2025.01）~\cite{2501_18630} 沿袭 3DLS 的有界支撑路线，但将核函数从``固定形状''推进到``可学习形状''——用 Beta 核替代线性核，使每个基元能独立学习最适合自己的衰减形态。
+
+\textbf{Beta 核：有界且可变形。}直觉上，Beta 核就像一个"弹性橡皮罩"——它有一个确定的边界（有界支撑），但罩子的形状可以通过参数 $b$ 在"平坦圆盘"和"尖锐锥体"之间连续变化。DBS 从 Beta 分布出发，固定参数 $\beta=1$ 并移除归一化项，得到 Beta 核：
+
+\begin{equation}
+\mathcal{B}(x;\, b) = (1 - x)^{s(b)}, \quad s(b) = 4e^b, \quad x \in [0, 1]
+\end{equation}
+
+与 3DLS 的线性核 $L(\mathbf{x}) = \max(0, 1 - D_M)$ 相比，Beta 核有两层递进。第一，它同样是有界支撑核——定义域严格限制在 $[0,1]$，支撑域外贡献精确为零，继承了 3DLS 消除浮动基元和软边界伪影的优势。第二，它引入了可学习的形状参数 $b \in \mathbb{R}$：$s(b)$ 越大，核的衰减越陡峭，形态越尖锐（适合边缘）；$s(b)$ 越小，衰减越平缓，形态越扁平（适合表面）。指数重参数化 $s(b) = 4e^b$ 确保形状参数恒正。关键设计在于初始化：当 $b=0$ 时 $s=4$，此时 Beta 核在 $[0,1]$ 上的积分近似等于高斯核 $\exp(-9x^2/2)$ 在对应区间上的积分——即初始化时 Beta 核自动退化为高斯核形状，随优化逐步变形。DBS 通过逆 Abel 变换证明了 Beta 核满足多视角一致性要求，是一种合法的泼溅核。
+
+\textbf{渲染管线兼容。}与 3DLS 一样，Beta 核复用马氏距离参数化和 $\alpha$-混合管线，仅将核函数替换为 Beta 核：
+
+\begin{equation}
+C(\mathbf{p}) = \sum_{i=1}^{N} c_i \, o_i \, \mathcal{B}(r_i(\mathbf{p})^2;\, b_i) \prod_{j=1}^{i-1}\left(1 - o_j \, \mathcal{B}(r_j(\mathbf{p})^2;\, b_j)\right)
+\end{equation}
+
+其中 $r_i(\mathbf{p}) = \sqrt{(\mathbf{p} - \boldsymbol{\mu}_i^p)^\top {\boldsymbol{\Sigma}_i^p}^{-1} (\mathbf{p} - \boldsymbol{\mu}_i^p)}$ 是投影后的马氏距离。每个 Beta 基元的参数为 $\mathcal{B} = \{\boldsymbol{\mu}, o, \mathbf{q}, \mathbf{s}, b, \mathbf{f}\}$，其中几何参数与 3DLS 相同，新增 $b$ 控制核形状、$\mathbf{f} \in \mathbb{R}^d$ 是外观特征向量。
+
+\textbf{Spherical Beta 替代球谐。}DBS 与 3DLS 的另一差异在于视角相关颜色的编码方式。3DLS 沿用标准 3DGS 的球谐（SH），但 $N$ 阶 SH 参数量以 $3(N+1)^2$ 二次增长，实用中受限于低阶（$N \leq 3$），无法建模锐利高光。DBS 引入 Spherical Beta（SB）函数，借鉴 Phong 反射模型，将颜色分解为漫反射底色加上 $M$ 个可学习的镜面反射瓣：
+
+\begin{equation}
+c(\mathbf{v}) = c_0 + \sum_{m \in \mathcal{M}} \mathcal{B}(1 - \mathbf{v} \cdot \mathbf{r}_m;\, b_m) \, c_m
+\end{equation}
+
+其中 $c_0$ 是漫反射底色，$\mathbf{v}$ 是视角方向，$\mathbf{r}_m$ 是反射方向，$b_m$ 控制高光锐度，$c_m$ 是高光颜色。SB 的参数量为 $3 + 6M$（线性增长），且由于 Beta 核天然有界，当视角与反射方向正交时辐射度自然降为零，无需像 Spherical Gaussian 那样施加截断操作。
+
+\textbf{核无关 MCMC 优化。}DBS 与 3DLS 的第三个差异是致密化策略。3DLS 直接复用标准 3DGS 的启发式梯度分裂/克隆策略，未针对有界核做特殊处理。DBS 基于 3DGS-MCMC 框架，但将其从高斯特有的致密化策略推广为核无关版本。关键贡献是证明：只要正则化不透明度 $o$ 足够小（实验中约 0.1），仅需调整不透明度即可在任意核函数下保持密度分布不变——无需像原版 MCMC 那样针对高斯核做复杂的尺度调整。直观上，这是因为当 $o$ 足够小时，致密化前后的分布误差为 $O(o^2)$，在正则化约束下可忽略。位置更新中用 Beta 核替换了 logit 噪声函数，组合损失为：
+
+\begin{equation}
+\mathcal{L} = (1 - \lambda_{\text{SSIM}}) \mathcal{L}_1 + \lambda_{\text{SSIM}} \mathcal{L}_{\text{SSIM}} + \lambda_o \sum_i |o_i| + \lambda_s \sum_i \sum_j |\text{eig}_j(\boldsymbol{\Sigma}_i)|
+\end{equation}
+
+其中不透明度正则项 $\lambda_o \sum |o_i|$ 和协方差特征值正则项 $\lambda_s \sum |\text{eig}_j|$ 共同鼓励基元消失和重生，实现分布保持的致密化。DBS 仅用 45\% 的参数量实现了比标准 3DGS 更高的 PSNR，渲染速度提升 1.5 倍。
+
+\paragraph{N 维各向异性 Beta 核}
+
+3DLS 用线性核替换高斯核，证明了有界支撑核的价值；DBS 进一步引入 Beta 核，通过可调形状参数让核函数在平坦与尖锐之间连续变化。但两者都局限在 3D 空间——要表达视角相关外观或动态运动，仍需叠加球谐编码或 4D 扩展。
+\textbf{动机。}现有有界支撑核仅建模空间衰减，视角相关的外观（如高光）和时变运动（如动态场景）仍需依赖外部编码器（球谐函数、4D 高斯），增加了参数量和计算开销。如果核函数本身能够原生感知视角和时间维度，就可以在保持紧凑参数化的同时统一处理外观和运动。Universal Beta Splatting (UBS)（2025.10）~\cite{2510_03312} 的核心动机是：既然 Beta 核已经提供了灵活的衰减控制，为什么不把视角、时间等维度直接编入核函数，让基元原生感知这些维度？答案是，只需将查询点从 $\mathbf{x} \in \mathbb{R}^3$ 扩展为 $(\mathbf{x}, \mathbf{q}) \in \mathbb{R}^N$（其中 $\mathbf{q} \in \mathbb{R}^{N-3}$ 编码视角方向、时间等额外维度），Beta 核就能统一接管所有维度，彻底消除球谐等辅助编码。
+
+\textbf{与 3DLS 的差异：N 维扩展与维度特定 Beta 参数。}3DLS 的线性核在所有维度上共享同一衰减模式；UBS 则为每个维度赋予独立的 Beta 形状参数 $\beta_i = 4 \cdot \sigma(b_i)$（$\sigma$ 为 sigmoid）。一个关键的设计选择是空间参数共享：三个空间轴共用 $\beta_x = 4\sigma(b_x)$，保证几何形状一致；而每个非空间维度独立参数化 $\beta_{q_i} = 4\sigma(b_{q_i})$，允许视角维度学习尖锐的镜面反射核，时间维度学习平滑的静态核——无需显式监督即可自动分离漫反射与镜面反射、静态与动态元素。
+
+\textbf{协方差的高维参数化。}3DLS 直接复用 3DGS 的四元数-缩放分解，无需修改协方差。但 UBS 扩展到 $N$ 维后，四元数无法推广到 $N > 3$。朴素方案是全 Cholesky 分解 $\boldsymbol{\Sigma} = \mathbf{L}\mathbf{L}^\top$，但这会丢失 3D 子空间中显式的旋转-缩放结构，导致几何退化。UBS 引入 Spatial-Orthogonal Cholesky 参数化，对 $N = 3 + C$ 维构造：
+
+\begin{equation}
+\mathbf{L} = \mathbf{L}_x \begin{bmatrix} \mathbf{R}_x(\boldsymbol{\theta}_x) & \mathbf{0} \\ \mathbf{L}_{qx} & \mathbf{L}_q \end{bmatrix}
+\end{equation}
+
+其中 $\mathbf{R}_x \in SO(3)$ 是空间旋转（通过矩阵指数的一阶泰勒近似 $\mathbf{R}_x \approx \mathbf{I} + \boldsymbol{\theta}_x$ 计算），$\mathbf{L}_x$ 是空间缩放，$\mathbf{L}_{qx}$ 编码空间与非空间维度之间的跨维度相关性（如视角如何影响空间位置）。这个分块结构确保 3D 几何保持旋转-缩放的显式控制，同时允许高维自由度在跨维度关联中表达。
+
+\textbf{渲染：Beta 调制条件化切片。}3DLS 的线性核直接投影到 2D 即可渲染；UBS 则需要先将 $N$ 维核条件化为 3D 表示，再进入标准投影管线。给定查询条件 $\mathbf{q}$（如当前视角和时间），条件化后的 3D 均值和协方差为：
+
+\begin{align}
+\boldsymbol{\mu}_{x|\mathbf{q}} &= \boldsymbol{\mu}_x + \boldsymbol{\Sigma}_{xq}\boldsymbol{\Sigma}_q^{-1} \, \text{diag}(\boldsymbol{\beta}_q) \, (\mathbf{q} - \boldsymbol{\mu}_q) \\
+\boldsymbol{\Sigma}_{x|\mathbf{q}} &= \boldsymbol{\Sigma}_x - \boldsymbol{\Sigma}_{xq}\boldsymbol{\Sigma}_q^{-1} \, \text{diag}(\boldsymbol{\beta}_q) \, \boldsymbol{\Sigma}_{qx}
+\end{align}
+
+公式本身是标准高斯条件化，但 UBS 插入了维度特定的 Beta 调制因子 $\text{diag}(\boldsymbol{\beta}_q)$：当某维度的 $\beta_q$ 较大（尖锐核）时，条件化响应集中，基元对该维度变化高度敏感——适合镜面反射等窄视角效应；当 $\beta_q$ 较小（平坦核）时，响应弥散，基元近乎忽略该维度——适合漫反射或静态物体。不透明度同样采用因式分解形式 $o_i^{raw} = \left(\prod_{q} \Phi(\mathbf{L}_q^{-1}(\mathbf{q}-\boldsymbol{\mu}_q))\right)^{2\beta_i}$，天然实现多维度衰减。
+
+\textbf{参数效率与向下兼容。}由于核函数原生编码了视角和时间信息，UBS 不再需要球谐系数。静态场景中，UBS 比 3DGS 减少 41\% 参数（省去 48 参数球谐）；动态场景中，比 4DGS 减少 73\% 参数（省去 144 参数 4D 球谐）。同时，UBS 在设计上保证向下兼容：当 $N=3$ 且 $b_x = 0$ 时退化为标准 3DGS，当 $\mathbf{b} = \mathbf{0}$ 时退化为对应维度的 Gaussian 方法（6DGS、7DGS），确保性能不低于现有方法。
+
+\paragraph{厚尾 Student-t 分布替代高斯}
+
+与 3DLS 的有界支撑策略相反，3D Student Splatting and Scooping (SSS)（2025.03）~\cite{2503_10148} 走向另一个极端——用厚尾的 Student-t 分布替代高斯核，使单个基元的覆盖范围更大而非更小。在此基础上，SSS 进一步突破标准 3DGS 的单调混合限制，引入负密度分量（scooping）实现非单调混合。
+
+\textbf{Student-t 核：从有限支撑到厚尾覆盖。}3DLS 用线性核将基元的支撑域严格限制在有界椭球内，密度在边界处骤降至零。SSS 反其道而行：用 Student-t 分布替代高斯核，让密度在远离中心处仍保持有意义的值。其非归一化形式为：
+
+\begin{equation}
+T(\mathbf{x}) = \left[1 + \frac{1}{\nu}(\mathbf{x}-\boldsymbol{\mu})^\top \boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})\right]^{-\frac{\nu+3}{2}}
+\end{equation}
+
+其中 $\nu > 0$ 是可学习的自由度参数。关键差异在于衰减模式：高斯核以 $\exp(-D_M^2)$ 形式快速衰减，Student-t 核以幂律 $D_M^{-(\nu+3)}$ 形式缓慢衰减——后者在远处的密度值显著高于前者。行为由自由度参数 $\nu > 0$ 控制：$\nu \to 1$ 时退化为 Cauchy 分布（极厚尾），$\nu \to \infty$ 时退化为高斯分布（薄尾）。由于 $\nu$ 是可学习的，每个基元在训练过程中自主选择最优的``尾厚程度''，模型实际上在一个连续的分布族谱系上优化。实验表明，用 Cauchy 核拟合环形面（torus）所需的基元数远少于高斯核——厚尾覆盖使单个基元能包裹更大的几何结构。
+
+尽管核函数截然不同，Student-t 与高斯共享一个关键数学性质：对仿射变换和边缘化封闭。投影到 2D 时有闭式解：
+
+\begin{equation}
+T^{2D}(\mathbf{u}) = \left[1 + \frac{1}{\nu}(\mathbf{u}-\boldsymbol{\mu}^{2D})^\top (\boldsymbol{\Sigma}^{2D})^{-1}(\mathbf{u}-\boldsymbol{\mu}^{2D})\right]^{-\frac{\nu+2}{2}}
+\end{equation}
+
+其中 $\boldsymbol{\mu}^{2D}$ 和 $\boldsymbol{\Sigma}^{2D}$ 的计算与高斯核投影完全相同。这使得梯度可以精确解析计算，无需像其他替代核那样引入数值近似。
+
+\textbf{Splatting 与 Scooping：非单调混合。}3DLS 只替换了核函数，混合方式（$w_i > 0$，仅加法）保持不变。SSS 做了更激进的改变：将不透明度范围从 $[0, 1]$ 扩展到 $[-1, 1]$（通过 $\tanh$ 参数化），渲染方程变为：
+
+\begin{equation}
+C(\mathbf{u}) = \sum_{i=1}^N c_i \, o_i \, T^{2D}_i(\mathbf{u}) \prod_{j=1}^{i-1}(1 - o_j \, T^{2D}_j(\mathbf{u}))
+\end{equation}
+
+正不透明度的基元（splatting）向图像添加颜色，负不透明度的基元（scooping）从图像减去颜色。直观理解：正密度``画''上颜色，负密度``擦''掉多余的颜色。这种加/减组合使少数基元即可表示复杂的空间密度分布，大幅提升了参数效率。注意，SSS 不采用 Loconte 等人提出的平方形式 $P(\mathbf{x}) = (\sum_i w_i T_i(\mathbf{x}))^2$（会引入分量间两两交互，复杂度为 $O(n^2)$），而是保持标准 $\alpha$-混合的线性复杂度。
+
+\textbf{SGHMC 采样优化。}引入可学习自由度 $\nu$ 带来一个新问题：$\nu$、$\boldsymbol{\Sigma}$、$\boldsymbol{\mu}$ 之间的耦合远比标准 3DGS 紧密——改变 $\nu$ 等价于切换整个分布族，进而改变 $\boldsymbol{\Sigma}$ 和 $\boldsymbol{\mu}$ 的最优配置。3DLS 用 AGS 修正线性核的梯度分布来稳定训练；SSS 则采用更根本的解决方案——对 $\boldsymbol{\mu}$ 使用 Stochastic Gradient Hamiltonian Monte Carlo (SGHMC) 替代 Adam 优化器。SGHMC 引入动量项 $r$，通过自适应摩擦 $F = \sigma(o)(1-C)r_{t-1}$ 和噪声 $\mathcal{N} = \sigma(o)\mathcal{N}(0, 2\eta^{-3/2}C)$ 实现参数空间的``惯性探索''：sigmoid 开关 $\sigma(o) = \text{sigmoid}(-k(o - t))$（$k=100$，$t=0.995$）仅在低不透明度基元（$o < 0.005$）上激活摩擦和噪声，既保证活跃基元稳定收敛，又让冗余基元有机会跳出局部最优、重新定位到需要的位置。损失函数为 $\mathcal{L} = (1-\lambda_D)\mathcal{L}_1 + \lambda_D\mathcal{L}_{D\text{-SSIM}} + \lambda_o \sum_i |o_i| + \lambda_\sigma \sum_i \sum_j |\sigma_{i,j}|$（$\sigma_{i,j}$ 为 $\boldsymbol{\Sigma}$ 的特征值），不透明度正则化鼓励仅在必要时启用基元，协方差正则化鼓励基元尽可能尖锐——两者共同最小化所需基元数量。基元回收时通过最小化 $\int_{\Omega} ||C_{\text{new}}(\mathbf{u}) - C_{\text{old}}(\mathbf{u})||^2 d\mathbf{u}$ 保证重定位前后全局分布不变，每次最多回收 5\% 的基元。
+
+\subsubsection{非对称分布}
+
+本路线介绍通过引入非对称密度函数来捕捉锐利边缘和不连续性的方法。高斯函数的径向对称性使其难以对齐锐利边缘。非对称分布可以在一侧快速衰减、另一侧缓慢延伸，更好地捕捉不连续性。
+
+\paragraph{半高斯核}
+
+本方法修改了 3DGS 的核函数定义——用半高斯（Half-Gaussian）核替代对称 3D 高斯核——splatting 渲染管线和 $\alpha$-混合框架保持不变。
+
+\textbf{动机：对称核的不连续性困境。}标准 3DGS 的对称高斯核在所有方向上以相同速率衰减，无法在空间某处产生"一侧有值、另一侧为零"的阶跃。这意味着物体边缘、角落和纹理丰富区域的不连续性必须用大量高斯叠加来逼近，既浪费基元又容易产生模糊。
+
+\textbf{方案：用分割平面将高斯一分为二。}"半高斯"的直觉很简单：用一个过中心的平面将标准 3D 高斯切成两半，每一半可以拥有不同的不透明度。当两侧不透明度相等（$o_1 = o_2$）时，半高斯退化为标准 3DGS；但当 $o_1 \neq o_2$ 时，基元自然地在边缘一侧有贡献、另一侧无贡献，从而用单个基元精确表达不连续性。形式化地，3D 半高斯核定义为：
+
+\begin{equation}
+\text{HG}(\mathbf{x}-\boldsymbol{\mu}) = \begin{cases} e^{-\frac{1}{2}(\mathbf{x}-\boldsymbol{\mu})^\top \boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})} & \mathbf{n}^\top(\mathbf{x} - \boldsymbol{\mu}) \geq 0 \\ 0 & \mathbf{n}^\top(\mathbf{x} - \boldsymbol{\mu}) < 0 \end{cases}
+\end{equation}
+
+直观理解：法向量 $\mathbf{n} = [n_1, n_2, n_3]^\top$ 定义了分割平面的朝向——法向量正半侧保留高斯响应，负半侧直接截断为零。互补半高斯通过翻转法向量符号即可获得。
+
+\textbf{投影闭式性与计算开销。}半高斯沿 $z$ 轴积分到 2D 时仍然保持闭式解：结果为 $\frac{1}{2} I(x,y)\, \hat{G}_\Sigma(\mathbf{u}-\boldsymbol{\mu})$，其中 $\hat{G}_\Sigma$ 与标准 3DGS 的 2D 投影完全相同，而缩放因子 $I(x,y) = \Phi\!\left(\frac{-(n_1 x + n_2 y)/n_3 + \mu_{z|xy}}{\sigma_{z|xy}}\right)$（$\mu_{z|xy}$、$\sigma_{z|xy}$ 是给定 $x,y$ 条件下 $z$ 的条件均值和标准差）。也就是说，半高斯在 2D 投影中仅增加了一个标量乘法因子，计算开销极小。
+
+\textbf{渲染与参数效率。}渲染时，成对的半高斯共享均值、旋转、缩放和颜色参数，仅额外学习一个法向量 $\mathbf{n}$ 和两侧各一个不透明度 $o_1$、$o_2$。体渲染 $\alpha$-混合为：
+
+\begin{equation}
+C = \sum_i c_i \, H_i(\mathbf{u}-\boldsymbol{\mu}_i) \prod_{j=1}^{i-1}(1 - H_j(\mathbf{u}-\boldsymbol{\mu}_j))
+\end{equation}
+
+其中每对半高斯的联合响应为 $H(\mathbf{u}-\boldsymbol{\mu}) = \frac{1}{2}\!\left[\sigma_2^2 + (o_1 - o_2)\,I(x,y)\right] \hat{G}_\Sigma(\mathbf{u}-\boldsymbol{\mu})$，即两个半高斯的贡献被统一到一个标量表达式中。
+
+\textbf{内存开销与 splatting 优化。}法向量 $\mathbf{n}$ 可以利用原始 3DGS 实现中已有但未使用的法向量场存储空间，因此实际上仅增加一个额外不透明度系数的内存开销。此外，3D-HGS 的 splatting 策略做了专门优化：论文统计发现，超过 75\% 的核其某一侧的归一化不透明度差值大于 0.5（即某一侧接近完全透明），因此系统独立计算每一半的有效投影区域，透明侧直接跳过，避免对大量无效核的光栅化。
+
+\paragraph{负高斯值扩展表达范围}
+
+与 3D-HGS 通过分割平面修改单个核的几何形状不同，NegGS（2024.05）~\cite{2405_18163} 走了另一条路：不改变核的形状，而是允许基元携带负颜色权重，用”正减负”的方式让少量基元就能逼近甜甜圈、月牙等非凸拓扑。两者的共同动机一致——标准 3DGS 的对称凸椭球无法紧凑表达非凸结构——但 NegGS 从权重符号而非几何切割入手。
+
+\textbf{动机：凸椭球的表达瓶颈与 Diff-Gaussian 分布。}论文从概率论出发定义了 Diff-Gaussian 分布：给定两个 $n$ 维高斯的 PDF $f_{m_0,\Sigma_0}$ 和 $f_{m_1,\Sigma_1}$，令
+\begin{equation}
+f_c(\mathbf{x}) = \frac{1}{1-c}\bigl(f_{m_0,\Sigma_0}(\mathbf{x}) - c \cdot f_{m_1,\Sigma_1}(\mathbf{x})\bigr), \quad 0 \leq c < 1,
+\end{equation}
+
+当 $c \leq \min_{\mathbf{x}}\, f_{m_0,\Sigma_0}(\mathbf{x}) / f_{m_1,\Sigma_1}(\mathbf{x})$ 时，$f_c$ 本身即为合法概率密度（非负且积分为 1）。直观上，正项 $f_{m_0,\Sigma_0}$ 提供”加色”密度，被缩放后的负项 $c \cdot f_{m_1,\Sigma_1}$ 在局部区域压低响应，形成凹陷或空洞——从而用单个分布自然地表达甜甜圈、月牙等结构。
+
+\textbf{实现：负颜色高斯而非显式 Diff-Gaussian。}NegGS 并不直接在渲染管线中使用上述 Diff-Gaussian 公式，而是在标准 3DGS 的 $\alpha$-混合框架中同时优化两组基元：正颜色高斯 $\mathcal{G}_{\text{GS}}$ 和负颜色高斯 $\mathcal{G}_{\text{-GS}}$，渲染时统一参与 $\alpha$-混合。等价地，一个正高斯和一个参数相同、颜色取负的高斯相加后彼此抵消，其效果等价于 Diff-Gaussian 的”正减负”。这种设计使 NegGS 对标准 3DGS 的改动极小——仅通过一个二值掩码追踪哪些基元为负——渲染速度完全不变。
+
+\textbf{参数与实验表现。}论文发现负高斯的初始数量是关键超参数：消融实验表明约 20\% 的基元为负时效果最优，且引入负高斯后所需的总基元数反而减少。在 NeRF Synthetic、Mip-NeRF 360 等数据集上，NegGS 在 PSNR/SSIM/LPIPS 上与标准 3DGS 持平或略优；其优势主要体现在高频细节区域（快速颜色过渡）和阴影表示的精度提升上。
+
+\paragraph{偏斜正态分布建模非对称性}
+
+3D-HGS 用分割平面将高斯一刀切为两半，实现了空间不连续性表达，但带来了一个本质局限：截断是硬的（hard truncation）——分割平面一侧完全保留，另一侧完全为零，分布本身在截断面处不连续。这意味着 3D-HGS 只能在”完全对称”和”最大不对称”两个极端之间二选一，无法连续调节偏斜程度。3D Skew-Normal Splatting（2026.05）~\cite{2605_15010} 的核心改进是用 Azzalini 偏斜正态分布（Skew-Normal Distribution）替代半高斯核，使基元的偏斜程度可以在 $[0, \text{max}]$ 上连续调节。
+
+\textbf{核函数定义与形状连续性。}3D 偏斜正态核定义为：
+
+\begin{equation}
+\text{SN}(\mathbf{x}; \boldsymbol{\mu}, \boldsymbol{\Sigma}, \mathbf{k}) = G_3(\mathbf{x} - \boldsymbol{\mu}; \boldsymbol{\Sigma}) \cdot \Phi\!\left(\boldsymbol{\delta}^{\top \circ} \boldsymbol{\Sigma}^{-1}(\mathbf{x} - \boldsymbol{\mu})\right),
+\end{equation}
+
+其中 $G_3$ 是标准 3D 高斯密度，$\Phi$ 是标准正态的 CDF，$\circ$ 表示 Hadamard 逐元素乘积。与 3D-HGS 的二值截断不同，偏斜正态通过 $\Phi$ 产生一条光滑过渡的非对称尾部，而非平面处的一步跳变。关键参数是偏斜潜向量 $\mathbf{k} \in \mathbb{R}^3$，经重参数化 $\boldsymbol{\delta} = R S^{-1} \mathbf{k}$ 与旋转 $R$、缩放 $S$ 解耦，确保旋转只改变基元朝向而不变形其非对称轮廓。当 $\mathbf{k} = 0$ 时核退化为标准对称高斯；$\|\mathbf{k}\| \to \infty$ 时趋近半高斯（即 3D-HGS 的极限形态）。因此 3D-HGS 的半高斯实际上是偏斜正态分布的边界情况，而偏斜正态提供了从对称到最大不对称的完整连续谱。
+
+\textbf{偏度的有界性与投影闭式性。}$\mathbf{k}$ 的效果由 Mardia 偏度 $\gamma_{1,d}^M$ 刻画，该值关于 $\|\mathbf{k}\|_2$ 单调递增且上界约为 $0.99$。这一有界性质至关重要：偏斜分布的空间足迹不会无限拉长，从而不会破坏 3DGS 的 tile-based 光栅化（基元必须紧凑以控制 tile 交集数量）和局部仿射近似（Jacobian 近似要求空间足迹局部化）。此外，偏斜正态分布保持仿射变换封闭性——3D 到 2D 的投影仍可解析计算，可直接嵌入现有 3DGS 光栅化管线。但与标准高斯不同，偏斜参数会使空间密度中心偏离名义均值 $\boldsymbol{\mu}^{2D}$，因此论文将 2D 足迹物理平移至真实空间均值 $\boldsymbol{\mu}_{\text{bbox}} = \boldsymbol{\mu}^{2D} + \frac{\boldsymbol{\delta}^{2D} \|\mathbf{k}\|^2}{1 + \|\mathbf{k}\|^2}$ 作为 tile bounding box 的定位中心。
+
+\textbf{负不透明度与解耦优化。}该方法允许基元具有负不透明度 $o_i \in [-1, 1]$（标准 3DGS 限制 $o_i \in [0, 1]$），使基元既能”加”密度也能”减”密度，增强拓扑表达能力。训练的关键挑战在于旋转 $R$、缩放 $S$ 与偏斜参数 $\mathbf{k}$ 三者深度耦合：调整基元朝向可能意外改变偏斜方向。论文从两个层面解耦：（1）参数分解——将 $\mathbf{k}$ 分解为独立的幅度标量 $m_k \in \mathbb{R}_+$ 和方向向量 $\mathbf{d}_k \in \mathbb{R}^3$（$\|\mathbf{d}_k\|_2 = 1$），使偏斜强度和偏斜方向可以独立优化；（2）块坐标下降（BCD）——先用 Adam 联合优化所有参数建立全局结构，然后交替冻结 $(R, S)$ 优化 $(m_k, \mathbf{d}_k)$、反之亦然，以避免旋转调整与偏斜方向的梯度冲突。
+
+3D Skew Gaussian Splatting（2026.05）~\cite{2605_18334} 扩展了偏斜高斯的应用，同时提供了任意相机轨迹的可视化引擎，支持灵活的 3D 空间数据探索。
+
+\begin{takeaway}
+有界支撑核（Beta核、线性核）消除了高斯无限支撑导致的伪影和长尾冗余，非对称分布（半高斯、偏斜正态）打破了径向对称性假设，使基元能更好地表达薄结构和边缘。偏斜正态分布保持仿射变换封闭性，可直接嵌入现有光栅化管线，但偏斜参数与旋转的耦合需要块坐标下降优化。
+\end{takeaway}
+
+%=====================================================================
+\section{替代核函数：多边形基元与通用框架}
+\label{sec:03_4}
+
+完全脱离高斯框架，使用几何形状更明确的基元。
+
+\paragraph{3D 平滑凸包基元}
+
+本方法修改了 3DGS 的\textbf{几何基元}——用 3D 平滑凸包（Smooth Convex）替代高斯椭球——基于 tile 的可微光栅化器和 $\alpha$-混合渲染流程保持不变。
+
+\textbf{动机：高斯椭球的两难。}标准 3DGS 的高斯椭球有两个结构缺陷。其一，高斯函数无限延伸（尾部永远不为零），无法精确表示硬边缘和平坦表面。其二，高斯的等值面只能是椭球面，表示多面体形状需要大量基元叠加——正如球体堆叠问题所示，用椭球填满空间总会留下缝隙（2024.11）~\cite{2411_14974}。3D Convex Splatting (3DCS)（2024.11）~\cite{2411_14974} 完全抛弃高斯核，改用\emph{3D 平滑凸包}作为基元。所谓”平滑凸包”，是一种用半平面交集定义、再经可微近似软化的封闭凸多面体——直观上，它可以是从四面体到近似球体之间的任意凸形状，且天然具备硬边缘和紧凑的空间覆盖。
+
+\textbf{凸包的 SDF 表示。}每个凸包在理论上由 $P$ 个半平面定义（$P > 3$），第 $j$ 个平面的有符号距离为 $L_j(\mathbf{p}) = \mathbf{n}_j \cdot \mathbf{p} + d_j$，其中 $\mathbf{n}_j$ 是外法线，$d_j$ 是偏移。凸包的真实 SDF 是所有平面距离的最大值 $s(\mathbf{p}) = \max_j L_j(\mathbf{p})$——几何上，一个点在所有半平面”内侧”当且仅当该最大值为负。但 $\max$ 不可微，无法用于梯度优化，因此用 LogSumExp 做平滑近似：
+
+\begin{equation}
+\tilde{s}(\mathbf{p}) = \frac{1}{\alpha} \log\!\left(\sum_{j=1}^{P} \exp(\alpha \, L_j(\mathbf{p}))\right),
+\end{equation}
+
+直觉上，LogSumExp 是 $\max$ 的”软最大值”：平滑参数 $\alpha > 0$ 越大，$\tilde{s}$ 越逼近真实的硬边缘；越小则棱角越圆滑。再将 SDF 转换为指示函数（即不透明度场）：
+
+\begin{equation}
+I(\mathbf{p}) = \sigma\!\left(-\beta \, \tilde{s}(\mathbf{p})\right),
+\end{equation}
+
+其中 $\sigma$ 是 sigmoid 函数，$\beta > 0$ 控制边界过渡的锐利程度——$\beta$ 越大边界越锐利，越小则形状越弥散。在凸包边界 $\tilde{s}(\mathbf{p}) = 0$ 处恰好有 $I(\mathbf{p}) = 0.5$。面数 $P$ 可调：$P=4$ 对应四面体（简单形状），$P=20$ 近似球体（复杂形状），在不同精度需求间灵活选择。
+
+\textbf{渲染：先投影、再凸包。}在实现层面，3DCS 并不直接操作半平面，而是将每个凸包定义为一组 $P$ 个可自由移动的 3D 点 $\mathcal{P} = \{p_1, p_2, \ldots, p_P\}$ 的凸包。渲染时，3DCS 不直接在 3D 构建凸包再投影，而是先将这组 3D 点通过针孔相机投影到 2D（投影公式为 $\mathbf{q}_k = K(R\mathbf{p}_k + \mathbf{t})$，其中 $K$ 为内参矩阵，$R$、$\mathbf{t}$ 为外参），再用 Graham Scan 算法计算 2D 凸包，最后在 2D 上直接计算指示函数进行 $\alpha$-混合。这一”先投影、再凸包”的策略避免了昂贵的 3D 凸包运算。为保持透视一致性，$\alpha$ 和 $\beta$ 按到相机的距离 $d$ 进行缩放。最终像素颜色通过标准的深度排序 $\alpha$-混合累积：
+
+\begin{equation}
+C(\mathbf{q}) = \sum_{n=1}^{N} c_n \, o_n \, I(\mathbf{q}) \prod_{i=1}^{n-1}\!\left(1 - o_i \, I(\mathbf{q})\right),
+\end{equation}
+
+其中 $c_n$ 为第 $n$ 个凸包的球谐颜色，$o_n$ 为不透明度，$I(\mathbf{q})$ 为 2D 指示函数。该公式与 3DGS 的 $\alpha$-混合完全一致，仅将高斯权重替换为凸包指示函数。
+
+\textbf{初始化与致密化。}凸包的 3D 点通过 Fibonacci sphere 算法均匀分布在初始点云周围，每个凸包的大小根据其到三个最近邻凸包的平均距离自适应确定——密集区域产生小凸包，稀疏区域产生大凸包。3DCS 的自适应致密化策略也不同于 3DGS 的 clone/split 二分法。由于凸包的位置梯度不能可靠地指示”欠重建”还是”过重建”区域，3DCS 改为监控锐度参数 $\beta$ 的损失值：当某个凸包的 $\beta$ 损失过大时，直接将其分裂为 $K$ 个更小的凸体，新凸体的中心放在原始凸包的 $P$ 个定义点上，确保子凸体的并集覆盖母体的体积。分裂时增大 $\beta$ 以鼓励形成更致密的形状，同时保持 $\alpha$ 不变。训练损失为 $L = (1-\lambda)L_1 + \lambda L_{\text{D-SSIM}} + L_m$，其中 $\lambda = 0.2$（与 3DGS 一致），$L_m$（权重 $\lambda_m = 0.0005$）是抑制冗余凸包的正则项。3DCS 在 Mip-NeRF 360、Tanks and Temples 和 Deep Blending 三个数据集上实现了 SOTA 保真度，PSNR 最高提升 0.81 dB，且使用的基元数量更少。
+
+\paragraph{三角形基元}
+
+3D Convex Splatting 用 $P$ 个半平面定义任意凸多面体，展现了多边形基元的表达能力，但其 LogSumExp 软化引入了近似误差，sigmoid 窗口函数也无法保证支撑域紧凑。Triangle Splatting（2025.05）~\cite{2505_19175} 将多边形基元推至最简——固定 $P=3$，即三角形。这并非简化，而是精确：三角形是最简单的多边形，其 $\max$ 运算可以精确计算（无需求助于 LogSumExp 近似），同时保留了与 GPU 图形管线天然兼容的独特优势。
+
+\textbf{动机：为何选择三角形。}从 3DCS 的凸包出发，一个自然的问题是：能否进一步简化基元，同时保持甚至提升渲染质量？三角形提供了肯定答案。首先，三角形的三条边恰好确定一个平面，不存在退化歧义；其次，GPU 的光栅化硬件专门为三角形设计，优化后的三角形汤（triangle soup）可直接导入标准网格渲染器和游戏引擎；最后，三角形的 SDF 可以用精确的 $\max$ 定义，无需像 3DCS 那样用 LogSumExp 近似——论文指出，当基元很小时 LogSumExp 近似变差，可能只有一个顶点对最终形状有影响。
+
+\textbf{窗口函数：从 sigmoid 到归一化比值。}与 3DCS 一样，Triangle Splatting 将 3D 三角形投影到 2D 后需要一个窗口函数控制不透明度衰减。投影三角形 $\Delta$ 的 SDF 定义为：
+
+\begin{equation}
+    \phi(\mathbf{p}) = \max_{i \in \{1,2,3\}} L_i(\mathbf{p}), \quad L_i(\mathbf{p}) = \mathbf{n}_i \cdot \mathbf{p} + d_i,
+\end{equation}
+
+其中 $\mathbf{n}_i$ 是各边外法线单位向量，$d_i$ 是偏移量——此处直接使用精确的 $\max$ 而非 3DCS 的 LogSumExp。关键创新是窗口函数的设计。3DCS 使用 $\sigma(-\beta \, \tilde{s})$（sigmoid），存在两个问题：(1) 三角形内部没有保证窗口值为 1 的点；(2) 支撑域溢出三角形边界，远处的 sigmoid 尾部非零。Triangle Splatting 改用归一化比值方案：设 $\mathbf{s}$ 为三角形内心，定义
+\begin{equation}
+    I(\mathbf{p}) = \left(\frac{\phi(\mathbf{p})}{\phi(\mathbf{s})}\right)^{\!\beta}.
+\end{equation}
+
+由于三角形内部 $\phi < 0$，内心处 $\phi(\mathbf{s})$ 是最小（最负）值，比值 $\phi(\mathbf{p})/\phi(\mathbf{s})$ 在内心处为 1、边界处为 0、三角形外为 0。这一设计同时满足了 3DCS 的 sigmoid 方案未能满足的三个性质：(1) 内心处窗口值恰好为 1；(2) 支撑域精确贴合三角形边界，无溢出；(3) 归一化比值自动随深度缩放，$\beta$ 无需像 3DCS 那样手动按距离调整。参数 $\beta > 0$ 控制过渡锐利程度：$\beta \to 0$ 时退化为硬三角形，$\beta \to \infty$ 时退化为内心处的脉冲函数。
+
+\textbf{每个基元的参数与渲染。}每个 3D 三角形由三个可自由移动的顶点 $\mathbf{v}_i \in \mathbb{R}^3$、球谐颜色 $\mathbf{c}$、平滑参数 $\beta$ 和不透明度 $o$ 定义。渲染时三个顶点经针孔相机投影到 2D 形成 $\Delta$，像素颜色通过标准的深度排序 $\alpha$-混合累积（公式与 3DCS 完全一致，仅将凸包指示函数替换为三角形窗口函数 $I$）。
+
+\textbf{致密化：MCMC + 中点细分。}3DCS 监控 $\beta$ 损失来触发分裂，Triangle Splatting 则采用 MCMC 框架：根据不透明度 $o$ 和锐度 $\beta$ 构建采样分布（交替使用 $1/\beta$ 和 $o$ 做 Bernoulli 采样），优先在低 $\beta$（即更"实心"的三角形）区域致密化。选中的三角形通过中点细分一分为四（连接三条边中点），保持总面积和空间覆盖不变。剪枝则移除最大混合权重低于阈值 $\tau_p$ 的三角形，以及仅在一个视角中渲染且覆盖不超过一个像素的三角形（防止过拟合）。初始化时，每个 SfM 点生成一个近似等边三角形，大小与到三个最近邻点的平均距离成正比，朝向随机。训练损失为 $L = (1-\lambda)L_1 + \lambda L_{\text{D-SSIM}} + \lambda_1 L_o + \lambda_2 L_d + \lambda_3 L_n + \lambda_4 L_s$，其中 $L_o$（不透明度正则）来自（2024.04）~\cite{2404_09591}，$L_d$（深度扭曲）和 $L_n$（法线一致）来自 2DGS，$L_s$ 是鼓励较大三角形的大小平滑正则项。三角形基元优化后在游戏引擎中以超过 2400 FPS（$1280\times720$）渲染，在视觉质量和渲染速度上均超越 3DGS、2DGS 和 3DCS。
+
+\paragraph{可变形径向核}
+
+3DCS 用多面体替代高斯椭球，从根本上获得了硬边缘和紧凑空间覆盖——代价是引入了凸包的 SDF 表示和投影-凸包渲染流程。Deformable Radial Kernel Splatting (DRK)（2024.12）~\cite{2412_11752} 选择另一条路线：保留高斯核的指数衰减框架，但放宽其\textbf{旋转对称}约束，使单个基元即可表达从圆到矩形、星形等任意凸形状。两种方法的共同目标都是减少逼近锐利边界所需的基元数量，但技术路径截然不同——3DCS 走的是"换基元"路线（凸多面体），DRK 走的是"松约束"路线（可变形核）。
+
+\textbf{径向基函数控制形状。}DRK 是 2D 平面基元（与 2DGS 类似），位置和朝向由中心 $\boldsymbol{\mu} \in \mathbb{R}^3$ 和旋转四元数 $q$ 定义。形状通过 $K=8$ 个径向基控制，每个基具有可学习的径向长度 $s_k > 0$ 和极角 $\theta_k \in (0, 2\pi]$。对于切平面局部坐标 $(u,v)$ 中的任意点，先转换为极坐标 $(r_2, \varphi)$，再在相邻两个径向基之间用余弦加权插值：
+
+\begin{equation}
+    \kappa = o \exp\!\left(-\frac{r_2^2}{2\left(\lambda_k \frac{2}{s_k^2} + (1-\lambda_k)\frac{2}{s_{k+1}^2}\right)}\right),
+\end{equation}
+
+其中 $\lambda_k = (1 - \cos(\varphi - \theta_k)) / (\theta_{k+1} - \theta_k)$ 控制相邻基之间的平滑过渡。这一设计的核心洞见是：当 $K=4$、$\theta_k = k\pi/2$、$s_0=s_2$、$s_1=s_3$ 时，DRK 恰好退化为标准 2D 高斯核——即高斯核只是径向基在四等分、对边等长约束下的特例。通过增加 $K$ 并学习 $s_k$、$\theta_k$，DRK 打破了高斯核固有的旋转对称性，使核的轮廓可以呈现花瓣状、矩形等非对称形状。
+
+\textbf{$L^1$/$L^2$ 混合距离：从圆锥曲线到直线边缘。}上述径向基插值仍基于 $L^2$ 范数 $r_2$，而 $L^2$ 范数在径向交汇处天然产生圆锥曲线，无法表示直线边缘（如矩形的边）。为此 DRK 引入 $L^1$/$L^2$ 混合距离度量：对同一邻接区间内的点计算 $L^1$ 范数 $r_1$（通过相邻端点的逆变换得到），然后用可学习混合权重 $\gamma \in (0,1)$ 插值：
+
+\begin{equation}
+    \kappa = o \exp\!\left(-\frac{1}{2}\left(\gamma \, r_1^2 + (1-\gamma) \frac{r_2^2}{s^2}\right)\right).
+\end{equation}
+
+$\gamma \to 1$ 时边缘趋近直线（适合人造建筑的矩形），$\gamma \to 0$ 时保持圆锥曲线（适合弯曲表面）。与 3DCS 用半平面交集直接定义硬边缘不同，DRK 通过连续插值在曲线和直线之间过渡，保持了梯度的平滑性。
+
+\textbf{锐度与尺度解耦。}3DCS 通过 $\beta$ 参数控制凸包边界 SDF 到指示函数的映射锐利度，但高斯核的尺度和边缘锐度通过方差耦合，难以独立控制。DRK 引入锐化系数 $\alpha \in (-1, 1)$ 和分段线性锐化函数 $S(g)$，将密度值 $g$（指数项）重新映射：$S$ 在 $g < (1+\alpha)/4$ 时推向 0，在 $g > (3-\alpha)/4$ 时推向 1，中间线性过渡。这使得边缘过渡更陡峭，同时不改变核的空间范围——$\alpha$ 越大，边缘越锐利，但核的径向长度 $s_k$ 完全不受影响。最终核不透明度为 $\kappa = o \cdot S(g)$。
+
+渲染管线方面，DRK 的可变形性使核的投影形状不再是对称的椭圆，因此传统基于轴对齐包围盒的 tile culling 效率下降。DRK 改用核边界多边形进行精确的 tile 覆盖判断，并采用缓存排序（cache-sorting）策略在有限大小的缓存中维护深度排序，缓解了高斯核仅按中心深度排序导致的视角不一致问题。
+
+\paragraph{傅里叶编码的可变形基元}
+
+Fourier Splatting（2026.03）~\cite{2603_19834} 同样追求"让单个基元表达更复杂的形状"，但走了一条与 3DCS 完全不同的路线：3DCS 在 3D 空间用半平面交集定义凸多面体，受限于凸性——无法表示凹入的轮廓；Fourier Splatting 则在 2D surfel 的切平面内用傅里叶级数参数化边界曲线，可逼近\emph{任意}闭合形状（包括凹多边形、星形、花瓣形等），并且将形状复杂度本身变成一个可连续调控的参数——同一训练模型只需截断傅里叶系数即可在不同质量级别间切换，无需重新训练。
+
+\textbf{基元参数化：从半平面交集到傅里叶闭合曲线。}3DCS 用 $P$ 个半平面的交集定义凸包的 SDF，再用 LogSumExp 做可微近似。Fourier Splatting 起点不同：每个 surfel 基元由中心 $\mathbf{p}_i \in \mathbb{R}^3$、旋转四元数 $q_i$（定义切平面朝向）、不透明度 $o_i$、球谐颜色系数、外接圆半径 $R_i$、傅里叶幅度 $\{a_{i,k}\}_{k=0}^{K-1}$ 和相位 $\{\phi_{i,k}\}_{k=0}^{K-1}$ 以及锐度参数 $\beta_i$ 定义。边界不再由半平面交集给出，而是切平面内极坐标下的一条傅里叶闭合曲线：
+
+\begin{equation}
+    r_i(\theta_j) = R_i \left|\sum_{k=0}^{K-1} c_{i,k} \, e^{i k \theta_j}\right|,
+\end{equation}
+
+其中复系数 $c_{i,k} = a_{i,k} e^{i\phi_{i,k}}$。$k=0$ 项是直流分量，设定均匀基准半径；每个更高频率 $k$ 引入 $k$ 折角变化（$k$-fold angular variation）。幅度通过平方 $L^1$ 归一化约束 $\hat{a}_{i,k} = a_{i,k}^2 / \sum_{k'} a_{i,k'}^2$，确保所有频率的最大建设性干涉不超过 $R_i$，即 $r_i(\theta) \leq R_i$ 对所有 $\theta$ 成立。$K=1$ 时仅剩直流项，边界退化为半径 $R_i \hat{a}_{i,0}$ 的标准圆盘，与 2DGS 等价。这一参数化的关键优势在于：频率数 $K$ 直接控制形状复杂度，且训练后可按需截断——3DCS 的面数 $P$ 虽也可调，但改变 $P$ 需要重新训练。
+
+\textbf{渲染：幂窗口与直通估计器。}3DCS 将凸包从 3D 投影到 2D 后直接计算指示函数；Fourier Splatting 则先将 3D 中心投影到切平面、再在极坐标下计算有符号距离 $\delta_j = \rho_j - r_i(\theta_j)$（内部为负，外部为正）。逐像素不透明度采用幂窗口（类似 Triangle Splatting）：
+
+\begin{equation}
+    \hat{o}_{i,j} = o_i \cdot \text{clamp}\!\left(0, \;\frac{r_i(\theta_j) - \rho_j}{r_i(\theta_j)}\right)^{\!\beta_i},
+\end{equation}
+
+窗口在基元中心取峰值、边界处衰减为 0。然而，与 3DCS 的凸包 SDF 不同——凸包内部所有像素都贡献梯度——Fourier Splatting 的硬截断使得 $\delta_j > 0$（边界外）时梯度为零，傅里叶系数无法从外部像素获得学习信号，优化倾向于膨胀 $R_i$ 而非学习复杂形状。为此引入直通估计器（Straight-Through Estimator, STE）：前向渲染使用硬窗口不变，反向传播时替换为平滑代理函数 $\tilde{w}(x)$，其在边界外侧仍提供非零梯度，使得傅里叶系数可从外部像素学习，边界得以自由伸缩。
+
+\textbf{致密化：从 $\beta$ 损失驱动到 MCMC + HYDRA 学习式分解。}3DCS 监控锐度参数 $\beta$ 的损失来决定何时分裂凸包；Fourier Splatting 采用 3DGS-MCMC 框架，将基元视为目标分布的样本，所有致密化操作必须保持分布不变性 $P(g^{\text{new}}) = P(g^{\text{old}})$。其 HYDRA 策略区分两种情况：小基元做保面积分裂（与 3DCS 类似但公式不同，通过极坐标积分推导新半径和透明度）；对于已发育出多瓣边界的大基元——这正是傅里叶编码带来的独特挑战——HYDRA 识别边界曲线上最深的 $S$ 个谷底，将曲线分为 $S$ 个角段，再通过预训练 MLP 为每个段生成独立子基元（Learned Lobe Decomposition），子基元继承父基元的颜色和朝向。这一学习式分解是 3DCS 所不需要的，因为凸包天然是凸的、不存在"多瓣"问题。
+
+\subsection{多边形基元与通用核框架}
+\label{ss:03_4a}
+
+本节讨论两条技术路线：（1）通用核框架；（2）理论推广与新型表示。
+
+\subsubsection{通用核框架}
+
+本路线介绍不局限于特定核函数、而致力于建立通用核函数理论框架的方法。
+
+\paragraph{衰减各向异性径向基函数}
+
+本方法修改了 3DGS 的核函数环节——用衰减各向异性径向基函数（DARBFs）替代高斯核——可微光栅化管线、$\alpha$-混合和优化流程保持不变。
+
+\textbf{问题：高斯核的闭式积分捷径隐含缺陷。}\quad 3DGS 的光栅化管线依赖高斯核的一个特殊性质：将 3D 高斯沿某一坐标轴积分后，结果仍是同族的高斯函数，因此可以直接从投影后的 $3\times3$ 协方差矩阵 $\Sigma'$ 中提取左上 $2\times2$ 子矩阵作为 2D 协方差 $\Sigma'_{2\times2}$。然而这带来一个微妙的问题——考虑两个仅 z 轴方差 $\sigma'_z$ 不同、其余参数完全一致的 3D 高斯，投影后产生相同的 $\Sigma'_{2\times2}$，导致 z 轴越”厚”的高斯本应有更大不透明度，却被赋予相同的 alpha 分布。这暗示闭式积分并非光栅化的唯一路径，3D 协方差完全可以被视为”从各视角观察时 2D 协方差的参数化表示”，而非必须沿坐标轴做解析积分。
+
+\textbf{方案：DARB 通用核与校正因子。}\quad DARB-Splatting（2025.01）~\cite{2501_12369} 将高斯核推广为衰减各向异性径向基函数（Decaying Anisotropic Radial Basis Functions, DARBFs）。直觉上，DARBF 就是”任何沿马氏距离衰减的平滑函数”——高斯核只是其中一个特例。形式化地，DARBF 定义为 $K(\mathbf{x}; \boldsymbol{\mu}, \boldsymbol{\Sigma}) = F(d_M(\mathbf{x}; \boldsymbol{\mu}, \boldsymbol{\Sigma}))$，其中 $F:\mathbb{R}_{\geq0}\to\mathbb{R}_{\geq0}$ 是任意衰减、可微的径向轮廓函数，$d_M = \sqrt{(\mathbf{x}-\boldsymbol{\mu})^\top\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu})}$ 是马氏距离。高斯核对应 $F=\exp(-\frac{1}{2}x^2)$，半余弦核对应 $F = \frac{1}{18}(9 - d_M^2)$（当 $d_M^2 < 9$，否则为 0）。由于一般 DARBF 沿坐标轴积分不再产生同族的 2D 函数，DARB-Splatting 的核心创新是引入校正因子 $\gamma$：不再追求闭式积分，而是通过数值积分（Simpson 法则）建立 $\Sigma'$ 与实际投影协方差之间的映射关系，用标量 $\gamma$ 修正 $\Sigma'_{2\times2}$，使投影后的核形状和范围与真实积分结果对齐。$\gamma$ 的优化目标是最小化 EWA Splatting 理论协方差与实际投影协方差之间的差异，通过 MLP 离线预计算并嵌入 CUDA 光栅化管线，运行时几乎无额外开销。
+
+\textbf{实例：半余弦核的校正。}\quad 以半余弦核为例，其 3D 形式为 $P_{i,j,k} = \frac{1}{18}(9 - d_M^2)$，2D 投影形式为 $w = F(d_M) = \frac{1}{9}(1 - d_M^2)$（当 $d_M^2 < 9$）。为使半余弦核的边界范围与 3DGS 中高斯核的 $3\sigma$ 范围（覆盖 99.7\%）一致，取 $\gamma = 18$，使得 $R_{\text{cosine}} = \frac{\sqrt{2}\max(\sigma_1,\sigma_2)}{2}\cdot\gamma = 3\max(\sigma_1,\sigma_2)$。这一匹配确保半余弦核占据与高斯核相同的 tile 范围，保证公平比较。反向传播时，DARB-Splatting 修改可微光栅化器以支持每种 DARBF 各自的梯度项，损失函数与 3DGS 相同（$L_1$ + D-SSIM）。该框架证明，只要核函数满足”马氏距离的衰减函数”这一条件，即可通过校正因子融入 3DGS 的可微光栅化管线，为探索非高斯核提供了通用的即插即用框架。
+
+\paragraph{多项式近似核}
+
+DARB-Splatting 回答了"非高斯核能否融入 3DGS 管线"这一理论问题，但未触及一个实践瓶颈：无论选用何种核函数，3DGS 光栅化中最昂贵的逐像素操作始终是指数评估 $g(x)=\exp(-\frac{1}{2}x)$——GPU 上一次 $\exp$ 的延迟远高于加减乘。Polynomial Kernels（2026.03）~\cite{2603_18707} 沿着通用核框架路线更进一步，直接将核函数本身替换为 ReLU 激活的多项式，在保持渲染质量的同时彻底消除 $\exp$ 运算。与 DARB-Splatting 通过校正因子 $\gamma$ 适配非高斯核不同，本方法的策略更为直接：多项式核天然满足紧支撑（有限范围内归零），无需校正因子即可直接嵌入光栅化管线。
+
+具体地，$N$ 阶多项式核定义为 $f_N(x)=\max(\sum_{i=0}^{N}c_i x^i,\, 0)$。以最实用的一阶多项式为例，$f_1(x)=\max(c_1 x + c_0,\, 0)$，系数通过 L1 损失在 $x\in[0, -2\ln(\frac{1}{255})]$ 范围内均匀采样拟合得到，结果为 $c_0\approx -0.176$、$c_1\approx 0.773$。该线性核在 $x>4.386$ 处自动归零，对应约 $2.1\sigma$ 的范围，比 3DGS 原有的 $3.3\sigma$ 更紧——这意味着每个 splat 覆盖的 tile 数量更少，剔除效率更高。进一步地，剔除边界 $t'_{f_1}=-c_0/c_1\approx 0.228$ 与不透明度 $o$ 无关，可以在渲染前预计算，避免了逐像素的动态判断。
+
+该工作还严格证明了多项式核与 MIP-Splatting 反走样策略的兼容性：任意核函数 $k$ 的归一化因子为 $N_k = |\Sigma|\int_{\mathbb{R}^N}k(\mathbf{y}^T\mathbf{y})\,d^N\mathbf{y}$，其中与协方差相关的 $|\Sigma|$ 项对所有核函数完全相同，核函数自身的积分部分在归一化因子的比值中抵消。因此 MIP-Splatting 的对角线添加常数 $v$ 的反走样策略可原封不动地应用于任意多项式核，无需额外推导。该方法实现 4--15\% 的渲染加速，且可直接加载已有 3DGS 模型权重，无需重新训练。
+
+\paragraph{Gabor 噪声核}
+
+DARB 通用核框架证明了任意马氏距离衰减函数均可通过校正因子融入 Splatting 管线，但框架本身并未触及核函数的一个根本局限：无论选择高斯核还是半余弦核，所有 DARBF 的空间响应都是单一峰值的低通形态。这意味着表征织物纹理、细密条纹等高频表面细节时，仍需大量基元密集堆叠。Gabor 核提供了另一条路径——在高斯包络上乘以正弦载波，使核函数变为带通滤波器，能够选择性地增强特定频率范围的纹理。两条工作分别从 2D 和 3D 两个维度将 Gabor 核引入 Splatting，它们不依赖 DARB 校正因子，而是重新设计了从核定义到渲染积分的完整路径。
+
+3D Gabor Splatting（2025.04）~\cite{2504_11003} 基于 2DGS 表征，将高斯包络与多个方向固定的正弦波函数相乘。与 DARB-Splatting 通过校正因子 $\gamma$ 修正投影协方差的路线不同，本方法利用 2DGS 的平面假设，直接在基元的局部坐标 $(u,v)$ 上定义波函数，从而绕开了 3D Gabor 核沿坐标轴积分无闭式解的问题。核心设计挑战是：原始 Gabor 核仅含单个正弦波，同时优化频率和方向会导致高度非线性的问题，极易陷入局部最优。为此，作者提出”多波叠加”策略——受 2D 头发方向图计算中 Gabor 核预处理思想的启发——每个核使用 $N=4$ 个波函数，方向均匀采样（间隔 $45^\circ$），仅优化频率 $f_i$ 和相位 $\psi_i$，方向固定不变。第 $i$ 个波函数的相位为 $\phi_i(u,v)=2\pi f_i(\cos\frac{\pi i}{N},\sin\frac{\pi i}{N})\cdot(u,v)^T+\psi_i$，颜色由两个基色 $c_A$、$c_B$ 通过余弦插值得到：$c(u,v)=\sum_{i=0}^{N-1}w_i\!\left[c_A\frac{1+\cos\phi_i}{2}+c_B\frac{1-\cos\phi_i}{2}\right]$，即波峰处显示颜色 $c_A$、波谷处显示颜色 $c_B$，通过加权求和实现多方向纹理的叠加。消融实验表明，固定方向、仅优化频率的多波方案优于同时优化两者的单波方案，也优于将所有波固定在同一轴向的方案。这种设计使少数基元即可表征密集的周期性纹理，大幅减少了高频细节所需的基元数量。
+
+3DGabSplat（2025.08）~\cite{2508_05343} 则走了一条完全不同的路线：不借助 2DGS 的平面假设，而是将 Gabor 基元直接定义为完全 3D 版本，并重新推导从 3D 到 2D 的投影积分。每个基元由一个高斯核与 $F$ 个不同频率的 3D Gabor 核构成滤波器组：$\Psi_k(\mathbf{x})=G_k(\mathbf{x})+\sum_{i=1}^{F}\lambda_{k,i}\,g_{k,i}(\mathbf{x})$，其中 $g_{k,i}(\mathbf{x})=\frac{1}{(2\pi)^{3/2}|\Sigma|^{1/2}}\exp(-\frac{1}{2}\mathbf{x}^T\Sigma^{-1}\mathbf{x})\cos(2\pi\mathbf{f}_{k,i}^T\mathbf{x})$，权重 $\lambda_{k,i}$ 满足归一化约束。与 DARB-Splatting 用标量 $\gamma$ 统一校正不同，这里需要单独处理频率向量的投影变换：$\mathbf{f}_{k,i}^{\text{proj}}=((JW)^{-1})^T\mathbf{f}_{k,i}$，其中 $J$ 是仿射近似的 Jacobian，$W$ 是世界到相机的变换矩阵。积分到 2D 后，频率的 $x,y$ 分量受 $z$ 分量的影响：$f_{k,i,x}^{2D}=f_{k,i,x}^{\text{proj}}-\frac{S_{02}}{S_{22}}f_{k,i,z}^{\text{proj}}$，$S_{ij}$ 为 $\Sigma^{-1}$ 的元素。
+
+该工作还提出了频率自适应优化策略，解决 3DGS 密度控制与 Gabor 核的冲突：标准 3DGS 在分裂基元时子基元复制父基元全部参数，若直接应用于 Gabor 基元则会导致频率和权重随分裂累积，产生过多高频伪影。为此，分裂时将子基元的频率重置为 0.001、权重重置为 0.01，使新基元从低频起步逐步学习适合自身的频率；同时每 3000 轮迭代将所有 Gabor 核权重与不透明度同步重置，清除冗余的高频基元。PSNR 最高提升 1.35 dB。
+
+\subsubsection{理论推广与新型表示}
+
+本节介绍 6 种理论推广与新型表示方法：Generalized Non-exponential Gaussian Splatting（非指数族透过率函数）、HoGS（齐次坐标高斯）、Power Foam（有界 Power Diagram）、Sparse Voxels Rasterization（稀疏体素）、Splat the Net（可泼溅神经基元）和 GMAE（高斯基元作为自监督中间表示）。
+
+\paragraph{广义非指数高斯泼溅}
+
+本方法修改了 3DGS 的 $\alpha$-混合合成环节——用可配置的\textbf{非指数族透过率函数}替代 Beer-Lambert 指数衰减——高斯基元的位置、协方差、球谐颜色等参数保持不变。
+
+\textbf{为什么指数核不够用？}
+标准 3DGS 的累积透过率 $T(\tau_0 \to \tau_i) = \prod_{j=0}^{i-1}(1-\alpha_j)$ 在连续极限下退化为 Beer-Lambert 指数衰减 $T(\tau) = \exp(-\tau)$。指数衰减源于一个隐含假设：基元内部的遮挡粒子彼此完全统计无关。可以用一个简单类比理解这一点——把两个高斯基元想象成两块各遮挡 50\% 光线的半透明板：如果两块板的粒子分布完全独立（统计无关），透过率为 $(1-0.5)(1-0.5) = 0.25$，即乘法累积；但如果第二块板的粒子恰好填满了第一块板的空隙（完全负相关），透过率直接降为 $1 - 0.5 - 0.5 = 0$，形成完全不透明的表面。标准 3DGS 只能建模前一种情况，透过率永远无法真正降为零，因此无法精确表达不透明表面。
+
+\textbf{非指数族的统一框架。}
+为了突破这一限制，Generalized non-exponential Gaussian splatting（2026.03）~\cite{2603_02887} 引入了辐射传输理论中的广义 Boltzmann 方程（Generalized Boltzmann Equation, GBE）。GBE 是经典辐射传输方程的推广——经典方程假设消光概率与光子已走过的距离无关（导致指数衰减），而 GBE 允许消光概率随距离变化，从而统一描述指数、超指数和亚指数等任意衰减体制。在这一框架下，离散消光概率不再是固定值 $\alpha_i$，而是由用户选择的\emph{母透过率函数} $T(\tau)$ 决定：$p_i = -\Delta T(\tau_i)$。直觉上，$p_i$ 的大小取决于"到目前为止已经有多少光线被遮挡"——遮挡越多，剩余光线被进一步吸收的概率越高（正相关体制）或越低（负相关体制），而指数衰减恰好是两者之间的分界线（无关体制）。广义渲染方程相应地变为
+\begin{equation}
+L_0 = \sum_{i<k} \hat{E}_i\, p_i + E_k\,,
+\end{equation}
+
+其中 $k$ 是第一个使累积消光概率 $\sum_{i \leq k} p_i \geq 1$ 的基元索引（透过率在此处饱和为零），$\hat{E}_i = E_i - E_k$ 是相对辐射亮度。公式后的物理含义很清晰：一旦第 $k$ 个基元让透过率饱和，后续所有基元都被完全遮挡、不再贡献颜色——这是标准 3DGS 做不到的，因为其乘法透过率永远严格大于零。
+
+\textbf{六种透过率函数与加速效果。}
+作者提出了六种满足物理约束（$T(0)=1$、单调非递增、$T(\tau) \in [0,1]$）的母透过率函数，重点验证了两种。线性透过率 $T(\tau) = \max(0,\, 1 - \tau)$ 衰减速度远快于指数：在光学深度 $\tau = 1$ 处指数透过率仍有 $e^{-1} \approx 0.37$，而线性透过率已精确降为零。二次透过率 $T(\tau) = \max(0,\, 1 - \tau)^2$ 的衰减速度介于线性和指数之间。实验中，superlinear 模型（$c = 0.5$ 的二次透过率）在 NeRF 合成数据集上取得最高平均 PSNR 30.13 dB（指数基线 28.99 dB，提升超 1 dB），渲染速度 50.3 FPS 对比基线 9.1 FPS（5.5$\times$ 加速），平均 overdraw 从 72.1 降至 16.2。在固定 5000 秒训练预算下，superlinear 模型完成约 13000 次迭代，而指数基线仅完成约 3300 次——4$\times$ 的迭代次数差距直接归因于更低的逐帧渲染开销。
+
+\paragraph{齐次坐标高斯}
+
+前述 Generalized non-exponential 方法在渲染合成层面推广了透过率函数，而 HoGS（2025.03）~\cite{2503_19232} 则在几何表示层面进行理论推广——将高斯基元的位置和尺度从笛卡尔坐标重新参数化到齐次坐标（projective coordinates），使近处与远处物体的优化动力学趋于一致。
+
+\textbf{为什么笛卡尔坐标不够用？}
+标准 3DGS 在笛卡尔坐标系中表示位置 $\boldsymbol{\mu} \in \mathbb{R}^3$ 和尺度 $\mathbf{s} \in \mathbb{R}^3_+$。这一表示在优化远距离物体时存在两个根本性困难。其一，梯度下降理论上需要无穷多步才能收敛到无穷远的位置——远距离目标的坐标值极大，梯度步长相对于目标距离趋近于零，收敛极其缓慢。其二，位置参数 $\boldsymbol{\mu}$ 的变化同时改变了相机到基元的距离，进而改变基元在图像平面上的投影大小，即使尺度 $\mathbf{s}$ 保持不变。这意味着在笛卡尔坐标下无法将”移动基元”和”缩放基元”这两个操作解耦，远距离大范围移动必然伴随投影形状的畸变。
+
+\textbf{齐次坐标的统一参数化。}
+HoGS 将位置和尺度同时提升到三维射影空间：$\tilde{\boldsymbol{\mu}} = (w\boldsymbol{\mu},\, w)^\top \in \mathbb{P}^3$，$\tilde{\mathbf{s}} = (w\mathbf{s},\, w)^\top \in \mathbb{P}^3$，两者共享同一个可学习权重 $w$。投影后基元在图像平面上的大小和位置仅取决于比值 $\tilde{\boldsymbol{\mu}}/w$ 与 $\tilde{\mathbf{s}}/w$，因此无论基元远近，其射影性质都在同一个参数空间中被统一表达。直觉上，$w$ 控制基元的”深度分层”：$w$ 越小，基元离世界原点越远，同时尺度也相应缩小——近处（$w \approx 1$）和远处（$w \ll 1$）的物体遵循相同的优化动力学。当 $w = 0$ 时，齐次坐标自然对应射影几何中的无穷远点，这是笛卡尔坐标无法直接表示的。作者通过一维合成实验验证了这一优势：从初始位置 $x=5$ 分别优化到近处目标 $x_t=10$、中间目标 $x_t=50$ 和远处目标 $x_t=200$ 时，齐次坐标和笛卡尔坐标在近处目标上收敛速度相当，但随着目标距离增大，笛卡尔坐标的收敛显著变慢，而齐次坐标始终保持快速收敛。
+
+\textbf{实现上的适配。}
+由于齐次坐标允许远处基元在保持射影性质的同时拥有极大的世界空间尺度，标准 3DGS 中周期性删除大高斯的自适应密度控制机制会误伤这些合法的远距离基元。HoGS 因此关闭了该机制，使远处大基元得以保留，其余渲染管线与原始 3DGS 完全相同。
+
+\paragraph{有界 Power Diagram}
+
+前述 Generalized non-exponential 与 HoGS 分别在渲染方程和坐标参数化层面推广了 3DGS 的理论基础，而 Power Foam（2026.04）~\cite{2604_24994} 则在\textbf{场景分解的数学结构}层面进行推广——从 Voronoi 图推广到加权 Voronoi 图（Power Diagram），同时引入有向点偶极表示和几何-外观解耦机制，使其成为一种兼具光栅化和光线追踪能力的全新体积基元。
+
+\textbf{从无界 Voronoi 到有界 Power Diagram。}
+前驱工作 Radiant Foam 使用 Voronoi 图将场景划分为互不重叠的凸多面体单元，每个单元存储密度和球谐颜色，利用 Delaunay 对偶图的邻接关系实现常数时间的单元间光线穿行。但 Voronoi 单元天然无界——标准 Voronoi 单元 $\mathcal{V}_i = \{\mathbf{x} : \|\mathbf{x}-\mathbf{s}_j\| \geq \|\mathbf{x}-\mathbf{s}_i\|\}$ 向外延伸至无穷，无法判定一个 tile 是否包含该单元的有效贡献区域，因此无法进行高效的 tile-based 光栅化。Power Foam 将 Voronoi 图推广为有界 Power Diagram：每个站点 $\mathbf{s}_i$ 配备一个可学习的半径（权重）$r_i$，单元定义为 $\mathcal{P}_i = \{\mathbf{x} : \|\mathbf{x}-\mathbf{s}_j\|^2 - r_j^2 \geq \|\mathbf{x}-\mathbf{s}_i\|^2 - r_i^2\}$，同时以 $r_i$ 作为包围球半径。这一设计解决了两个问题：半径同时影响单元间界面和球边界，保证始终有梯度（不会出现包围球远大于或远小于单元时梯度消失的问题）；不相交的有界 power 单元之间不会产生虚假的邻接面，避免了非局部相互作用。Power Diagram 的数学性质还保证了一个关键优势——按站点深度排序后，体积渲染积分是无损的，不会产生 splatting 渲染器中常见的 popping 伪影，也支持非针孔相机（如鱼眼镜头）的无损光栅化。
+
+\textbf{有向点偶极表示。}
+作者观察到 Radiant Foam 优化后密度呈双峰分布——占据区域的 cell 密度极高、空白区域的 cell 密度趋近于零——场景表面本质上由高/低密度的突变界面定义。然而用相邻 cell 之间的界面来捕捉这一几何是低效的，需要在空白区域显式放置零密度站点并为其分配球谐颜色参数。为此，Power Foam 将每个 cell 的参数化从单一站点改为\emph{有向点}：由面中心 $\mathbf{c}_i$ 和法向量 $\mathbf{n}_i$ 定义一个内部"有向面"，将 cell 二分为高密度（内侧）和零密度（外侧）两个半空间。这一表示类似于物理偶极子——成对的正负电荷定义局部场——提供了与表面对齐的基元，用单个体积 cell 同时表征占据空间和空白空间，消除了空白区域中的颜色参数冗余。
+
+\textbf{几何与外观解耦。}
+在上述基础上，作者进一步解耦了几何和纹理的频率特性。每个偶极面关联 $k$ 个可学习的 detail site $\mathbf{s}_i \in \mathbb{R}^2$，承担双重功能：（1）作为可学习位移场的锚点，沿法线方向偏移偶极面以表达高频几何细节，无需增加基元数量；（2）存储方向辐射亮度，使用球面 Voronoi 函数建模视角相关的外观。单个几何基元因此可以表示复杂的几何变化和纹理变化，显著减少了高保真重建所需的基元总数。室内场景使用 50 万个 power 站点，室外场景使用 120 万个，比基线方法少 2--4 倍。训练策略采用基于重构误差 EMA 的概率致密化与基于累积贡献 EMA 的剪枝，辅以法线正则化、稀疏正则化和连通性正则化三项损失防止退化配置。
+
+\paragraph{稀疏体素光栅化}
+
+前述 Power Foam 通过 Power Diagram 的数学性质保证无损排序；Sparse Voxels Rasterization（2024.12）~\cite{2412_04459} 则从另一个方向解决排序问题——完全脱离高斯基元，将场景表示为自适应 Octree 稀疏体素（最大 LOD 为 16，分辨率 $65536^3$），利用体素的结构化布局实现确定性排序。每个体素用 8 个角点参数建模三线性密度场 $\rho \in \mathbb{R}^{2 \times 2 \times 2}$，共享角点使相邻体素密度连续，并通过 exponential-linear 激活 $\sigma(x)$ 确保非负密度。体素 alpha 通过均匀采样 $K$ 个点做数值积分得到：$\alpha = 1 - \exp(-\delta \sum_{k=1}^{K} \sigma(\rho(\mathbf{p}_k)))$。外观方面，每个体素存储 $L$ 阶 SH 系数（假设在体素内恒定），并使用从相机到体素中心的方向代替逐像素光线方向求值——这意味着同一体素的 SH 颜色可被该体素覆盖的所有像素共享，只需计算一次，效率远高于 3DGS 的逐像素 SH 求值。核心创新在于排序策略：3DGS 用高斯基元中心或最近距离排序会产生弹出伪影，而该方法利用 Octree 布局的 Morton 码排序——仅需根据光线方向的正负号选择八种 Morton 序之一，即可保证正确的从后到前渲染顺序，彻底消除弹出伪影。光栅化流程复用 3DGS 的 tile-based CUDA 框架：将体素 8 个角点投影到图像空间分配 tile，预计算体素颜色和法线供所有相交像素共享，并在透射率低于阈值时提前终止合成。自适应细分的优先级由训练损失的梯度按 alpha 加权累积：$P = \sum_{r \in R} \alpha_r \|\nabla \mathcal{L}(r)\|$，优先级最高的 top-$p$\% 体素被细分为 8 个子体素。抗锯齿采用超分辨率渲染（$s$ 倍分辨率）后下采样的方式。
+
+\paragraph{可泼溅神经基元}
+
+上述方法均在解析核函数（高斯、凸包、傅里叶曲线等）的框架内替换或推广基元形状，渲染时的泼溅积分要么依赖仿射近似（3DGS），要么需要特殊几何处理。Splat the Net（2025.10）~\cite{2510_08491} 选择了另一条路线：保留椭球包围体和泼溅渲染范式，但将密度场从解析高斯替换为浅层 Siren 网络——$\sigma(\mathbf{x}) = \text{MLP}\left(\frac{\mathbf{x} - \boldsymbol{\mu}}{\|\cdot\|_\Sigma}\right)$，其中 MLP 有一层宽度为 8 的隐藏层，频率乘子固定为 30，总参数约 99 个/基元（比标准高斯多 1.6 倍）。关键性质是：该密度场沿视线的线积分具有闭合形式反导数 $F(t) = \text{sinc}\left(\alpha\left(\frac{t \cdot w_1}{d} + \frac{b_1}{d} + c\right)\right) + t \cdot a_2$，使得泼溅核 $\kappa = 1 - \exp(-\max(0, F(t_{\text{out}}) - F(t_{\text{in}})))$ 可直接解析计算，无需光线步进，且结果透视精确——不像 3DGS 的仿射近似在大视场角下产生失真。密度场在训练和推理中都从不直接求值，所有运算仅作用于其反导数 $F$。致密化方面，由于神经密度场的梯度语义不同于高斯的位置梯度，该方法改用网络权重梯度的幅值作为分裂/剪枝判据（而非 3DGS 的屏幕空间位置梯度），并引入几何正则项惩罚极端各向异性。代价是训练收敛较慢（100k 迭代），但仅用十分之一的基元即可达到相当质量。
+
+\paragraph{高斯基元作为自监督中间表示}
+
+前面所有方法都在 3D 重建或渲染场景中使用高斯基元。GMAE（2025.01）~\cite{2501_03229} 则开辟了完全不同的应用方向——将高斯基元引入视觉自监督学习，作为掩码自编码器（MAE）的中间表示。标准 MAE（Masked Autoencoder，掩码自编码器）的解码器直接预测被掩码的像素补丁。GMAE 的核心洞察是让解码器预测显式的 3D 高斯基元属性，再通过可微泼溅渲染重建图像。具体地，图像被 patchify 为 $N$ 个补丁并以比率 $r$ 随机掩码。ViT 编码器处理 $n = N(1-r)$ 个可见补丁得到潜在嵌入 $\hat{x}_i \in \mathbb{R}^{d_{\text{dec}}}$，与 $k$ 个可学习 query token $\{q_j\}_{j=0}^{k}$ 拼接后送入解码器。解码器为每个 query token 预测一个 14 维高斯向量 $g_j = \{p, s, q, r, o\} \in \mathbb{R}^{14}$，分别对应 3D 中心位置（3 维）、尺度向量（3 维）、旋转四元数（4 维）、颜色（3 维）和不透明度（1 维）。尺度通过有效尺度 $c \cdot \text{sigmoid}(s)$ 限制最大尺寸，$c$ 控制高斯上界。预测的高斯经固定相机投影做泼溅渲染，仅在原始掩码像素区域计算 MSE 损失。与前面所有方法依赖点云初始化不同，这里的高斯由解码器随机初始化、端到端学习，无需任何 3D 先验。实验中观察到一个有趣的涌现性质：高斯沿深度方向自动分层——近处的高斯尺度大、建模低频信息，远处的高斯尺度小、建模高频细节。据此可实现零样本前景分割和边缘检测，无需任何分割或检测训练。
+
+% 替代核函数方向小结
+
+表~\ref{tab:03_kernel_compare} 对比了代表性替代核函数方法的关键特性。
+
+\begin{table}[htbp]
+\centering
+\caption{替代核函数方法对比。支撑类型（有界/无限）、形状特性（对称/非对称/多边形）和关键优势。}
+\label{tab:03_kernel_compare}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{方法} & \textbf{支撑类型} & \textbf{形状特性} & \textbf{关键优势} \\
+\midrule
+标准 3DGS（2023.08）~\cite{2308_04079} & 无限 & 对称椭球 & 基线方法 \\
+3DLS（2024.11）~\cite{2411_12440} & 有界 & 对称椭球 & 消除软边界伪影 \\
+DBS（2025.01）~\cite{2501_18630} & 有界 & 自适应 & 参数减少55\% \\
+UBS（2025.10）~\cite{2510_03312} & 有界 & 各向异性 & 统一静/动/视角依赖 \\
+SSS（2025.03）~\cite{2503_10148} & 无限 & 对称+正负 & 正负密度组合 \\
+3D-HGS（2024.06）~\cite{2406_02720} & 半无限 & 非对称 & 即插即用 \\
+3DCS（2024.11）~\cite{2411_14974} & 有界 & 凸多面体 & 硬边缘/平面表面 \\
+Triangle Splat.（2025.05）~\cite{2505_19175} & 有界 & 三角形 & 兼容标准图形管线 \\
+Fourier Splat.（2026.03）~\cite{2603_19834} & 有界 & 可变形 & 可扩展质量级别 \\
+DARBF（2025.01）~\cite{2501_12369} & 可选 & 可选 & 通用核框架 \\
+Poly Kernels（2026.03）~\cite{2603_18707} & 可选 & 对称 & 渲染加速4--15\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+替代核函数方向呈现出从”改进高斯核”到”替换高斯核”的清晰演进：（1）\textbf{有界化}（Beta 核、线性核）——解决无限支撑问题；（2）\textbf{非对称化}（半高斯、偏斜分布、负高斯）——解决径向对称问题；（3）\textbf{多边形化}（凸包、三角形、可变形轮廓）——完全脱离高斯框架；（4）\textbf{理论统一}（DARBF、多项式核、非指数推广）——建立通用核函数理论。其中，三角形基元因其与标准图形管线的天然兼容性，在工业应用中展现出独特的优势；而 Fourier Splatting 的可扩展参数化则为”一个模型、多个质量级别”提供了优雅的解决方案。
+
+\begin{takeaway}
+多边形基元和通用核框架标志着从”改进高斯核”到”替换高斯核”的范式转变。三角形基元因与标准图形管线的天然兼容性在工业应用中优势显著，Convex Splatting 产生更紧凑、更少浮动伪影的表示。DARBF 等理论统一工作表明，不同基元形式可在距离函数逼近的统一框架下理解。
+\end{takeaway}
+
+%=====================================================================
+
+%=====================================================================
+
+\subsection{近期方法脉络：Surface-aligned alternatives to Gaussian primitives}
+
+这一组近期工作延续 3DGS，主要把改动集中在替代路线等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{FLAT}
+FLAT（2026.06）~\cite{2606_24876} 延续 3DGS 在“Surface-aligned alternatives to Gaussian primitives”上的基本设定，主要改变是：从视频扩散 latent 前馈解码 surface-aligned triangle splats。不改变 3DGS 主线的表示、渲染或优化管线。
+其设计动机是：探索从压缩视频扩散 latent 直接生成表面对齐 primitive，使输出更适合仿真和传统图形管线。
+具体而言，方法不以标准 3DGS 为核心，而是针对 3D Gaussian 缺少明确表面的限制设计 triangle splat 表示与前馈 latent 解码器。
+适用边界是：是与 3DGS 相邻的 splatting 表示创新，不是 Gaussian primitive 的直接改进；相关性主要来自表示设计对比。
+\section{特殊频谱与高维表示}
+\label{sec:03_5}
+
+\subsection{特殊频谱与高维扩展方法}
+
+本节讨论两条技术路线：（1）高光谱 3DGS；（2）方向感知与高维表示。
+
+\subsubsection{高光谱 3DGS}
+
+本路线介绍将 3DGS 扩展到高光谱等非 RGB 多通道域的方法。标准 3DGS 处理 RGB 三通道图像。高光谱成像（Hyperspectral Imaging, HSI）捕获数十到数百个光谱波段，在遥感、农业和医学等领域有重要应用。将 3DGS 扩展到高光谱域面临的核心挑战是高维光谱数据的参数化与压缩。
+
+\paragraph{潜变量高光谱 3DGS}
+
+本方法修改了 3DGS 的颜色表示与渲染管线——用潜变量高光谱表示替代 RGB 三通道向量——3DGS 的高斯分裂/克隆机制与可微光栅化框架保持不变。传统 RGB 相机仅捕获红、绿、蓝三个宽波段，无法区分材料的光谱”指纹”（例如两块视觉同色的织物可能在红外波段截然不同）。高光谱成像以数十到数百个窄波段逐像素记录完整光谱曲线，为遥感、医学诊断和环境监测等领域提供关键材料信息。然而，标准 3DGS 将每个高斯的颜色属性设为 3 维 RGB 向量，直接扩展到高光谱域意味着每个高斯需要存储数十到数百维的光谱签名，优化空间维度爆炸且对噪声高度敏感。
+
+\textbf{潜空间压缩。}HyperGS（2024.12）~\cite{2412_12849} 的核心思路是”先压缩、再重建”：不在原始光谱空间中优化高斯，而是先将高维光谱压缩到低维潜空间（latent space，即一个经学习得到的紧凑表示，用远少于原始波段数的维度捕获光谱的主要变异模式），在潜空间中完成 3DGS 优化后再解码回完整光谱。具体地，训练一个对称的 1D 卷积自编码器，沿光谱维度用卷积层和 Squeeze-Excitation（SE）块将高维光谱压缩到 $m$ 维潜空间（论文中 $m{=}8$，相比典型高光谱数据集的 31 个波段压缩约 4 倍）。省略跳跃连接以使解码器可独立运行，便于在推理时将潜签名解码为完整光谱。自编码器训练损失为
+\begin{equation}
+L_{\text{ae}} = L_{\text{Huber}}\bigl(C^*(p),\; \text{Dec}(\text{Enc}(C^*(p)))\bigr),
+\end{equation}
+
+即衡量”编码再解码”后的光谱与真实像素光谱 $C^*(p)$ 之间的重建误差，其中 Huber 损失兼具 L1 和 L2 的优点，对异常光谱波段提供平滑梯度以应对不同数据集的信噪比差异。
+
+\textbf{潜空间 3DGS 渲染。}在潜空间中，每个高斯的颜色属性从 3 维 RGB 向量变为 $m$ 维潜向量 $f_i \in \mathbb{R}^m$，并通过 view-directional hash 编码 $h(\mathbf{m}_i, \mathbf{d})$ 加 MLP $F_\theta$ 预测视角相关的光谱调制 $\delta_{i,d}$ 和不透明度 $o_{i,d}$：
+
+\begin{equation}
+[\delta_{i,d},\; o_{i,d}] = F_\theta\bigl(h(\mathbf{m}_i, \mathbf{d});\; \theta\bigr).
+\end{equation}
+
+直觉上，$\delta_{i,d}$ 对潜空间中的光谱签名做视角相关的微调（类似于标准 3DGS 中球谐系数对颜色的视角调制），而 $o_{i,d}$ 根据视角动态调节高斯的不透明度。体积渲染在潜空间中进行，累积透射率为 $T_{i,d} = \prod_{j=1}^{i-1}(1 - o_j \alpha_j o_{j,d})$，最终潜签名为 $\hat{C}(p,d) = \sum_i T_{i,d} \, \alpha_i \, f_i \, \delta_{i,d}$，最后通过冻结的解码器还原完整光谱 $C(p,d) = \text{Dec}(\hat{C}(p,d))$。在潜空间而非原始光谱空间中渲染，既大幅降低了计算量，又让视角调制作用于低维表示，从而减少异常值。
+
+\textbf{高光谱适配的损失函数。}标准 3DGS 的 $\text{L1} + \text{D-SSIM}$ 损失对高光谱数据会导致敏感光谱波段产生极端误差从而破坏训练稳定性。HyperGS 改用加权组合
+\begin{equation}
+L_d(p) = (1-\lambda)\bigl(L_{\text{CB}}(p) + L_{\text{CS}}(p)\bigr) + \lambda L_{\text{SSIM}}(p),
+\end{equation}
+
+其中 Charbonnier 损失 $L_{\text{CB}}$ 替代 L1 提供更平滑的梯度，cosine similarity $L_{\text{CS}}$ 度量光谱向量间的角度距离以捕捉光谱形状相似性。两光谱形状越相似角度越小，即使绝对亮度不同也能获得低损失。$\lambda$ 平衡光谱质量与空间一致性。
+
+\textbf{深度感知的自适应致密化。}致密化阶段同样针对高光谱域做了改进：标准 3DGS 按 NDC 梯度阈值分裂高斯，但近距离高斯在稀疏区域会产生不一致分裂，且高光谱数据通道数增多使视觉不连续性更加突出。HyperGS 引入深度缩放因子 $h(d,i) = (|E_d X_i|_\mathbb{R} / R)^\beta$（$\beta$ 为可调参数，$R$ 为场景半径），按深度平方衰减分裂分数 $S(g_i)$，以抑制近距离高斯的过度分裂。最终在 HyperGS 基准测试上比已有高光谱 NeRF 方法精度提升 14 dB。
+
+\paragraph{Voronoi-guided 双边 2DGS 高光谱超分辨率}
+
+与 HyperGS 走 3DGS 场景重建路线不同，GaussianHSI（2026.04）~\cite{2604_17727} 将高斯基元直接用于 2D 图像域——任务是给定低分辨率 HSI $I^{lr}\in\mathbb{R}^{H\times W\times B}$，重建任意尺度 $r$ 的高分辨率 HSI $I^{hr}\in\mathbb{R}^{rH\times rW\times B}$。核心表示沿用标准 2DGS：图像由一组平面高斯函数 $\{x_n, y_n, \mathbf{F}_n, \boldsymbol{\Sigma}_n\}_{n=1}^N$ 参数化（$\mathbf{F}_n\in\mathbb{R}^{C_1}$ 为特征向量，合并了颜色与不透明度；$\boldsymbol{\Sigma}_n$ 为 $2\times2$ 协方差矩阵）。这种连续表示天然支持任意空间位置求值，从而实现任意尺度超分。与 HyperGS 的关键差异在于：其一，HyperGS 在潜空间中做 3D 体积渲染以重建场景高光谱，GaussianHSI 在 2D 图像域直接用高斯做空间超分，光谱细节由并行分支补充。其二，HyperGS 的优化围绕 3D 高斯分裂/克隆展开，GaussianHSI 的高斯初始化在像素位置上，由小型 CNN 预测残差偏移与协方差参数。
+
+\textbf{Voronoi 引导的高斯选择。}标准 2DGS 的光栅化用固定欧氏距离邻域聚合像素贡献，无法自适应地捕捉不同尺度和方向的高斯-像素关联。GaussianHSI 用 Voronoi 竞争替代固定邻域：将所有高斯视为目标像素的竞争候选，对每个目标像素 $(x,y)$ 用 Mahalanobis 距离
+\begin{equation}
+d_{i,j}(x,y) = \sqrt{(\mathbf{p} - \boldsymbol{\mu}_{i,j})^\top \boldsymbol{\Sigma}_{i,j}^{-1}(\mathbf{p} - \boldsymbol{\mu}_{i,j})}
+\end{equation}
+
+衡量关联度（$\mathbf{p}=[x,y]^\top$，$\boldsymbol{\mu}_{i,j}$ 为高斯中心，$\boldsymbol{\Sigma}_{i,j}$ 为协方差），选取距离最小的 top-$k$ 个高斯构成候选集 $\mathcal{S}_k(x,y)$。Mahalanobis 距离内嵌协方差逆矩阵，相比欧氏距离能更准确地反映每个高斯的各向异性尺度与朝向——例如一个沿水平方向拉长的高斯，其水平方向的等距面更远，自然会吸引更多水平方向的像素。
+
+\textbf{参考感知双边聚合。}选定候选集后，GaussianHSI 进一步引入低分辨率参考特征来调制聚合权重——这是对 HyperGS 纯距离驱动的体积渲染的补充，显式利用了超分任务中低分辨率输入可用的先验。具体地，将低分辨率特征 $\mathbf{F}_\text{spatial}$ 上采样至目标分辨率作为参考 $\hat{\mathbf{F}}^{x,y}_\text{spatial}$，用余弦相似度 $s_{i,j} = \cos(\mathbf{F}_{i,j},\, \hat{\mathbf{F}}^{x,y}_\text{spatial})$ 衡量高斯特征与参考特征的一致性，最终聚合权重为
+\begin{equation}
+\mathbf{F}'_\text{spatial}(x,y) = \frac{\sum_{(i,j)\in\mathcal{S}_k} w_{i,j}\,G_{i,j}(x,y)}{\sum_{(i,j)\in\mathcal{S}_k} w_{i,j}}, \quad w_{i,j} = \sigma(\beta\, s_{i,j})
+\end{equation}
+
+其中 $\beta$ 是可学习的参考影响系数，$\sigma$ 为 sigmoid 函数。直觉上，即使一个高斯在空间上与目标像素很近（$G_{i,j}$ 大），若其特征与参考特征不一致（$s_{i,j}$ 低），权重也会被压低。这在边缘和纹理区域能有效抑制混叠。
+
+\textbf{光谱细节增强。}与 HyperGS 在潜空间中联合建模空间和光谱不同，GaussianHSI 将光谱恢复解耦到并行的光谱细节增强模块（SDE）。编码器将输入特征按通道拆分为空间部分 $\mathbf{F}_\text{spatial}$（送入 VBGS）和光谱部分 $\mathbf{F}_\text{spectral}$（送入 SDE）。SDE 将光谱特征上采样后，对每个目标像素提取局部窗口，通过两层交替的空间 MLP（跨位置混合）和光谱 MLP（跨通道混合）增强光谱细节。两条路径的特征拼接后经基于窗口自注意力的解码器输出最终 HSI。这种双分支设计反映了一个关键洞察：基于高斯的空间重建擅长恢复空间结构但可能丢失细粒度光谱变化，而 SDE 作为补充专门增强光谱保真度。
+
+\subsubsection{方向感知与高维表示}
+
+本节介绍 2 种方向感知与高维表示方法：6DGS（6D 空间-角度高斯）和 Spherical Voronoi（球面 Voronoi 方向外观）。
+
+\paragraph{6D 空间-角度联合高斯}
+
+6DGS（2024.10）~\cite{2410_04974} 修改了 3DGS 的高斯基元表示——用 6D 空间-角度联合高斯替代纯 3D 空间高斯——球谐颜色表示和基于 tile 的光栅化渲染管线保持不变。核心动机来自一个观察：标准 3DGS 中每个高斯仅有 3D 位置 $\boldsymbol{\mu}_p$ 和固定不透明度 $\alpha$，视角依赖效果完全依赖 SH 系数建模颜色变化，而不透明度本身与视角无关。这意味着镜面反射、半透明、各向异性散射等强视角依赖现象需要大量高斯才能近似，效果仍然有限。
+
+\textbf{6D 联合表示。}6DGS 的核心思想是将高斯基元从 3D 空间提升到 6D 空间-角度联合域：每个基元不再只有一个 3D 位置，而是同时拥有一对 $(\boldsymbol{\mu}_p, \boldsymbol{\mu}_d)$——分别表示空间位置和该基元”最可见”的方向均值。直觉上，这好比把一个固定在空间中的”光斑”变成了一个既知道”我在哪”也知道”我朝哪看”的基元。形式化地，位置和方向被联合建模为单个 6D 高斯 $\mathcal{N}([\boldsymbol{\mu}_p; \boldsymbol{\mu}_d], \boldsymbol{\Sigma}_{6D})$，其中 $6\times6$ 协方差矩阵按空间-方向分块：
+
+\begin{equation}
+\boldsymbol{\Sigma}_{6D} = \begin{bmatrix} \boldsymbol{\Sigma}_p & \boldsymbol{\Sigma}_{pd} \\ \boldsymbol{\Sigma}_{pd}^\top & \boldsymbol{\Sigma}_d \end{bmatrix}
+\end{equation}
+
+$\boldsymbol{\Sigma}_p$ 描述空间形状，$\boldsymbol{\Sigma}_d$ 描述方向的散布范围，而交叉项 $\boldsymbol{\Sigma}_{pd}$ 编码了空间位置与方向之间的耦合关系——正是这一耦合使得高斯中心能够随视角”滑动”。
+
+\textbf{切片操作与条件参数。}渲染时，6DGS 并不直接操作 6D 高斯，而是沿给定视角方向 $d$ 对其做”切片”——类比于用一个方向超平面去截取 6D 高斯，得到一个条件化的 3D 高斯。切片后推导出三个条件参数。条件均值利用方向-空间耦合使高斯中心随视角动态偏移：
+
+\begin{equation}
+\boldsymbol{\mu}_\text{cond} = \boldsymbol{\mu}_p + \boldsymbol{\Sigma}_{pd}\boldsymbol{\Sigma}_d^{-1}(d - \boldsymbol{\mu}_d)
+\end{equation}
+
+这等价于最优线性无偏估计（BLUE）：当视角 $d$ 偏离方向均值 $\boldsymbol{\mu}_d$ 时，空间位置沿交叉相关方向修正，从而捕捉视差和非平面几何效果。条件协方差为 Schur 补 $\boldsymbol{\Sigma}_\text{cond} = \boldsymbol{\Sigma}_p - \boldsymbol{\Sigma}_{pd}\boldsymbol{\Sigma}_d^{-1}\boldsymbol{\Sigma}_{pd}^\top$，表示扣除方向相关性后位置的残余不确定性，且与视角方向无关——因此可在推理前预计算。条件不透明度 $\alpha_\text{cond} = \alpha \cdot f_\text{cond}$ 引入视角依赖的可见性衰减：
+
+\begin{equation}
+f_\text{cond} = \exp\!\bigl(-\alpha_\text{opa}(d - \boldsymbol{\mu}_d)^\top \boldsymbol{\Sigma}_d^{-1}(d - \boldsymbol{\mu}_d)\bigr)
+\end{equation}
+
+$f_\text{cond}$ 本质上是方向分量 $(d - \boldsymbol{\mu}_d)$ 的马氏距离的指数衰减：高斯在方向均值 $\boldsymbol{\mu}_d$ 附近最”实”，偏离越远越”透明”，自然地建模了各向异性的视角依赖可见性。参数 $\alpha_\text{opa}\in(0,1)$ 控制衰减强度：实验中 $\alpha_\text{opa} = 0.35$ 取得了质量与点数的最优平衡；将其设为逐高斯可学习参数可进一步提升效果。
+
+\textbf{与 3DGS 框架的兼容性。}切片后得到的条件 3D 高斯 $(\boldsymbol{\mu}_\text{cond}, \boldsymbol{\Sigma}_\text{cond}, \alpha_\text{cond})$ 可直接输入 3DGS 的光栅化管线，无需修改渲染器。自适应密度控制（克隆/分裂）通过 SVD 分解 $\boldsymbol{\Sigma}_\text{cond} = UDU^\top$ 提取旋转 $R = U$ 和尺度 $S = \sqrt{\text{diag}(D)}$，复用 3DGS 原有的密度控制逻辑。推理时仅需每帧计算 $\boldsymbol{\mu}_\text{cond}$ 和 $\alpha_\text{cond}$（$\boldsymbol{\Sigma}_\text{cond}$ 可预计算），开销极小。在包含强视角依赖效果的 6DGS-PBR 数据集上，6DGS 相比 3DGS 的 PSNR 平均提升 +10.08\,dB（最高 +15.73\,dB），同时高斯点数仅用 33.5\%；在无强视角依赖的 Synthetic NeRF 数据集上质量持平但点数减少 23.1\%。
+
+\paragraph{球面 Voronoi 方向外观建模}
+
+6DGS 通过修改基元的空间-角度\emph{几何结构}（6D 协方差、切片操作、条件不透明度）实现方向感知，但保留 SH 作为颜色表示——高斯的”形状随视角变”解决了，”颜色随视角变”仍依赖 SH。Spherical Voronoi（2025.12）~\cite{2512_14180} 选择了正交互补的路线：不改变高斯的空间结构，而是替换视角依赖颜色函数的参数化方式——用球面 Voronoi 分区替代 SH 和 Spherical Gaussians (SG)，为漫反射与镜面反射提供统一的颜色表示。
+
+\textbf{动机：SH 与 SG 的瓶颈。}SH 阶数 $L$ 有限时无法表示尖锐的局部信号（高频镜面高光），增大 $L$ 导致参数爆炸和 Gibbs 振铃；SG 虽能建模局部信号，但多个高斯核的重叠导致对初始化敏感、梯度弱。Spherical Voronoi 的核心思路是将球面方向域划分为\emph{不重叠的}可学习区域，从根源上消除多核竞争问题。
+
+\textbf{球面 Voronoi 表示。}定义 $K$ 个方向站点 $s_1,\ldots,s_K\in S^2$ 及其关联值 $c_1,\ldots,c_K\in\mathbb{R}^3$，函数在方向 $\omega$ 处的值为
+\begin{equation}
+f_{SV}(\omega;\tau,s,c) = \sum_{k=1}^{K} w_k(\omega;\tau_k)\, c_k, \quad w_k = \frac{\exp(\tau_k\, s_k^\top\omega)}{\sum_{k'=1}^{K}\exp(\tau_{k'}\, s_{k'}^\top\omega)}
+\end{equation}
+
+即用 softmax 对各站点的方向内积加权。温度参数 $\tau_k>0$ 控制分区锐度——$\tau_k$ 小则区域间过渡平滑（适合漫反射），$\tau_k$ 大则趋近硬 Voronoi 镶嵌（适合尖锐镜面高光）。与 6DGS 的协方差交叉项 $\boldsymbol{\Sigma}_{pd}$ 编码空间-方向耦合不同，SV 完全不涉及基元的空间几何——它只回答”从方向 $\omega$ 看这个基元是什么颜色”。softmax 保证所有站点梯度始终非零（不存在 SG 的”死区”问题），且区域天然不重叠，避免了多核竞争。
+
+\textbf{3DGS 集成方式。}每个高斯额外存储 $(\tau_k, s_k, c_k)$ 作为可学习参数，替代 SH 系数，渲染时用视角方向查询 $f_{SV}$ 获取颜色。与 6DGS 的切片-条件化管线不同，SV 不需要修改高斯的位置、协方差或不透明度——颜色计算与几何完全解耦。
+
+\textbf{反射建模与可学习光探针。}对于镜面反射场景，SV 进一步引入可学习 Voronoi 光探针（基于 2DGS 骨架 + 延迟渲染），与直接视图方向查询形成两个层次：每个探针包含位置 $p_i$、混合权重 $\lambda_i$ 和一组 Spherical Voronoi 参数，用反射方向 $d_r=2(n\cdot d)n-d$ 查询，表面粗糙度 $R$ 通过 $\tau=(1-R)\tau_l+R\tau_h$ 动态调制温度——粗糙度低则反射锐利，粗糙度高则光斑弥散。这一设计使 SV 能够同时处理漫反射（直接方向查询、低温度）和镜面反射（反射方向查询、高温度），实现比 SH 更统一的视角依赖外观建模。
+
+\subsection{特殊频谱小结}
+
+特殊频谱与高维表示方向虽然论文数量较少（4 篇），但每篇都开辟了新的应用方向。高光谱 3DGS（HyperGS）和 Voronoi-guided 2DGS 为遥感领域的多光谱成像提供了连续表示方案；6DGS 从理论上证明了空间-角度联合表示的优势；Spherical Voronoi 为视角依赖外观提供了比 SH 更灵活的参数化方式。这些工作共同指向一个趋势：高斯基元不限于 RGB 三通道的场景重建，其连续表示能力可以自然扩展到任意维度和模态。
+
+\begin{takeaway}
+高斯基元的表示能力不限于 RGB 三通道——HyperGS 将其扩展到高光谱域实现连续光谱重建，6DGS 引入空间-角度联合表示增强方向感知，Spherical Voronoi 用可学习分区替代 SH 实现更灵活的视角依赖外观建模。这些工作表明高斯基元框架具有跨维度和跨模态的天然通用性。
+\end{takeaway}
+
+%=====================================================================
+
+本章从纹理化、核函数替换、维度降阶和域扩展四个维度系统梳理了高斯基元的改进方向。四个维度代表了四种不同的设计哲学：（1）纹理高斯在不改变基元几何的前提下增强外观表达力；（2）替代核函数从根本上重新思考”用什么形状作为基元”；（3）2D 高斯通过降维消除平面表面的参数冗余；（4）高维扩展将基元推向非 RGB 的新应用领域。
+
+从论文数量分布来看，替代核函数方向最为活跃（22 篇），反映了研究者对高斯核固有局限的广泛关注；纹理高斯方向（16 篇）的技术路线最为成熟，已形成从简单参数替换到全局神经场的完整谱系；2D 高斯方向（14 篇）在图像处理领域开辟了独特的应用空间。
+
+跨章节来看，本章讨论的基元改进为后续章节提供了基础：纹理高斯的解耦思想为第 5 章（材质与光照）的 BRDF 表示奠定基础；2D Surfel 的表面友好性为第 4 章（几何与表面重建）的 mesh 提取提供支持；替代核函数的灵活性为第 7 章（物理仿真）的动力学建模打开了新的可能性。
+
+\input{chapters/recent/ch03}
+
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+\begin{futurebox}{本章总结与展望}{ch03_summary}
+本章从基元设计角度系统梳理了 3DGS 表示层的改进方向，涵盖 58 篇论文。
+
+\textbf{纹理高斯与空间变化外观}（第~\ref{sec:03_1}~节和第~\ref{sec:03_2}~节）解决了标准高斯"一种颜色"的表达力瓶颈。从 SH 空间坐标化到 2D 纹理图再到全局神经场，技术路线从简单参数替换演进到结构化的外观表示。
+
+\textbf{替代核函数与新型基元}（第~\ref{sec:03_3}~节和第~\ref{sec:03_4}~节）重新思考了"用什么形状作为基元"的根本问题。有界支撑核消除了高斯无限支撑导致的伪影；非对称分布和三角/多边形基元打破了旋转对称性假设，为薄结构和尖锐边缘提供了更好的几何表达。
+
+\textbf{2D 高斯与 Surfel 表示}已移至第~\ref{ch:04}~章讨论。2DGS 通过维度降阶消除了 3D 椭球表示平面表面时的参数冗余，在表面重建和图像表示中开辟了独特的应用空间。
+
+\textbf{特殊频谱与高维表示}（第~\ref{sec:03_5}~节）将高斯基元从 RGB 三通道扩展到高光谱和 6D 空间-角度联合表示，展示了基元表示的通用性——不限于可见光成像，可自然扩展到任意维度和模态。
+
+从设计哲学看，这些方向代表了不同的思路：纹理高斯在不改变基元几何的前提下增强外观；替代核函数从根本上重新定义基元形状；2D 高斯通过降维消除冗余；高维扩展将基元推向新应用领域。这些改进为后续章节提供了表示层面的基础——纹理化解耦思想为第~\ref{ch:05}~章的材质分解铺路，2D Surfel 的表面友好性为第~\ref{ch:04}~章的 mesh 提取提供支持（2DGS 内容已移至第~\ref{ch:04}~章），替代核的灵活性为第~\ref{ch:06}~章的物理仿真打开新可能。
+
+当前该方向最突出的开放问题包括：
+\begin{itemize}
+\item \textbf{基元设计的统一理论}：不同基元变体（3D/2D/多边形/6D）缺乏统一的理论框架，选择哪种基元仍依赖经验判断。是否存在一种自适应的基元选择机制，根据场景特征自动确定最优表示？
+\item \textbf{纹理与几何的耦合优化}：当前纹理化和几何优化往往独立进行，联合优化时如何避免纹理和几何的相互干扰（如纹理拉伸、几何退化为平面）仍需探索。
+\item \textbf{基元表示的物理一致性}：替代核函数在视觉质量上取得进展，但物理正确性（如能量守恒、闭合性）尚未被系统验证，这限制了其在物理仿真（第~\ref{ch:06}~章）和逆渲染（第~\ref{ch:05}~章）中的应用。
+\end{itemize}
+\end{futurebox}

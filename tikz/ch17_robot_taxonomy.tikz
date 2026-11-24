@@ -1,0 +1,43 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (25.5, 5.6) {机器人导航与具身智能方法分类};
+  \node[route=techblue] (b0) at (8.8, 3.1) {导航与路径规划};
+  \node[method=techblue] (b0_l0) at (2.0, 0.6) {地图构建导航\\{\tiny ATLAS Navigator, NavGSim, NVSim}};
+  \node[method=techblue] (b0_l1) at (6.6, 0.6) {语义探索安全\\{\tiny VISTA, SplatSearch, GSplatVNM}};
+  \node[method=techblue] (b0_l2) at (10.9, 0.6) {无人机导航\\{\tiny UAV-GS, DroneNav-GS}};
+  \node[route=techgreen] (b1) at (19.3, 3.1) {机械臂操控};
+  \node[method=techgreen] (b1_l0) at (15.2, 0.6) {功能推理抓取\\{\tiny GraspGS, SplatGrasp, ManipGS}};
+  \node[method=techgreen] (b1_l1) at (19.3, 0.6) {灵巧操控\\{\tiny DexGS, DextrousSplat}};
+  \node[route=techorange] (b2) at (25.5, 3.1) {具身感知与交互};
+  \node[method=techorange] (b2_l0) at (23.2, 0.6) {遥操作孪生\\{\tiny TeleGS, Gello-GS, MimicGS}};
+  \node[method=techorange] (b2_l1) at (27.3, 0.6) {多模态感知\\{\tiny ConceptGS, SceneGraph-GS}};
+  \node[route=techpurple] (b3) at (32.0, 3.1) {仿真与真实迁移};
+  \node[method=techpurple] (b3_l0) at (32.0, 0.6) {Real2Sim2Real\\{\tiny SplatSim, R2D2-GS}};
+  \node[method=techpurple] (b3_l1) at (36.7, 0.6) {Sim2Real\\{\tiny RoboGSim, GenSim-GS}};
+  \node[route=techblue] (b4) at (40.6, 3.1) {强化学习};
+  \node[method=techblue] (b4_l0) at (40.6, 0.6) {场景表示\\{\tiny RL-GS, NavRL-GS}};
+  \node[method=techblue] (b4_l1) at (44.0, 0.6) {RL训练\\{\tiny GSRL, SceneRL-GS}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (root) -- (b4);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+  \draw[arr] (b4) -- (b4_l0);
+  \draw[arr] (b4) -- (b4_l1);
+\end{tikzpicture}

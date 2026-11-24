@@ -1,0 +1,23 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (d1) at (3.4, 0.6) {数据采集(多相机/LiDAR)};
+  \node[box=techgreen] (d2) at (10.9, 0.6) {街景重建(静态背景)};
+  \node[box=techorange] (d3) at (17.8, 0.6) {动态建模(车辆/行人)};
+  \node[box=techpurple] (d4) at (24.7, 0.6) {仿真引擎(闭环测试)};
+  \node[box=techblue] (d5) at (31.5, 0.6) {训练验证(感知模型)};
+  \node[font=\scriptsize, text=techgray] at (10.9, -0.6) {天空/地面分离};
+  \node[font=\scriptsize, text=techgray] at (17.8, -0.6) {实例级动态高斯};
+  \node[font=\scriptsize, text=techgray] at (24.7, -0.6) {传感器模拟};
+  \draw[arr] (d1) -- (d2);
+  \draw[arr] (d2) -- (d3);
+  \draw[arr] (d3) -- (d4);
+  \draw[arr] (d4) -- (d5);
+\end{tikzpicture}

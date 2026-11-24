@@ -1,0 +1,72 @@
+% 图6.1: 动态场景 3DGS 技术路线图
+\begin{tikzpicture}[
+  node distance=0.8cm and 1.8cm,
+  block/.style={rectangle, rounded corners=3pt, draw=techgray, fill=techbg,
+    text width=2.8cm, minimum height=1.0cm, align=center, font=\small},
+  route/.style={rectangle, rounded corners=3pt, draw=#1, fill=techbg,
+    text width=2.5cm, minimum height=0.8cm, align=center, font=\small\bfseries},
+  arr/.style={-{Stealth[length=5pt]}, thick, techgray},
+  label/.style={font=\scriptsize\color{techlightgray}, align=center},
+]
+
+% Central node: Static 3DGS
+\node[block, text width=3.5cm, minimum height=1.2cm, draw=techblue, fill=techbluebg, font=\normalsize\bfseries] (gs)
+  {静态 3DGS\\（位置+颜色固定）};
+
+% Two main routes
+\node[route=techblue, above left=1.8cm and 2.0cm of gs] (r1)
+  {路线 A\\变形场};
+\node[route=techgreen, above right=1.8cm and 2.0cm of gs] (r2)
+  {路线 B\\原生 4D};
+
+% Arrows to routes
+\draw[arr, techblue] (gs.north west) -- (r1.south east)
+  node[label, midway, above left] {静态 GS + 变形 MLP};
+\draw[arr, techgreen] (gs.north east) -- (r2.south west)
+  node[label, midway, above right] {时空联合高斯};
+
+% Deformation details
+\node[block, left=1.5cm of r1, text width=2.2cm, draw=techblue, font=\scriptsize] (d1)
+  {逐高斯位移\\+ 旋转 + 缩放};
+\draw[arr, techblue] (d1.east) -- (r1.west);
+
+% 4D details
+\node[block, right=1.5cm of r2, text width=2.2cm, draw=techgreen, font=\scriptsize] (d2)
+  {HexPlane / K-plane\\张量分解};
+\draw[arr, techgreen] (r2.east) -- (d2.west);
+
+% Key encodings
+\node[block, below=0.3cm of d1, text width=2.2cm, draw=techblue, font=\scriptsize] (e1)
+  {嵌入 / 哈希\\B样条 / ODE};
+\node[block, below=0.3cm of d2, text width=2.2cm, draw=techgreen, font=\scriptsize] (e2)
+  {4D Scaffold\\锚点驱动};
+
+% Section labels
+\node[route=techorange, below left=2.5cm and 1.5cm of gs] (s2)
+  {§6.2 单目重建};
+\node[route=techpurple, left=2.5cm of gs] (s3)
+  {§6.3 运动跟踪};
+\node[route=techgray, below right=2.5cm and 1.5cm of gs] (s4)
+  {§6.4 视频流};
+\node[route=techorange, below=2.5cm of gs] (s5)
+  {§6.5 场景分解};
+
+% Arrows from center to sections
+\draw[arr, techorange] (gs.south west) -- (s2.north east)
+  node[label, midway, below left] {深度先验/正则化};
+\draw[arr, techpurple] (gs.west) -- (s3.east)
+  node[label, midway, above] {轨迹/速度场};
+\draw[arr, techgray] (gs.south east) -- (s4.north west)
+  node[label, midway, below right] {压缩/流式传输};
+\draw[arr, techorange] (gs.south) -- (s5.north)
+  node[label, midway, right] {静态-动态分离};
+
+% Paper counts
+\node[label, below=0.15cm of r1] {82篇};
+\node[label, below=0.15cm of r2] {原生 4D};
+\node[label, below=0.15cm of s2] {35篇};
+\node[label, below=0.15cm of s3] {18篇};
+\node[label, below=0.15cm of s4] {49篇};
+\node[label, below=0.15cm of s5] {24篇};
+
+\end{tikzpicture}

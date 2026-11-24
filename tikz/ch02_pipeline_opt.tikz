@@ -1,0 +1,43 @@
+\begin{tikzpicture}[
+  layer/.style={rectangle, rounded corners=6pt, draw=#1, fill=#1!8,
+    text width=13cm, minimum height=1.5cm, align=left, font=\small},
+  mname/.style={font=\scriptsize\ttfamily, techgray},
+  arr/.style={-{Stealth[length=6pt]}, very thick, techgray},
+  >=Stealth
+]
+  % Layer 3 (底部): 管线效率优化
+  \node[layer=techpurple] (l3) at (0, 0) {%
+    \textbf{Layer 3: 管线效率优化}%
+    \hfill {\scriptsize 减少冗余计算 + 利用硬件特性}%
+  };
+  \node[mname, anchor=north west] at ([xshift=0.3cm, yshift=-0.1cm]l3.north west) {
+    FlashGS \textbullet{} Speedy-Splat \textbullet{} QuadBox \textbullet{} TC-GS \textbullet{} TensorGS \textbullet{} GEMM-GS
+  };
+
+  % Layer 2 (中部): 排序精度改进
+  \node[layer=techorange] (l2) at (0, 2.3) {%
+    \textbf{Layer 2: 排序精度改进}%
+    \hfill {\scriptsize 逐像素精确排序 + 投影校正}%
+  };
+  \node[mname, anchor=north west] at ([xshift=0.3cm, yshift=-0.1cm]l2.north west) {
+    StopThePop \textbullet{} Plucker坐标 \textbullet{} 混合透明度 \textbullet{} 精确椭球投影
+  };
+
+  % Layer 1 (顶部): 消除排序依赖
+  \node[layer=techblue] (l1) at (0, 4.6) {%
+    \textbf{Layer 1: 消除排序依赖}%
+    \hfill {\scriptsize 可交换混合替代 alpha blending}%
+  };
+  \node[mname, anchor=north west] at ([xshift=0.3cm, yshift=-0.1cm]l1.north west) {
+    WSR (加权求和) \textbullet{} StochasticSplats \textbullet{} Duplex-GS \textbullet{} MB3DGS
+  };
+
+  % 层间箭头
+  \draw[arr] (l1.south) -- (l2.north) node[midway, right=0.3cm, font=\scriptsize, techgray] {排序仍然需要};
+  \draw[arr] (l2.south) -- (l3.north) node[midway, right=0.3cm, font=\scriptsize, techgray] {排序已优化};
+
+  % 右侧标注：效果
+  \node[font=\scriptsize, techblue, anchor=west] at (7, 4.6) {弹出伪影 = 0};
+  \node[font=\scriptsize, techorange, anchor=west] at (7, 2.3) {高斯减少 50\%};
+  \node[font=\scriptsize, techpurple, anchor=west] at (7, 0) {渲染加速 1.5--7$\times$};
+\end{tikzpicture}

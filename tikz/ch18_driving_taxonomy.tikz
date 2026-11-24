@@ -1,0 +1,41 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (18.2, 5.6) {自动驾驶场景方法分类};
+  \node[route=techblue] (b0) at (5.1, 3.1) {街景重建与渲染};
+  \node[method=techblue] (b0_l0) at (1.5, 0.6) {街景表示\\{\tiny StreetGaussians, DrivingGaussian, ADM-GS}};
+  \node[method=techblue] (b0_l1) at (5.1, 0.6) {动态建模\\{\tiny ReconDrive, StreetForward, PointForward}};
+  \node[route=techgreen] (b1) at (12.3, 3.1) {仿真与数据生成};
+  \node[method=techgreen] (b1_l0) at (8.7, 0.6) {闭环仿真\\{\tiny SplatSim-Drive, DriveSim-GS}};
+  \node[method=techgreen] (b1_l1) at (12.3, 0.6) {数据合成\\{\tiny DrivingForward, XYZCylinder, VGD}};
+  \node[route=techorange] (b2) at (18.2, 3.1) {动态驾驶场景};
+  \node[method=techorange] (b2_l0) at (15.9, 0.6) {动静分解\\{\tiny Street Gaussians, DynaGS-Drive}};
+  \node[method=techorange] (b2_l1) at (19.5, 0.6) {综合动态\\{\tiny 4DGS-Drive, OmniRe, PVG}};
+  \node[route=techpurple] (b3) at (23.6, 3.1) {传感器融合};
+  \node[method=techpurple] (b3_l0) at (23.6, 0.6) {多传感器融合\\{\tiny LiDAR-GS-Drive, RadarGS}};
+  \node[method=techpurple] (b3_l1) at (27.3, 0.6) {定位\\{\tiny GeomGS, LocGS, PoseGS}};
+  \node[route=techblue] (b4) at (30.9, 3.1) {3D占用与感知};
+  \node[method=techblue] (b4_l0) at (30.9, 0.6) {高斯辅助感知\\{\tiny OccGS, GaussianOcc, GS-Perc}};
+  \node[method=techblue] (b4_l1) at (35.0, 0.6) {占用估计\\{\tiny OccSplat, GSOcc}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (root) -- (b4);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+  \draw[arr] (b4) -- (b4_l0);
+  \draw[arr] (b4) -- (b4_l1);
+\end{tikzpicture}

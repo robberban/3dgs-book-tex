@@ -1,0 +1,35 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (s1) at (3.0, 0.6) {3D 高斯(数百万元素)};
+  \node[box=techblue] (s2) at (9.1, 0.6) {视锥体剔除};
+  \node[box=techgreen] (s3) at (14.8, 0.6) {实例化+Key构造};
+  \node[box=techorange] (s4) at (20.7, 0.6) {GPU基数排序};
+  \node[box=techpurple] (s5) at (25.7, 0.6) {Tile渲染};
+  \draw[arr] (s1) -- (s2);
+  \draw[arr] (s2) -- (s3);
+  \draw[arr] (s3) -- (s4);
+  \draw[arr] (s4) -- (s5);
+
+  \node[font=\scriptsize, techgray, text width=3.2cm, align=center, below=0.4cm of s1] {输入：位置、协方差、\\不透明度、SH系数};
+  \node[font=\scriptsize, techgray, text width=3.2cm, align=center, below=0.4cm of s2] {保留99\%置信区间\\与视锥体相交的高斯};
+  \node[font=\scriptsize, techgray, text width=3.2cm, align=center, below=0.4cm of s3] {每个高斯按重叠tile\\创建实例，组合键：\\高位=深度，低位=tile ID};
+  \node[font=\scriptsize, techgray, text width=3.2cm, align=center, below=0.4cm of s4] {单次$O(N)$排序\\Radix Sort\\线程块内按深度有序};
+  \node[font=\scriptsize, techgray, text width=3.2cm, align=center, below=0.4cm of s5] {每tile一个线程块\\前到后混合\\累积不透明度饱和即停};
+  \draw[techgray, thick, decorate, decoration={brace, amplitude=6pt}]
+    ([yshift=0.8cm]s1.north west) -- ([yshift=0.8cm]s2.north east)
+    node[midway, above=8pt, font=\scriptsize, techblue] {预处理};
+  \draw[techgray, thick, decorate, decoration={brace, amplitude=6pt}]
+    ([yshift=0.8cm]s3.north west) -- ([yshift=0.8cm]s4.north east)
+    node[midway, above=8pt, font=\scriptsize, techgreen] {排序};
+  \draw[techgray, thick, decorate, decoration={brace, amplitude=6pt}]
+    ([yshift=0.8cm]s5.north west) -- ([yshift=0.8cm]s5.north east)
+    node[midway, above=8pt, font=\scriptsize, techpurple] {渲染};
+\end{tikzpicture}

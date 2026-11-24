@@ -1,0 +1,18 @@
+% Part 5 导言：规模与建图
+\vspace{1em}
+\begin{center}
+\textcolor{techgray}{\small 本部分将3DGS的规模从室内场景推到城市级别——大规模分布式训练与SLAM稠密建图。}
+\end{center}
+\vspace{0.5em}
+
+\noindent\textbf{本部分包含：}
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+\item[\textcolor{techblue}{\textbullet}] \textbf{第14章}（大规模重建）— 城市场景、在线增量、分层LOD、分布式并行训练
+\item[\textcolor{techblue}{\textbullet}] \textbf{第15章}（SLAM建图）— RGB-D/单目/多模态SLAM、语义建图、动态SLAM
+\end{itemize}
+
+\noindent\textbf{阅读建议：}第14章和第15章分别处理``场景太大''和``需要在线增量建图''两个问题。如果关注离线大规模重建，重点读第14章；如果关注实时导航，重点读第15章。两者共享高斯管理的底层技术（分块、LOD、剪枝）。
+
+\noindent\textbf{与其他部分的联系：}第14章依赖第11章的压缩技术和第12章的位姿估计；第15章的SLAM系统集成了第10章的语义理解、第11章的加速策略、第6章的动态建模；第14章的城市重建结果为第18章（自动驾驶）和第20章（遥感）提供场景基础。
+
+\vspace{1em}

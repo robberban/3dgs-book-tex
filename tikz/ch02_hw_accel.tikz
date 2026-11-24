@@ -1,0 +1,43 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (40.0, 5.6) {硬件加速方案};
+  \node[route=techblue] (b0) at (12.4, 3.1) {专用 ASIC 加速器};
+  \node[method=techblue] (b0_l0) at (3.1, 0.6) {空间映射/算法-架构协同\\{\tiny Shimamura, GBU, Wang et al., Lumina}};
+  \node[method=techblue] (b0_l1) at (9.4, 0.6) {内存重构/存内计算\\{\tiny STREAMINGGS, GCC, 3DGauCIM}};
+  \node[method=techblue] (b0_l2) at (15.3, 0.6) {排序/过滤/训练集成\\{\tiny Neo, FLICKER, Vorion, 129FPS}};
+  \node[route=techgreen] (b1) at (32.8, 3.1) {GPU 管线增强};
+  \node[method=techgreen] (b1_l0) at (21.3, 0.6) {提前终止+ROP优化\\{\tiny VR-Pipe}};
+  \node[method=techgreen] (b1_l1) at (29.3, 0.6) {硬件光栅化扩展，面积开销$<$0.2\%\\{\tiny GauRast}};
+  \node[method=techgreen] (b1_l2) at (37.0, 0.6) {瓦片分组排序解耦\\{\tiny GS-TG}};
+  \node[route=techorange] (b2) at (47.5, 3.1) {软件加速框架};
+  \node[method=techorange] (b2_l0) at (43.5, 0.6) {聚类过滤+贡献感知光栅化\\{\tiny SeeLe}};
+  \node[method=techorange] (b2_l1) at (51.5, 0.6) {低分辨率渲染+解析梯度上采样\\{\tiny Niedermayr et al.}};
+  \node[method=techorange] (b2_l2) at (59.6, 0.6) {缓存优化/无序渲染，手机端\\{\tiny Texture3dgs, Mobile-GS}};
+  \node[route=techpurple] (b3) at (68.6, 3.1) {VR/AR 集成系统};
+  \node[method=techpurple] (b3_l0) at (68.6, 0.6) {注视点渲染+弹出伪影消除，72+ FPS\\{\tiny VR-Splatting, VRSplat}};
+  \node[method=techpurple] (b3_l1) at (77.3, 0.6) {功耗降低86\%/移动端训练\\{\tiny PowerGS, PocketGS}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b1) -- (b1_l2);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b2) -- (b2_l2);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+  \node[draw=techgray, fill=techgray!5, rounded corners, font=\scriptsize,
+    text width=12cm, align=center] at (40.5, -1.2) {趋势：通用 GPU 计算 $\to$ 3DGS 专用优化 $\to$ 边缘设备功耗-性能联合优化。关键指标从"FPS 加速比"扩展到"功耗/能效/移动端可用性"。};
+\end{tikzpicture}

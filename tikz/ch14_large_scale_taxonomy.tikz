@@ -1,0 +1,43 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (22.2, 5.6) {大规模与在线重建方法分类};
+  \node[route=techblue] (b0) at (7.3, 3.1) {城市场景重建};
+  \node[method=techblue] (b0_l0) at (1.5, 0.6) {分治重建\\{\tiny CityGaussian, BlockGaussian, LoBE-GS}};
+  \node[method=techblue] (b0_l1) at (5.3, 0.6) {跨视角语义\\{\tiny Horizon-GS, GS4City, DRAGON}};
+  \node[method=techblue] (b0_l2) at (9.2, 0.6) {外观优化\\{\tiny GS-Diff, ADM-GS, CityGS-X}};
+  \node[route=techgreen] (b1) at (16.4, 3.1) {在线增量重建};
+  \node[method=techgreen] (b1_l0) at (12.8, 0.6) {流式更新\\{\tiny Gaussian On-the-Fly, Splatfacto-W}};
+  \node[method=techgreen] (b1_l1) at (16.4, 0.6) {增量融合\\{\tiny TideGS, MegaGS, FreeGS}};
+  \node[route=techorange] (b2) at (22.2, 3.1) {分层与LOD};
+  \node[method=techorange] (b2_l0) at (20.3, 0.6) {层次化结构\\{\tiny Octree-GS, HUG, Scaffold-GS}};
+  \node[method=techorange] (b2_l1) at (24.1, 0.6) {核外渲染\\{\tiny Grendel, Virtual Memory GS}};
+  \node[route=techpurple] (b3) at (27.7, 3.1) {分布式并行};
+  \node[method=techpurple] (b3_l0) at (27.7, 0.6) {并行训练\\{\tiny Grendel, Distributed 3DGS}};
+  \node[method=techpurple] (b3_l1) at (31.4, 0.6) {联邦协同\\{\tiny PhotoReg, GaussReg, SIREN}};
+  \node[route=techgray] (b4) at (35.0, 3.1) {其他};
+  \node[method=techgray] (b4_l0) at (35.0, 0.6) {核外训练\\{\tiny Out-of-core GS, VastGaussian}};
+  \node[method=techgray] (b4_l1) at (38.3, 0.6) {多模态\\{\tiny Neural-MMGS, LiDAR-GS}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (root) -- (b4);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+  \draw[arr] (b4) -- (b4_l0);
+  \draw[arr] (b4) -- (b4_l1);
+\end{tikzpicture}

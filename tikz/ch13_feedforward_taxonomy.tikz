@@ -1,0 +1,45 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (25.3, 5.6) {可泛化前馈重建方法分类};
+  \node[route=techblue] (b0) at (7.7, 3.1) {多视角前馈};
+  \node[method=techblue] (b0_l0) at (1.5, 0.6) {像素对齐\\{\tiny MVSGaussian, DepthSplat, TranSplat}};
+  \node[method=techblue] (b0_l1) at (5.3, 0.6) {注意力聚合\\{\tiny HiSplat, FreeSplat, GS-LRM}};
+  \node[method=techblue] (b0_l2) at (10.0, 0.6) {Epipolar注意力\\{\tiny MVSplat, MuGS, IDESplat}};
+  \node[route=techgreen] (b1) at (19.5, 3.1) {无标定自由视角};
+  \node[method=techgreen] (b1_l0) at (14.9, 0.6) {联合位姿估计\\{\tiny NoPoSplat, Splatt3R, AnySplat}};
+  \node[method=techgreen] (b1_l1) at (19.5, 0.6) {基础模型引导\\{\tiny DUSt3R, MASt3R, VGGT}};
+  \node[route=techorange] (b2) at (25.3, 3.1) {单图到3D};
+  \node[method=techorange] (b2_l0) at (23.6, 0.6) {单图前馈\\{\tiny LRM, InstantMesh, Unique3D}};
+  \node[method=techorange] (b2_l1) at (27.3, 0.6) {LRM架构\\{\tiny GS-LRM, Large reconstruction model}};
+  \node[route=techpurple] (b3) at (33.2, 3.1) {大规模重建模型};
+  \node[method=techpurple] (b3_l0) at (31.2, 0.6) {逐像素高斯\\{\tiny pixelSplat, MVSplat, DepthSplat}};
+  \node[method=techpurple] (b3_l1) at (35.1, 0.6) {迭代精炼\\{\tiny ReSplat, GIFSplat, Diff3R}};
+  \node[method=techpurple] (b3_l2) at (39.0, 0.6) {大场景扩展\\{\tiny GS-LRM, TokenGS, GlobalSplat}};
+  \node[route=techblue] (b4) at (43.1, 3.1) {特定领域};
+  \node[method=techblue] (b4_l0) at (43.1, 0.6) {特殊传感器\\{\tiny EventGS, RadarGS}};
+  \node[method=techblue] (b4_l1) at (47.0, 0.6) {医学/卫星\\{\tiny Medical-GS, Satellite-GS}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (root) -- (b4);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+  \draw[arr] (b3) -- (b3_l2);
+  \draw[arr] (b4) -- (b4_l0);
+  \draw[arr] (b4) -- (b4_l1);
+\end{tikzpicture}

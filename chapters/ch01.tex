@@ -1,0 +1,709 @@
+\chapter{3DGS基础与全景概览}
+\label{ch:01}
+
+\paragraph*{本章阅读锚点}
+本章的锚点是原始 3DGS：高斯基元如何参数化，如何投影到屏幕，如何用可微光栅化和自适应密度控制完成训练。后续章节的所有方法都可以先问一句：它改的是表示、渲染、优化，还是数据入口。
+
+
+2020年，Mildenhall et al.（2020.03）~\cite{2003_10204}提出 Neural Radiance Fields（NeRF），将三维场景建模为连续的神经隐式场，在新视角合成（Novel View Synthesis, NVS）任务上取得了前所未有的照片级真实感。NeRF 的核心在于体渲染（Volume Rendering）：从相机发出射线，沿射线采样连续的密度场和颜色场，通过数值积分合成像素颜色。这一机制赋予了 NeRF 出色的表达能力，但也带来了根本性的效率瓶颈——射线步进（Ray Marching）需要在包括空旷空间在内的整个定义域上反复查询多层感知机（MLP），每次渲染一张图像都需要数百万次网络推理。即使借助 Instant-NGP（2022）~\cite{mueller2022instant} 的哈希加速或 Plenoxels（2022）~\cite{plenoxels} 的稀疏体素网格，渲染速度仍难以稳定达到实时帧率（$\geq$30 FPS，即每秒帧数，Frames Per Second）。而当时渲染质量最高的 Mip-NeRF 360（2022）~\cite{barron2022mipnerf360} 更是需要长达 48 小时的训练时间。
+
+2023年，Kerbl et al.（2023.08）~\cite{2308_04079}提出 3D Gaussian Splatting（3DGS），从根本上突破了上述瓶颈。3DGS 的核心设计可以归纳为三个方面：（1）\textbf{各向异性 3D 高斯基元}作为场景表示——它像可微体积表示一样便于梯度优化，又像显式基元一样可以直接光栅化；（2）\textbf{自适应密度控制}（Adaptive Density Control, ADC），从稀疏初始化出发，通过梯度引导的增删操作自动生长为密集表示；（3）\textbf{基于tile的可微分光栅化器（differentiable rasterizer）}，利用 GPU 排序和 $\alpha$-混合实现实时渲染。这一设计使 3DGS 在渲染质量上匹敌甚至超越 Mip-NeRF 360，同时实现了 1080p 分辨率下超过 100 FPS 的实时渲染。训练时间仅需 35--45 分钟。
+
+3DGS 的问世在计算机视觉与图形学领域引发了爆发式增长。短短两年内，围绕 3DGS 的研究论文已突破 2600 篇，催生了一个涵盖渲染质量提升、大规模场景处理、动态场景建模、语义分割、场景编辑、3D 内容生成、模型压缩、机器人感知、医学影像等众多方向的庞大研究生态系统。从 CVPR、ECCV、SIGGRAPH 到 NeurIPS，3DGS 已成为各类顶级学术会议中最热门的研究主题之一。与此同时，3DGS 正在从学术界向工业界快速渗透——虚拟现实（VR）、增强现实（AR）、自动驾驶、数字孪生等应用领域纷纷探索 3DGS 的落地潜力。
+
+作为全书开篇，本章旨在为读者搭建理解 3DGS 技术全貌的认知框架。第~\ref{sec:01_1}~节详细介绍 3DGS 的核心技术原理，从场景表示、投影渲染、优化训练到密度控制，为理解全书内容奠定理论基础。第~\ref{sec:01_2}~节梳理现有的领域综述文献，重点呈现不同综述的分类学观点，并与本书的六部分结构进行对比。第~\ref{sec:01_3}~节介绍与 3DGS 相关的基准评测工具和数据集，从 NeRF 时代的经典基准到 3DGS 专用的新兴数据集。第~\ref{sec:01_4}~节深入讨论 3DGS 的理论分析进展。第~\ref{sec:01_5}~节介绍开源工具生态。
+
+% ======================================================================
+% 1.1 3D Gaussian Splatting 技术详解
+% ======================================================================
+\section{3D Gaussian Splatting 技术详解}
+\label{sec:01_1}
+
+本节系统阐述 Kerbl et al.（2023.08）~\cite{2308_04079} 提出的 3D Gaussian Splatting 的完整技术流程。我们从场景表示（scene representation）出发，逐步介绍投影与渲染的数学原理、优化策略、自适应密度控制机制，以及基于tile的光栅化器（rasterizer）设计。对于每个组件，我们既给出严格的数学推导，也阐明其设计动机和物理直觉。
+
+理解本节内容是阅读全书后续章节的前提——后续章节中讨论的各种改进和扩展，本质上都是对这一基础流程中特定环节的增强。图~\ref{fig:01_pipeline}~展示了 3DGS 的完整训练与渲染流程。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.75\textwidth}{!}{\input{tikz/ch01_pipeline.tikz}}
+\caption{3D Gaussian Splatting 的训练与渲染流程。训练阶段从 SfM 稀疏点云出发，通过梯度引导的自适应密度控制（ADC）自动生长为密集表示；渲染阶段通过基于tile的可微分光栅化器实现实时渲染。}
+\label{fig:01_pipeline}
+\end{figure}
+
+\subsection{场景表示——三维高斯基元}
+\label{sec:01_1_1}
+
+3DGS 用一组各向异性的三维高斯函数来表示场景。每个高斯基元 $\mathcal{G}_k$ 由以下参数定义：
+\begin{itemize}
+\item \textbf{位置}（均值）$\boldsymbol{\mu}_k \in \mathbb{R}^3$：高斯中心的世界坐标。
+\item \textbf{协方差矩阵（covariance matrix）} $\boldsymbol{\Sigma}_k \in \mathbb{R}^{3 \times 3}$：控制高斯的形状和方向，是半正定（positive semi-definite）对称矩阵。
+\item \textbf{不透明度（opacity）} $\alpha_k \in [0, 1)$：控制高斯的不透明程度。
+\item \textbf{球谐系数}（Spherical Harmonics, SH）：编码视角依赖的颜色 $\mathbf{c}_k$，通常使用 3 阶 SH（$l=0$ 至 $l=3$，48 个系数）来精确捕捉高光等方向性外观效果。
+\end{itemize}
+
+第 $k$ 个高斯的空间分布定义为：
+
+\begin{equation}
+\label{eq:gaussian_3d}
+G_k(\mathbf{x}) = \exp\!\left(-\frac{1}{2}(\mathbf{x} - \boldsymbol{\mu}_k)^\top \boldsymbol{\Sigma}_k^{-1} (\mathbf{x} - \boldsymbol{\mu}_k)\right)
+\end{equation}
+
+其中 $\mathbf{x} \in \mathbb{R}^3$ 为空间中的任意一点。等值面（isosurface）$G_k(\mathbf{x}) = c$（$0 < c < 1$）是三维空间中的椭球面（ellipsoid），其形状和朝向完全由 $\boldsymbol{\Sigma}_k$ 决定。图~\ref{fig:01_gaussian_params}~展示了高斯基元的完整参数结构。
+
+\subsubsection{三维高斯基元的数学定义与参数化}
+
+\paragraph{为什么选择高斯？} 这一选择绝非偶然。首先，高斯函数是\textbf{可微的}——这是通过梯度下降优化参数的前提。其次，三维高斯在投影到二维后仍然保持高斯的形式（见第~\ref{sec:01_1_2}~节），因此可以高效地将其投影到屏幕空间进行渲染。第三，传统的 Surfel（表面元素）方法~\cite{yifan19,kopanas21}需要为每个点估计法线方向，高斯表示则无需法线。而 SfM 产生的稀疏点云法线估计极不稳定，这使得高斯成为从稀疏初始化出发的理想选择。最后，高斯的\textbf{各向异性}（anisotropic）特性意味着一个大而扁的椭球形高斯可以紧凑地表示一个薄壁或平面区域，从而显著减少所需的基元数量。
+
+\paragraph{协方差的参数化。} 直觉上，协方差矩阵 $\boldsymbol{\Sigma}_k$ 描述了 3D 高斯的形状：缩放矩阵 $\mathbf{S}$ 控制沿三个轴的伸展程度（椭球是扁还是长），旋转矩阵 $\mathbf{R}$ 控制朝向（椭球指向哪里）。直接优化协方差矩阵 $\boldsymbol{\Sigma}_k$ 是不可行的，因为梯度更新很容易破坏半正定约束，产生无效的协方差矩阵。为此，3DGS 采用了一个等价但便于优化的参数化方案。任何半正定对称矩阵都可以分解为旋转矩阵和缩放矩阵的乘积：
+
+\begin{equation}
+\label{eq:cov_decomp}
+\boldsymbol{\Sigma}_k = \mathbf{R}_k \mathbf{S}_k \mathbf{S}_k^\top \mathbf{R}_k^\top
+\end{equation}
+
+其中 $\mathbf{R}_k \in SO(3)$ 是旋转矩阵，由四元数（quaternion）$\mathbf{q}_k$ 参数化（4 个参数，需归一化为单位四元数）；$\mathbf{S}_k = \mathrm{diag}(s_k^{(1)}, s_k^{(2)}, s_k^{(3)})$ 是对角缩放矩阵（3 个参数）。这种分解确保了 $\boldsymbol{\Sigma}_k$ 始终是半正定的：无论 $\mathbf{R}_k$ 和 $\mathbf{S}_k$ 取何值，$\mathbf{R}\mathbf{S}\mathbf{S}^\top\mathbf{R}^\top$ 都是半正定的。每个高斯的总参数量为：位置 3 + 四元数 4 + 缩放 3 + 不透明度 1 + 球谐颜色 48 = \textbf{59 个参数}。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.7\textwidth}{!}{\input{tikz/ch01_gaussian_params.tikz}}
+\caption{3D 高斯基元的参数结构。每个高斯由位置 $\boldsymbol{\mu}$、协方差 $\boldsymbol{\Sigma}$（分解为旋转 $\mathbf{R}$ 和缩放 $\mathbf{S}$）、不透明度 $\alpha$ 和球谐系数（SH）五组参数定义，共 59 个可学习参数。}
+\label{fig:01_gaussian_params}
+\end{figure}
+
+\subsection{投影与渲染——从 3D 到 2D}
+\label{sec:01_1_2}
+
+渲染的核心问题是：如何从一组三维高斯基元计算每个像素的颜色？3DGS 的做法是将 3D 高斯投影到 2D 屏幕空间（screen space），然后通过 $\alpha$-混合合成颜色。
+
+\subsubsection{3D 到 2D 的投影}
+
+对于位于世界坐标 $\boldsymbol{\mu}_k$ 处的 3D 高斯，其投影到相机坐标系后的 2D 协方差为：
+
+\begin{equation}
+\label{eq:projection}
+\boldsymbol{\Sigma}'_k = \mathbf{J}_k \mathbf{W}_k \boldsymbol{\Sigma}_k \mathbf{W}_k^\top \mathbf{J}_k^\top
+\end{equation}
+
+其中 $\mathbf{W}_k$ 是从世界坐标到相机坐标的变换矩阵（即相机外参矩阵的前三行），$\mathbf{J}_k$ 是投影变换在 $\boldsymbol{\mu}_k$ 处的雅可比矩阵（Jacobian matrix）。$\mathbf{J}_k$ 本质上是透视投影（perspective projection）的一阶泰勒展开。
+
+这里有一个微妙但重要的事实：一个 3D 高斯经透视投影后，严格来说\textbf{不再是精确的 2D 高斯}（透视变换是非线性的）。但通过局部仿射近似（local affine approximation，即只保留一阶项），投影后的分布可用 2D 高斯很好地近似。这种近似在绝大多数实际场景中是足够精确的。
+
+省略 $\boldsymbol{\Sigma}'_k$ 的第三行和第三列，得到 $2 \times 2$ 的屏幕空间协方差矩阵。Zwicker et al.（2001）~\cite{zwicker2001ewa} 证明，这个 $2 \times 2$ 矩阵与直接从带有法线的平面点出发进行 2D splatting 所得的结果完全一致。换言之，3D 高斯的投影自动退化为等效的 2D splatting，无需显式估计法线。
+
+\subsubsection{$\alpha$-混合渲染方程}
+
+每个像素 $\mathbf{x}$ 的颜色通过前到后（front-to-back）的 $\alpha$-混合计算：
+
+\begin{equation}
+\label{eq:alpha_blending}
+C(\mathbf{x}) = \sum_{k=1}^{K} c_k \, \alpha_k \, G_k^{2D}(\mathbf{x}) \prod_{j=1}^{k-1}\left(1 - \alpha_j \, G_j^{2D}(\mathbf{x})\right)
+\end{equation}
+
+其中 $K$ 为覆盖该像素的高斯数量（按深度排序），$c_k$ 为第 $k$ 个高斯在该视角下的颜色（由球谐函数计算），$\alpha_k$ 为其不透明度，$G_k^{2D}(\mathbf{x})$ 为投影后的 2D 高斯在像素 $\mathbf{x}$ 处的值。乘积项 $\prod_{j=1}^{k-1}(1-\alpha_j G_j^{2D})$ 正是\textbf{透射率}（transmittance）$T_k$，即光线穿过前 $k-1$ 个高斯后剩余的比例。
+
+\subsubsection{NeRF 与 3DGS 渲染方程的等价性}
+
+一个关键的数学事实是：3DGS 的 $\alpha$-混合渲染方程与 NeRF 的体渲染方程，二者的图像形成模型（image formation model）\textbf{完全相同}。
+
+NeRF 通过沿射线采样密度场（density field）来计算颜色。具体地，将射线离散化为 $N$ 个采样点，颜色由如下求积公式给出：
+
+\begin{equation}
+\label{eq:nerf_volume}
+C = \sum_{i=1}^{N} T_i \left(1 - e^{-\sigma_i \delta_i}\right) \mathbf{c}_i, \quad T_i = \exp\!\left(-\sum_{j=1}^{i-1} \sigma_j \delta_j\right)
+\end{equation}
+
+其中 $\sigma_i$ 为密度，$\delta_i$ 为相邻采样点之间的距离，$T_i$ 为透射率，$\mathbf{c}_i$ 为采样点颜色。
+
+现在令 $\alpha_i = 1 - e^{-\sigma_i \delta_i}$，则透射率可以改写为：
+
+\begin{equation}
+\label{eq:transmittance_product}
+T_i = \exp\!\left(-\sum_{j=1}^{i-1} \sigma_j \delta_j\right) = \prod_{j=1}^{i-1} e^{-\sigma_j \delta_j} = \prod_{j=1}^{i-1}(1 - \alpha_j)
+\end{equation}
+
+将式~(\ref{eq:transmittance_product})代入式~(\ref{eq:nerf_volume})，得到：
+
+\begin{equation}
+\label{eq:nerf_alpha}
+C = \sum_{i=1}^{N} T_i \alpha_i \mathbf{c}_i = \sum_{i=1}^{N} \mathbf{c}_i \alpha_i \prod_{j=1}^{i-1}(1 - \alpha_j)
+\end{equation}
+
+对比式~(\ref{eq:nerf_alpha})和式~(\ref{eq:alpha_blending})，两者的数学形式完全一致。
+
+\paragraph{等价性的意义。} 这一等价性解释了 3DGS 为何能在渲染质量上与 NeRF 匹敌——它们使用的是同一个图像形成模型。区别在于\textbf{实现方式}：NeRF 通过射线步进在连续的隐式密度场（implicit density field）上采样，代价高昂但表达灵活；3DGS 通过光栅化（rasterization）在离散的显式高斯基元（explicit Gaussian primitive）上混合，高效并行但依赖基元质量。3DGS 的核心洞察在于：既然图像形成模型相同，那么只要高斯基元足够密集，显式表示完全可以达到隐式表示的渲染质量。而 GPU 光栅化天然比射线步进更适合并行计算。图~\ref{fig:01_nerf_vs_3dgs}~直观对比了两种方法的渲染流程。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.85\textwidth}{!}{\input{tikz/ch01_nerf_vs_3dgs.tikz}}
+\caption{NeRF 与 3DGS 的渲染流程对比。两者使用数学上等价的图像形成模型，但实现方式截然不同：NeRF 通过射线步进查询隐式 MLP，3DGS 通过光栅化混合显式高斯基元。}
+\label{fig:01_nerf_vs_3dgs}
+\end{figure}
+
+\subsection{优化与训练策略}
+\label{sec:01_1_3}
+
+\subsubsection{损失函数}
+
+3DGS 的训练目标是最小化渲染图像与真实图像之间的差异。损失函数为 $\mathcal{L}_1$ 损失和 D-SSIM 损失的加权组合：
+
+\begin{equation}
+\label{eq:loss}
+\mathcal{L} = (1 - \lambda)\mathcal{L}_1 + \lambda\mathcal{L}_{\text{D-SSIM}}
+\end{equation}
+
+其中 $\lambda = 0.2$。$\mathcal{L}_1$ 损失确保像素级的亮度保真，D-SSIM 损失则补充了结构相似性约束，两者互补：$\mathcal{L}_1$ 擅长捕捉全局色调偏差，D-SSIM 擅长捕捉局部结构和纹理失真。
+
+\subsubsection{参数优化}
+
+所有可学习参数（位置 $\boldsymbol{\mu}$、四元数 $\mathbf{q}$、缩放 $\mathbf{s}$、不透明度 $\alpha$、球谐系数）通过随机梯度下降（Stochastic Gradient Descent, SGD）联合优化。为避免自动微分（automatic differentiation）带来的显著开销，3DGS 对所有参数手动推导了梯度公式。
+
+为确保参数在有效范围内，3DGS 使用了特定的激活函数：
+\begin{itemize}
+\item \textbf{不透明度}：sigmoid 激活函数，将 $\alpha$ 约束在 $[0, 1)$ 范围内，同时提供平滑梯度。
+\item \textbf{缩放}：指数激活函数，确保缩放因子始终为正值。
+\item \textbf{四元数}：每次更新后归一化为单位四元数，确保 $\mathbf{R}_k$ 始终是有效的旋转矩阵。
+\end{itemize}
+
+\subsubsection{初始化与预热}
+
+训练的起点是由 Structure-from-Motion（SfM）（2016）~\cite{schoenberger2016sfm} 从输入图像中提取的稀疏点云。在每个 SfM 点处初始化一个各向同性（isotropic）高斯，其协方差设置为单位矩阵乘以该点到最近三个邻居的平均距离。有意思的是，即使使用随机初始化（如在 NeRF Synthetic 数据集上的实验），3DGS 仍能获得高质量的重建结果——这归功于 ADC 能自动从稀疏状态长出密集表示。
+
+训练采用渐进式预热（progressive warmup）策略：从 $1/4$ 分辨率开始训练，在第 250 和 500 次迭代时分别将分辨率上采样至 $1/2$ 和全分辨率。类似地，球谐波段也是逐步引入的：从 0 阶（仅 DC 分量，DC component）开始，每 1000 次迭代增加一个波段，直到第 3000 次迭代达到全部 3 阶（4 个波段）。位置的学习率按指数衰减，类似 Plenoxels（2022）~\cite{plenoxels} 的策略。整个训练过程约需 7000--30000 次迭代，在 GPU 上 35--45 分钟即可完成。
+
+\subsubsection{训练流程总览}
+
+完整的 3DGS 训练流程可以概括为以下步骤：
+\begin{enumerate}
+\item \textbf{SfM 预处理}：从输入图像集中估计相机位姿和稀疏点云。
+\item \textbf{初始化}：在每个 SfM 点处创建各向同性高斯，参数随机初始化。
+\item \textbf{迭代优化}：交替执行参数梯度更新和自适应密度控制（每 100 次迭代执行一次 ADC）。
+\item \textbf{收敛}：训练结束后，每个场景由 100 万到 500 万个高斯基元组成。
+\end{enumerate}
+
+\subsection{自适应密度控制（ADC）}
+\label{sec:01_1_4}
+
+自适应密度控制（Adaptive Density Control, ADC）是 3DGS 训练中最核心的非可微操作（non-differentiable operation）。稀疏 SfM 点云只有几百个点，ADC 要解决的核心问题是：如何自动将其生长为数百万个高斯，同时保证高斯分布在需要的位置。
+
+\subsubsection{触发条件}
+
+ADC 在优化预热完成后每 100 次迭代执行一次。其触发条件基于\textbf{视图空间位置梯度}（view-space positional gradient）：如果一个高斯在多个训练视图中的位置梯度平均幅值超过阈值 $\tau_{\mathrm{pos}} = 0.0002$，则认为该高斯所在区域尚未被充分重建，需要增密。
+
+这个条件的道理很简单：如果优化过程持续试图移动某个高斯（产生大的位置梯度），说明该区域当前的几何表示不够好——要么缺少足够的基元（重建不足），要么现有基元过大无法精确拟合细节（重建过度）。
+
+\subsubsection{三种增密操作}
+
+ADC 根据高斯的尺寸采用不同的增密策略：
+
+\paragraph{克隆（Clone）。} 对于尺寸较小的高斯（最大缩放分量低于场景范围的 1\%），如果其梯度超过阈值，则创建一个与原高斯完全相同的副本，并将其沿位置梯度方向移动一小段距离。在随后的参数优化中，这两个重叠的高斯会被逐渐拉开，分别覆盖不同的区域。
+
+\textbf{效果}：增加系统的总基元数量和总覆盖体积——填补空白区域。
+
+\paragraph{分裂（Split）。} 对于尺寸较大的高斯，如果其梯度超过阈值，则将其替换为两个更小的高斯。子高斯的缩放为父高斯的 $1/\phi$（$\phi = 1.6$，实验确定），位置从父高斯的协方差分布中随机采样。
+
+\textbf{效果}：保持系统的总覆盖体积不变，但将一个大基元细分为两个更精确的小基元——细化已有结构。
+
+\paragraph{剪枝（Prune）。} 系统周期性地执行三种剪枝操作来控制高斯总数：(1) 删除不透明度低于阈值 $\epsilon_\alpha$ 的几乎透明的高斯；(2) 删除在世界空间中过大的高斯和在视图空间中 footprint 过大的高斯；(3) 每隔 $N = 3000$ 次迭代，将所有高斯的不透明度重置为接近零的值，然后由优化过程自行决定哪些高斯需要恢复。这是一种有效的"去飘浮"（anti-floater）机制，专门针对靠近相机但不对应真实几何的虚假高斯。
+
+\subsubsection{设计原理}
+
+克隆、分裂和剪枝三种操作形成了一个完整的生命周期：克隆填充空白区域（增加体积），分裂细化已有表示（细分体积），剪枝移除冗余和错误（控制总量）。这种三位一体的机制实现了从稀疏初始化到密集表示的自动化生长，无需人工干预，也不需要针对不同场景调整超参数。
+
+需要强调的是，3DGS 中的高斯始终是三维空间中的独立基元，不需要像 Mip-NeRF 360（2022）~\cite{barron2022mipnerf360} 或 Plenoxels（2022）~\cite{plenoxels} 那样的空间压缩、收缩或投影策略来处理远处或大型高斯。这种简洁性是 3DGS 易于扩展和修改的重要原因。
+
+\subsection{基于tile的可微分光栅化器}
+\label{sec:01_1_5}
+
+3DGS 的实时渲染能力归功于其精心设计的 tile-based 可微分光栅化器。这一设计受到 Pulsar（2021）~\cite{Lassner_2021_CVPR} 的启发，但在关键方面做出了不同的选择。图~\ref{fig:01_rasterizer}~展示了光栅化器的完整管线。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.95\textwidth}{!}{\input{tikz/ch01_rasterizer.tikz}}
+\caption{Tile-based 可微分光栅化器的四阶段管线。3D 高斯经过视锥体剔除、实例化与键构造、GPU 基数排序和 Tile 级 $\alpha$-混合，最终渲染出图像。整个管线在 GPU 上高度并行化。}
+\label{fig:01_rasterizer}
+\end{figure}
+
+\subsubsection{为什么基于tile？}
+
+朴素的方法是为每个像素独立排序覆盖该像素的高斯——这需要逐像素排序，计算量极大。3DGS 的解决方案是将屏幕划分为 $16 \times 16$ 像素的 tile，在每个 tile 内进行统一的排序和混合。这一设计大幅减少了排序开销：一个 $1920 \times 1080$ 的图像只需要 $120 \times 68 = 8160$ 个tile，而非 $2{,}073{,}600$ 个像素级别的排序操作。
+
+\subsubsection{渲染管线}
+
+光栅化器的完整管线包含四个步骤：
+
+\begin{enumerate}
+\item \textbf{视锥体剔除（frustum culling）}：对于每个高斯，以其中心为原点向外扩展 3 个标准差作为影响范围（超出此范围后高斯值已可忽略），判断该范围是否与相机视锥体相交——不相交则剔除。同时使用保护带（guard band）快速拒绝中心在极端位置的高斯——这些高斯的投影协方差计算可能数值不稳定。
+\item \textbf{实例化（instantiation）}：根据每个高斯重叠的tile数量创建相应数量的实例，为每个实例分配一个组合键（key），高位存储视图空间深度，低位存储tile ID。
+\item \textbf{排序}：使用单次 GPU 基数排序（Radix Sort）（2010）~\cite{merrill2010revisiting} 按键排序。排序结果自然地保证了：同一tile内的高斯按深度从近到远排列，且不同tile的高斯也被分离。
+\item \textbf{渲染}：为每个tile启动一个 GPU 线程块（thread block）。线程块内的线程协作地将高斯数据加载到共享内存中，然后对每个像素执行前到后的 $\alpha$-混合遍历。当某个像素的累积不透明度达到饱和（$\alpha \to 1$）时，该像素停止处理。整个tile在所有像素都饱和后终止。
+\end{enumerate}
+
+\subsubsection{反向传播}
+
+可微分渲染的关键在于高效的反向传播。3DGS 的反向传播需要在每个像素上恢复前向传播时的完整混合序列，以计算每个高斯参数的梯度。
+
+朴素的做法是在前向传播时为每个像素存储所有参与混合的高斯列表——这需要大量动态内存管理。3DGS 采用了更优雅的方案：\textbf{后到前重新遍历}（back-to-front retraversal）。具体地：
+\begin{enumerate}
+\item 在前向传播中，每个像素只存储最终的累积不透明度 $\alpha_{\mathrm{acc}}$。
+\item 在反向传播中，利用已排序的高斯列表从后到前重新遍历。
+\item 对于第 $k$ 个高斯，前向传播时该点之前的透射率 $T_k = \alpha_{\mathrm{acc}} / (\alpha_k \, G_k^{2D})$——即通过除以当前高斯的贡献来恢复中间状态。
+\end{enumerate}
+
+这种方案避免了动态内存分配（dynamic memory allocation），仅需要常数级别的额外存储（每像素一个 $\alpha_{\mathrm{acc}}$ 值），同时支持\textbf{任意数量}的高斯接收梯度更新。
+
+\subsubsection{与先前工作的关键区别}
+
+3DGS 的光栅化器与 Pulsar（2021）~\cite{Lassner_2021_CVPR} 有两个根本性的区别。第一，Pulsar 使用与顺序无关的渲染（order-independent rendering），而 3DGS 通过排序保持了近似的可见性顺序（visibility order）——这对于体渲染的物理正确性至关重要。第二，Pulsar 限制每个像素只有 $N=5$ 个最近基元可以接收梯度，而 3DGS 不设置任何上限。消融实验（ablation study）表明，这一选择影响显著：将接收梯度的高斯数量限制为 10 个会导致 PSNR 下降约 11 dB。
+
+\subsubsection{近似与精度}
+
+tile级排序意味着同一tile内所有像素共享相同的深度顺序，因此 $\alpha$-混合只是一种\textbf{近似}——在极端情况下，同一tile内不同像素的最优排序可能不同。然而，这种近似随着高斯基元尺寸接近像素大小而变得可以忽略不计。在实践中，训练收敛后的场景几乎不产生可见的排序伪影（sorting artifact）。
+
+\subsection{设计选择如何塑造后续研究}
+\label{sec:01_1_6}
+
+原始 3DGS 的每一个设计选择，都既带来了优势，也留下了改进空间。表~\ref{tab:design_research}~总结了这些设计选择与后续研究方向的对应关系。
+
+\begin{table}[htbp]
+\centering
+\caption{3DGS 的设计选择与后续研究方向}
+\label{tab:design_research}
+\begin{tabularx}{\textwidth}{@{}l@{\hspace{1em}}X@{}}
+\toprule
+\textbf{设计选择} & \textbf{后续研究方向} \\
+\midrule
+每个高斯仅有单一尺度层级 & 抗锯齿（anti-aliasing）与多尺度渲染（multi-scale rendering）（第~\ref{sec:02_1}~节） \\
+启发式密度控制（heuristic density control，ADC） & 密度控制改进（第~\ref{sec:02_2}~节） \\
+无几何正则化（regularization） & 伪影消除与正则化（第~2~章） \\
+高斯基元（高斯核） & 替代核函数（alternative kernel）与基元设计（primitive design）（第~3~章） \\
+无表面约束（surface constraint） & 几何重建（geometric reconstruction）与表面提取（surface extraction）（第~4~章） \\
+无材质分解（material decomposition） & 逆渲染（inverse rendering）与重光照（relighting）（第~5~章） \\
+仅限静态场景 & 动态/4D 场景建模（第~6~章） \\
+无物理仿真 & 物理感知（physics-aware）的 3DGS（第~7~章） \\
+无生成能力 & 文本/图像到 3D 生成（第~8~章） \\
+不可编辑 & 场景编辑与操控（第~9~章） \\
+大存储开销 & 模型压缩与紧凑化（第~11~章） \\
+依赖密集输入视角 & 稀疏视角（sparse views）与泛化（generalization）（第~12~章） \\
+仅限小场景 & 大规模场景处理（第~14~章） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+这张路线图揭示了 3DGS 研究的一个核心模式：几乎所有的后续工作都可以理解为对原始设计中某个"不做"或"简化"的补全。在接下来的章节中，我们将逐一探讨这些改进方向。图~\ref{fig:01_book_roadmap}~展示了全书的六部分结构。
+
+\begin{figure}[p]
+\centering
+\resizebox{!}{0.85\textheight}{\input{tikz/ch01_book_roadmap.tikz}}
+\caption{全书结构路线图。全书分为六部分：Part~I（表示与渲染）是后续各部分的技术基础，各部分按技术依赖关系递进排列。}
+\label{fig:01_book_roadmap}
+\end{figure}
+
+\begin{takeaway}
+3DGS 的核心技术由三大支柱构成：各向异性高斯基元作为场景表示、梯度引导的自适应密度控制实现从稀疏到密集的自动化生长、基于tile的可微分光栅化器实现实时渲染。3DGS 与 NeRF 共享数学上等价的图像形成模型（$\alpha$-混合），但用显式基元的光栅化取代了隐式场的射线步进。这使得 3DGS 在渲染质量匹敌 Mip-NeRF 360 的同时，实现了超过 100 FPS 的实时渲染。
+\end{takeaway}
+
+% ======================================================================
+% 1.2 领域综述与分类观点
+% ======================================================================
+
+
+\section{领域综述与分类观点}
+\label{sec:01_2}
+
+自 3DGS 问世以来，大量综述论文从不同视角和粒度对其进行了系统梳理。本节不再逐篇罗列这些综述，而是提炼它们各自的\textbf{分类视角}（taxonomic perspective）——即不同综述是如何组织 3DGS 研究版图的，并与本书的六部分结构进行对比，帮助读者理解不同分类方式的异同。
+
+\subsection{主要综述的分类框架}
+
+以下介绍 4 篇代表性综述的分类学观点：Dalal et al.（2024.05）~\cite{2405_03417} 的四维度分类、Bao et al.（2024.07）~\cite{2407_17418} 的双层面结构化分类、Kerbl（2025.10）~\cite{2510_26694} 的影响力与轨迹视角、以及 He et al.（2025.08）~\cite{2508_09977} 的下游任务导向分类。
+
+\subsubsection{四维度分类框架详解}
+
+\paragraph{四维度分类综述。} 这是最早的几篇 3DGS 综述之一，按照四个维度组织文献：输入类型（图像/视频/深度）、模型结构（高斯参数化/优化策略）、输出表示（渲染质量/几何精度）和训练策略（损失函数/正则化）。该综述讨论了大场景处理、动态场景和编辑能力等未解决挑战，但分类粒度较粗，未深入技术模块级别。
+
+\paragraph{双层面结构化分类综述。} 这是目前最系统化的 3DGS 综述。在\textbf{任务层面}，将下游工作按动机分为优化（提升质量/效率）、应用（机器人/医学/扩展现实（Extended Reality, XR））和扩展（动态/生成）三类。在\textbf{技术层面}，系统总结了 3DGS 九类核心模块的改进方案：初始化、属性配置、Splatting 算子、正则化、训练策略、自适应密度控制、后处理、与其他表示的集成、以及额外先验指导。该综述还归纳出四项根本性挑战：数据效率、泛化能力、大规模处理和动态建模。
+
+\paragraph{影响力与轨迹视角综述。} 该综述从技术影响力与发展轨迹出发，审视 3DGS 的演进，聚焦于哪些方向取得了实质性进展、哪些方向仍停滞不前，以及未来可能突破的方向。
+
+\paragraph{下游任务导向综述。} 该综述聚焦于 3DGS 的三大核心下游任务：分割、编辑和生成，系统综述了每个任务中的代表性方法、监督策略和学习范式，总结出共享的设计原则。
+
+\subsection{与本书六部分结构的比较}
+
+表~\ref{tab:survey_comparison}~比较了主要综述的分类方式与本书的六部分结构。
+
+\begin{table}[htbp]
+\centering
+\caption{综述分类与本书结构对比}
+\label{tab:survey_comparison}
+\begin{tabular}{lcccc}
+\toprule
+& \textbf{Dalal} & \textbf{Bao} & \textbf{He} & \textbf{本书} \\
+\midrule
+表示与渲染 & $\checkmark$ & $\checkmark$ & — & Part~I \\
+外观与动态 & $\checkmark$ & $\checkmark$ & — & Part~II \\
+生成与交互 & — & $\checkmark$ & $\checkmark$ & Part~III \\
+系统与优化 & — & 部分 & — & Part~IV \\
+应用领域 & $\checkmark$ & $\checkmark$ & — & Part~V \\
+理论/工具/评测 & — & — & — & Ch1 专题 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+本书的分类逻辑与现有综述有三个关键区别：
+
+第一，\textbf{技术分层}。多数综述按应用领域组织；本书按技术依赖关系分层——表示/渲染（Part~I）是外观/动态（Part~II）的基础，后者又是生成/交互（Part~III）的基础，依次递进。读者可以按序阅读，逐步建立知识体系。
+
+第二，\textbf{系统优化的独立地位}。现有综述很少把系统级问题（压缩、加速、鲁棒重建、大规模处理）单独列为一类。本书 Part~IV 专门讨论这些贯穿性问题（cross-cutting concerns）——它们不只影响特定应用，更影响着 3DGS 走向实际部署的所有场景。
+
+第三，\textbf{基础资源的集中呈现}。理论分析、开源工具和评测基准在综述中通常散布在各处，本书将它们集中在第一章，为后续所有章节提供统一的参考基线。
+
+\subsection{特定方向综述}
+
+除了上述综合性综述，大量工作聚焦于 3DGS 在特定领域的应用。以下按领域分组简要列举各方向的代表性综述，详细内容将在对应的应用章节中展开：
+
+\textbf{机器人。}Ming et al.（2024.05）~\cite{2405_05526}综述了 NeRF 和 3DGS 在自主机器人感知、定位导航和决策中的应用现状与未来方向。Irshad et al.（2024.10）~\cite{2410_20220}基于 200 余篇论文系统梳理了包括 3DGS 在内的四大神经场框架在位姿估计、操控、导航、物理建模和自动驾驶五大机器人领域的应用。Zhu et al.（2024.10）~\cite{2410_12262}则首次专门综述了 3DGS 在机器人中的应用，将相关工作按场景理解（定位/SLAM（同步定位与建图）、语义分割）和交互（抓取、导航、操作）进行分类。最近，Irshad et al.（2025.12）~\cite{2512_03422}从几何表示到基础模型的视角比较了各种 3D 场景表示在机器人中的优劣（详见第~17~章）。
+
+\textbf{人体建模。}Wang et al.（2024.06）~\cite{2406_04253}从重建和生成两个角度系统梳理了 3D 人体头像建模技术，涵盖基于像素对齐隐函数、NeRF 和 3DGS 的重建方法以及基于 CLIP（对比语言-图像预训练，Contrastive Language-Image Pre-training）和扩散模型的生成方法（详见第~16~章）。
+
+\textbf{医学影像。}Xu et al.（2024.08）~\cite{2408_04426}系统综述了机器人微创手术中可变形组织的 3D 重建技术，复现并评估了 NeRF 和 3DGS 方法在手术场景数据集上的表现，证明了实时高质量重建的可行性（详见第~19~章）。
+
+\textbf{扩展现实（XR）。}Qiu et al.（2024.12）~\cite{2412_06257}分析了 272 篇 3DGS 论文中与 XR 相关的工作，发现 152 篇提及 XR 但多数仅泛泛提及，揭示了 3DGS 在 XR 中直接应用的巨大空白。该综述最有价值的发现是：首次用数据揭示了 XR 领域对 3DGS ``关注度高、实际应用少''的落差。Li et al.（2025.08）~\cite{2508_04326}遵循 PRISMA 2020 指南系统调研了 365 篇辐射场相关论文中涉及 XR 的 66 篇详细贡献，明确了辐射场在 XR 中的应用愿景、实施现状和研究空白。
+
+\textbf{数字孪生。}Melnik et al.（2025.04）~\cite{2504_13159}从几何、外观、动态、物理和语义五个维度系统梳理了从视觉数据生成数字孪生的方法，特别关注了 3DGS 在实时渲染、场景编辑和语义集成中的应用。该综述的突出之处是提出了一个多维质量评估框架，把数字孪生的保真度从单一渲染指标扩展到了几何精度、外观真实感、时序一致性和语义完整性四个层面。
+
+\textbf{视觉增强与重建。}Huang et al.（2025.05）~\cite{2505_01869}首次对水下视觉增强与 3D 重建进行全面系统综述，涵盖从非学习方法到 NeRF 和 3DGS 的技术演进，建立了纯 3D、两阶段和端到端三种重建流水线范式的基准评估。Li et al.（2025.05）~\cite{2505_00737}则聚焦植物表型分析中的 3D 重建技术，系统覆盖经典方法、NeRF 和 3DGS 三大范式在农业场景中的应用。
+
+\textbf{事件相机。}Xu et al.（2025.05）~\cite{2505_08438}提供了首个专门针对事件相机 3D 重建的综合综述，系统分析了从几何方法到 NeRF 和 3DGS 神经渲染的技术演进路线。该综述的关键洞察在于：事件相机的异步高动态范围特性与 3DGS 的显式基元表示天然互补——事件流提供高频运动信号，高斯基元提供高效渲染能力，两者结合有望实现极端光照条件下的实时三维感知。
+
+\textbf{对抗安全。}Hull et al.（2024.11）~\cite{2411_09749}提出了首个基于可微渲染（包括 3DGS 和 NeRF）的对抗攻击综合综述，按攻击目标（纹理操控、光照操控、网格操控）和攻击任务分类 28 篇文献，识别了研究空白并指明未来方向。该工作的核心发现是：可微渲染管线的端到端梯度通路在带来高质量重建的同时，也为对抗性扰动敞开了大门——对训练图像的微小篡改即可导致重建场景的系统性失真。
+
+\textbf{语义场景理解。}Zaouali et al.（2025.08）~\cite{2508_05064}提供了首个关于语言嵌入与 3DGS 结合的全面综述，涵盖理论基础、集成策略和实际应用，指出了计算瓶颈、泛化性和语义标注数据稀缺等关键限制。值得指出的是，视觉语言模型（VLM）的快速发展正在深刻影响 3DGS 的语义理解能力——Vision Language Models（2025.10）~\cite{2510_09586}对超过 26,000 篇论文的综述表明，VLM 作为 2D 先验正在成为 3DGS 语义分割、开放词汇理解和语言驱动编辑等任务的核心基础设施。
+
+\textbf{低级视觉。}Kwon et al.（2025.06）~\cite{2506_16262}提出 R$^3$eVision 综述，首次系统梳理 3D 低级视觉（3D LLV）领域——将超分辨率、去模糊、天气退化去除等 2D 任务扩展到 3D 空间域，形式化了退化感知渲染问题。该综述提出了"退化-表示-渲染"三维联合建模框架，将 2D 图像恢复中成熟的退化模型与 3DGS 的显式表示相结合。
+
+\textbf{4D 表示。}Advances in 4D Representation（2025.10）~\cite{2510_19255}系统梳理了 4D 表示中几何、运动和交互的最新进展。Liang et al.（2024.12）~\cite{2412_04457}通过控制性合成数据集首次对单目动态高斯泼溅方法进行统一基准测试，发现高斯方法渲染速度快（20--200 FPS）但图像质量不如神经场方法 TiNeuVox，且优化过程不够稳定。
+
+\textbf{无人机。}Teikari et al.（2025.08）~\cite{2508_01965}综述了自主室内无人机结合 3DGS 主动重建和多种传感模态如何实现客观化的房产物理属性评估。该综述的独到之处是把 3DGS 从单纯的视觉重建工具提升为物理测量基础设施——高斯基元的显式几何属性可以直接用于计算房间面积、墙体平整度等建筑质量指标。
+
+\textbf{跨领域综述。}From Fields to Splats（2025.09）~\cite{2509_23555}提供了从神经场到高斯泼溅的跨领域综述。该综述系统比较了隐式连续表示与显式离散表示在表示效率、编辑灵活性和渲染速度三个维度上的本质取舍，指出两种范式正走向融合而非彼此取代。A Survey of Spatial Memory Representations（2026.04）~\cite{2604_16482}探讨了用于高效机器人导航的空间记忆表示方法。该综述将 3DGS 定位为拓扑-度量混合地图的底层表示，指出高斯基元的可索引性和实时渲染能力使其特别适合在导航任务中同时支持全局路径规划和局部避障。
+
+\subsection*{3D 表示方法综述}
+
+另一类综述将 3DGS 置于更广阔的 3D 表示方法谱系中进行比较分析。Wang et al.（2024.10）~\cite{2410_06475}系统回顾了包括体素网格、点云、网格、符号距离函数（SDF）、NeRF、3DGS、三平面和深度行进四面体（DMTet）在内的八类主流 3D 表示方法的演进脉络和技术特点，帮助研究者根据需要选择合适的场景表示。Bai et al.（2024.07）~\cite{2407_08137}则聚焦 NeRF、Latent Diffusion Model 和 3DGS 三类深度学习 3D 重建技术，从算法层面详细分析了各方法的原理、优劣权衡和未来研究轨迹。
+
+\subsection*{相关技术综述}
+
+此外，一些综述虽然不以 3DGS 为核心主题，但对其所依赖的基础技术进行了深入梳理。Wang et al.（2024.08）~\cite{2408_15235}全面综述了基于学习的多视角立体（MVS，Multi-View Stereo）方法，将学习方法分为深度图方法、体素方法、NeRF 方法、3DGS 方法和大型前馈方法五大类别，汇总了各方法在 DTU、Tanks and Temples 等主流基准上的性能数据。
+
+\begin{takeaway}
+现有 3DGS 综述从四个维度组织文献：按应用领域分类、按技术模块分类、按影响力与轨迹分类、按下游任务分类。本书采用按技术依赖关系分层的六部分结构，区别于现有综述的关键在于将系统级问题（压缩、加速、鲁棒性）独立成篇，并将理论、工具和评测集中在首章为全书提供统一参考基线。
+\end{takeaway}
+
+% ======================================================================
+% 1.3 基准评测与数据集
+% ======================================================================
+
+\subsection{近期方法脉络：领域综述与全景概览}
+
+这一组近期工作延续 3DGS，主要把改动集中在增量改进等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{Recent Advances and Trends in Learning-based 3D Representations}
+Recent Advances and Trends in Learning-based 3D Representations（2026.06）~\cite{2606_04871} 延续 3DGS 在“领域综述与全景概览”上的基本设定，主要改变是：学习式3D表示综述，覆盖mesh、point cloud、NeRF、3DGS等神经/primitive表示。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：从效率、质量、任务适配和应用领域角度总结现代3D表示，为选择3DGS或其他表示提供横向视角。
+具体而言，论文组织传统几何表示和现代神经/显式primitive表示，讨论重建、NVS、生成、机器人、驾驶和医学等应用趋势。
+适用边界是：覆盖面较宽，3DGS细节和方法谱系深度有限。
+\section{基准评测与数据集}
+\label{sec:01_3}
+
+评测基准和数据集是 3DGS 研究的基石。本节按时间线组织：首先介绍 3DGS 之前就已存在的经典数据集（但至今仍是核心评估基准），然后梳理 3DGS 时代新兴的专用基准和评测方法。
+
+\subsection{经典基准数据集}
+
+以下数据集虽然诞生于 NeRF 时代甚至更早，但 3DGS 原始论文即在其上完成评测，它们至今仍是 3DGS 方法的标准评测基准。
+
+\begin{itemize}
+\item \textbf{NeRF Synthetic / Blender}（2020.03）~\cite{2003_10204}（2020年）：8 个合成物体场景，360 度完整视角覆盖，提供精确的相机参数和真值图像。3DGS 在此数据集上渲染速度极快（180--300 FPS），且即使使用随机初始化（而非 SfM 点云）也能获得高质量结果。
+
+\item \textbf{LLFF}（2019）~\cite{mildenhall2019llff}（2019年）：8 个真实场景，采用手持手机前向拍摄（相机不环绕物体，仅在一个朝向采集）。LLFF 是早期 NeRF 和稀疏视角方法的主要评估基准。
+
+\item \textbf{Mip-NeRF 360}（2022）~\cite{barron2022mipnerf360}（2022年）：9 个无界真实场景（5 个室外、4 个室内），是目前新视角合成质量评测的\textbf{黄金基准}。3DGS 在此数据集上首次实现了与 Mip-NeRF 360 相当甚至更好的渲染质量，同时保持实时渲染速度。
+
+\item \textbf{Tanks and Temples}（2017）~\cite{knapitsch2017tanks}（2017年）：大规模室外场景的 MVS 基准。3DGS 原始论文使用其中的 Truck 和 Train 两个场景进行评估。
+
+\item \textbf{Deep Blending}（2018）~\cite{hedman2018deep}（2018年）：室内场景数据集，包含 Playroom 和 DrJohnson 两个场景，是 3DGS 原始论文的另一个主要评估数据集。
+
+\item \textbf{DTU}（2014）~\cite{jensen2014large}（2014年）：多视角立体匹配基准，包含 16 个物体扫描和真值点云，主要用于\textbf{几何精度}评估（如 Chamfer Distance）。
+
+\item \textbf{BlendedMVS}（2020）~\cite{yao2020blendedmvs}（2020年）：大规模 MVS 数据集，包含 113 个场景，广泛用于几何和表面重建评估。
+
+\item \textbf{ScanNet}（2017）~\cite{dai2017scannet}（2017年）：包含 1513 个室内 RGB-D 扫描场景，主要用于 SLAM（同步定位与建图）和语义理解任务评估。
+\end{itemize}
+
+\subsection{3DGS 专用基准}
+
+针对 3DGS 的特点和难点，研究者构建了多个专用评测框架。Liang et al.（2024.12）~\cite{2412_04457}创建了首个面向单目动态 3DGS 方法的统一基准测试，通过控制性合成数据集隔离相机基线、物体运动速度等影响因素，系统分类运动表征类型并量化其影响，结果表明：高斯方法渲染速度快，但优化过程较为脆弱。
+
+在压缩质量评估方面，Yang et al.（2024.07）~\cite{2407_14197}提出首个基于传统信号处理框架（图信号处理）的 3DGS 压缩方法 GGSC并创建了 GSQA 质量评估数据集（120 个样本），通过主观实验收集 MOS（Mean Opinion Score，平均意见分）分数，揭示了不同属性失真对视觉质量的影响。Xing et al.（2025.06）~\cite{2506_14642}进一步构建了大规模 3DGS 图像质量评估数据集 3DGS-IEval-15K，包含 15,200 张图像（10 个场景、6 种算法、20 个视角），60 位观测者参与主观评分，覆盖 30 种图像质量评估（IQA）指标。Xing et al.（2025.08）~\cite{2508_07038}将评测扩展到视频域，建立 3DGS-VBench，包含 660 个压缩 3DGS 模型和视频序列，覆盖 11 个场景、6 种 SOTA（State-of-the-Art，当前最优）压缩算法。
+
+Chen et al.（2025.11）~\cite{2511_06830}提出了 MUGSQA 数据集，首次系统评估 3DGS 重建方法在多种输入条件扰动（视角数量与分辨率、拍摄距离、初始点云精度）下的鲁棒性。Wan et al.（2025.11）~\cite{2511_08032}构建了首个系统化的 3DGS 感知质量评估数据集 3DGS-QA（225 个退化重建、15 个物体类型），并提出直接在 3D 高斯基元上操作的无参考质量预测模型。Wang et al.（2026.05）~\cite{2605_26880}构建了 GScomp-QA 主观数据集专门面向压缩高斯泼溅的质量评估。
+
+Chen et al.（2026.04）~\cite{2604_18205}对 NeRF 和 Gaussian Splatting 的几何精度进行了系统性比较评估。该工作的关键发现是：尽管 3DGS 在渲染质量上已匹敌 NeRF，但其在 Chamfer Distance 等几何指标上仍存在系统性劣势——高斯基元往往聚集在表面附近，而非精确贴合表面，这为后续的几何正则化研究提供了明确的改进方向。Ebert（2025.06）~\cite{2506_18787}构建了 3D Arena 开放平台，通过大规模人类成对比较（123,243 票、8,096 用户、19 个模型）建立生成式 3D 模型的可靠评估基准，发现高斯泼溅输出比网格格式获得 16.6 ELO 优势。该工作的方法论贡献是把众包评估引入 3D 生成模型领域，弥补了自动指标（如 FID）无法捕捉人类对 3D 质量感知的长期不足。Splatwizard（2025.12）~\cite{2512_24742}提供了 3DGS 压缩的基准工具包。该工具包的其亮点是首次将压缩率、质量和速度三个维度纳入统一评测框架，支持多种压缩算法的公平比较和可视化分析。
+
+\subsection{新视角合成通用基准}
+
+除 3DGS 专用基准外，若干通用评测框架也为 NVS 研究提供了重要参考。Ding et al.（2026.03）~\cite{2603_20428}系统基准评测了面向新视角合成的相机位姿估计策略。Daly et al.（2025.08）~\cite{2508_09068}构建了基于密集线性九相机阵列的多视角数据集，首次实现了帧插值和视图合成方法的公平对比，发现在真实场景中 3DGS 比最佳帧插值方法低达 3.5\,dB PSNR（受限于 COLMAP 预处理质量），但在合成场景中反超约 5\,dB。
+
+在动态场景评测方面，Li et al.（2026.04）~\cite{2604_23803}首次针对第一人称视角（Egocentric）场景评估了动态 3DGS 方法。Kim et al.（2025.06）~\cite{2506_02794}构建了 PhysGaia——首个物理感知的动态新视角合成基准，包含多体交互场景和多种物理材料（液体、气体、织物、流变体），提供 3D 粒子轨迹和物理参数真值。
+
+\subsection{质量评估方法}
+
+如何准确评估 3DGS 渲染结果的感知质量是一个活跃的研究方向。新视角合成领域广泛使用三个标准指标：PSNR（峰值信噪比）衡量像素级亮度还原精度，SSIM（结构相似性）衡量局部结构保持，LPIPS（学习感知图像块相似度）衡量深度特征层面的感知相似性。三者各有侧重——PSNR 对全局色调偏差敏感但忽视感知质量，LPIPS 更接近人类判断但计算成本更高。然而，这些传统指标难以全面捕捉人类视觉感知，因此研究者提出了更先进的评估方法。Qu et al.（2025.01）~\cite{2501_06488}提出了 NVS-SQA 方法，通过自监督学习实现无需人类标注和参考图像的神经合成场景质量评估，在 SRCC 指标上比最佳无参考方法提升 109.5\%，甚至超越了 16 种全参考方法。
+
+在主观评测方面，Zhang et al.（2025.01）~\cite{2501_08072}首次针对动态场景中的 Gaussian Splatting 和 NeRF 方法进行系统性主观质量评估，覆盖 360 度、前向和单视角三种观看路径，首次探索动态物体对 NVS 方法的影响。Martin et al.（2025.02）~\cite{2502_13196}构建了 GS-QA 基准，通过主观质量评估实验系统分析了 18 种客观质量指标与人类感知的一致性。
+
+在部分参考评估方面，PR-IQA（2026.04）~\cite{2604_04576}提出了面向扩散模型新视角合成的部分参考图像质量评估方法。在美学评估方面，Aes3D（2026.05）~\cite{2605_05155}首次将美学评估引入 3DGS 领域。此外，Chen et al.（2024.08）~\cite{2408_10906}构建了 ShapeSplat 大规模 3DGS 数据集（206K 对象、87 类别），提出 Gaussian-MAE 进行高斯参数自监督预训练，为 3DGS 表示空间的直接理解奠定了基础。
+
+\subsection{特定场景数据集}
+
+多样化的场景数据集对于全面评测 3DGS 方法在不同条件下的表现至关重要。Xiong et al.（2024.04）~\cite{2404_04880}构建了 GauU-Scene V2 数据集——覆盖超 6.5 平方公里的大规模户外 LiDAR-图像数据集，通过对比图像度量和几何度量指出当前图像度量在大规模场景评估中并不可靠，同时暴露了 3DGS 在几何重建方面的明显不足。
+
+Tao et al.（2024.11）~\cite{2411_10546}发布了 Oxford Spires 数据集，包含三台同步相机、3D 激光雷达和惯性传感器以及毫米级精度 TLS 地图，建立了 SLAM、SfM/MVS 和辐射场方法的统一评估基准，结果表明，当前最优的辐射场方法存在过拟合训练位姿的问题，3D 重建质量不如传统 MVS。
+
+在特殊传感器方面，Gunes et al.（2025.04）~\cite{2504_01732}引入 FIORD 数据集——首个使用双 200 度鱼眼镜头的室内外 3D 重建数据集，以更少的拍摄覆盖完整 360 度场景，并提供 LiDAR 真值点云。Ito et al.（2025.05）~\cite{2505_20126}构建了 OB3D 合成数据集，专为系统评估全景图像（等距柱状投影）3D 重建方法而设计，提供像素对齐的深度和法线真值。
+
+在 VR 导航方面，Ding et al.（2025.06）~\cite{2506_02380}发布了 EyeNavGS——首个面向 3DGS 场景的公开 6-DoF 导航数据集，包含 46 名参与者在 12 个真实世界 3DGS 场景中的头部姿态和眼动数据，并开源录制回放软件。
+
+在压缩基准数据方面，Wang et al.（2025.05）~\cite{2505_18197}提出 GausPcgc 框架将高斯基元视为点云进行几何位置压缩，并构建了专用训练数据集 GausPcc-1K。
+
+在视觉基础模型评估方面，Chen et al.（2024.12）~\cite{2412_09606}提出 Feat2GS 框架，利用 3DGS 作为探测工具从视觉基础模型（Vision Foundation Model, VFM）特征中读出高斯属性，分别评估 VFM 对 3D 几何和纹理的感知能力。
+
+在大规模与极端条件场景方面，DF3DV-1K（2026.04）~\cite{2604_13416}构建了大规模无干扰物新视角合成数据集。BALTIC（2026.04）~\cite{2604_19133}建立了跨越航空和地面域的 3D 重建基准。Chougule（2025.08）~\cite{2508_07483}通过 SSIM、PSNR、LPIPS 和 lp/mm 分辨率系统比较了摄影测量与 3DGS 的重建质量。SpaceDG（2026.05）~\cite{2605_22536}建立了视觉退化条件下的空间智能基准。
+
+% ======================================================================
+% 1.4 理论分析
+% ======================================================================
+
+\subsection{近期方法脉络：工业对象数据集、3D一致性评测、Visualization and diagnosis tools等}
+
+这一组近期工作延续 3DGS、Gaussian splatting、3DGS evaluation，主要把改动集中在增量改进、分析、扩展等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{MVM-IOD}
+MVM-IOD（2026.06）~\cite{2606_16638} 延续 3DGS 在“工业对象数据集”上的基本设定，主要改变是：MVM-IOD：机器人臂半球采集工业物体图像，提供参考位姿并评测多种3D重建方法。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：提供更贴近工业测量场景的数据集和评测协议，补足现有数据缺少真实工业对象和参考位姿的问题。
+具体而言，用工业机器人末端相机围绕物体半球采集，提供参考camera poses，并比较代表性重建方法。
+适用边界是：数据集/评测工作本身不提出3DGS方法；3DGS只是被评估方法之一。
+
+\paragraph{WorldOlympiad}
+WorldOlympiad（2026.06）~\cite{2606_11129} 延续 Gaussian splatting 在“3D一致性评测”上的基本设定，主要改变是：WorldOlympiad：三轨benchmark，其中几何轨用Gaussian splatting重建生成视频并评估结构一致性。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：提出从物理、几何和交互三个维度诊断视频世界模型的benchmark，补足只看视觉质量和短期一致性的不足。
+具体而言，几何track会对生成视频进行Gaussian splatting重建，并评估结构保持、跨视角/时间一致性等指标。
+适用边界是：3DGS仅作为评估工具；不提出新的高斯表示或渲染方法。
+
+\paragraph{Vis4GS}
+Vis4GS（2026.06）~\cite{2606_26985} 延续 3DGS 在“Visualization and diagnosis tools”上的基本设定，主要改变是：多视图联动的 primitive 级训练和属性分析工具。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：在原始 3DGS viewer 和训练框架基础上增加 Gaussian analysis、property、view coverage 和 genealogy 等联动视图。
+具体而言，工具将可见渲染缺陷映射到具体高斯属性、视角覆盖、训练进度和高斯谱系，帮助解释优化过程中伪影产生原因。
+适用边界是：主要是分析工具而非重建算法；效果依赖用户交互和可视化设计。
+
+\paragraph{Mind the Gap}
+Mind the Gap（2026.07）~\cite{2607_01556} 延续 3DGS evaluation 在“Evaluation protocols and generalization gaps”上的基本设定，主要改变是：Matched-count interpolation/extrapolation protocol，对比均匀 holdout 与连续空间扇区 holdout。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：提出公平 matched-count 协议，揭示插值与外推之间存在 3 到 12 dB 的巨大差距。
+具体而言，两个训练分支使用相同图像数量，只改变 holdout 方式：均匀间隔代表 interpolation，连续空间 sector 代表 extrapolation，从而隔离评测协议效应。
+适用边界是：是评测协议论文，不直接提出新 3DGS 模型；需要社区采纳才能影响报告标准。
+
+\paragraph{Practical High-Fidelity Novel-View Synthesis of Mounted Lepidoptera}
+Practical High-Fidelity Novel-View Synthesis of Mounted Lepidoptera（2026.06）~\cite{2606_31679} 延续 3DGS 在“Specialized digitization case studies”上的基本设定，主要改变是：segmentation-free, mirror-aware 3D Gaussian Splatting extension，结合手持 focus stacking 和一表面镜采集。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：在标本脆弱、微观细节丰富、景深很浅且腹侧难以直接拍摄的条件下，将手持焦点堆叠、非接触一表面镜和镜面感知 3DGS 结合成端到端数字化管线。
+具体而言，方法在 3DGS 管线中显式处理镜面采集视角：用一表面镜获得腹侧观测，同时避免依赖像素级分割，使蝴蝶标本可从全方向照片级浏览。
+适用边界是：适用于静态、可控采集的微小标本；残余 floaters、前景隔离和腹侧低保真仍需后处理或进一步改进。
+\section{理论分析}
+\label{sec:01_4}
+
+3D Gaussian Splatting 的巨大成功主要源于工程实践和经验优化（如第~\ref{sec:01_1}~节所述），但其背后的理论基础直到最近才有人系统整理。在第~\ref{sec:01_1}~节中，我们已经建立了 3DGS 的核心数学框架（高斯定义、投影方程、渲染公式、优化流程）；本节在此基础上，进一步深入探讨理论层面的进展：从数学推导到收敛性分析，从不确定性量化到形式化验证。
+
+\subsection{数学推导与统一理论框架}
+\label{sec:01_4_1}
+
+本小节从数学基础出发，梳理 3DGS 背后的理论工作：从体渲染到 Splatting 的严格推导。
+
+\subsubsection{从体渲染到Splatting的完整推导}
+
+\paragraph{从体渲染到 Splatting 的完整推导。} Matias et al.（2025.10）~\cite{2510_18101}撰写了一篇系统的教程论文，完整地从体渲染的光传输常微分方程（Ordinary Differential Equation, ODE）出发，逐步推导出 3DGS 的 splatting 公式。回顾第~\ref{sec:01_1_2}~节中的等价性分析：NeRF 的体渲染求积形式 $C = \sum T_i(1-e^{-\sigma_i \delta_i})c_i$ 可以重写为 $C = \sum T_i \alpha_i c_i$，与 3DGS 的 $\alpha$-混合公式完全一致。Matias et al. 的贡献在于从\textbf{连续}的光传输方程出发，系统展示了这一等价性并非巧合——它反映了体渲染的离散化本质上就是基元混合。该教程首先介绍了 NeRF 的体渲染框架及其局限性：NeRF 需要在包括空白空间在内的整个定义域上进行网络查询，导致计算成本高昂且难以实现实时渲染。随后引出了 3DGS 的核心思路：将场景建模为 3D 高斯集合，利用体 splatting 进行可微渲染，从而避免对空白空间的查询。教程还综述了内存优化、二次光线效果等关键扩展方向，以及表面重建、数字人建模、动画和前馈 3D 重建等应用场景。这些内容为初学者提供了理解 3DGS 理论的重要参考。
+
+\subsection{不确定性与稳定性分析}
+\label{sec:01_4_2}
+
+3DGS 在实际应用中面临多种不确定性来源，但原始方法（第~\ref{sec:01_1}~节）缺乏内建的不确定性量化机制。
+
+\subsubsection{认知不确定性与偶然不确定性量化}
+
+\paragraph{不确定性分类。} Klasson et al.（2024.09）~\cite{2409_06407}首次系统性地为 NeRF 和 3DGS 的 3D 场景重建建立了不确定性分类体系。他们将不确定性来源分为两类：\textbf{认知不确定性}（epistemic uncertainty）源于信息不足（如稀疏视角、遮挡），理论上可以通过增加观测来消除；\textbf{偶然不确定性}（aleatoric uncertainty）源于场景本身的随机性（如移动物体、传感器噪声），无法通过更多观测消除。该工作将多种不确定性估计技术适配到 NeRF 和 GS 框架中，包括 Active-NeRF/GS（学习方差参数）~\cite{pan2022activenerf}、MC-Dropout（随机 Dropout 推理）~\cite{gal2016dropout}、Laplace 近似（后验高斯近似）~\cite{daxberger2021laplace}和集成方法~\cite{lakshminarayanan2017ensemble}。实证研究表明，集成方法在整体上表现最稳定，Active 方法在特定场景下有效。而 MC-Dropout 和 Laplace 近似则很难直接用在 GS 这种显式表示上。
+
+\paragraph{形式化验证（formal verification）。} Li et al.（2025.03）~\cite{2503_00308}提出抽象渲染（Abstract Rendering）方法，首个面向 3DGS 场景的形式化抽象渲染框架。该方法对相机位置在一定范围内连续变化时渲染出的所有图像施加约束，实现严格的不确定性传播。其核心技术是高效的分段线性边界传播来近似基本渲染操作。同时，针对矩阵求逆和深度排序这两个不直接适用于标准近似的操作，作者提出了新的线性关系抽象方法。该方法支持高达 750K 高斯的大规模场景，相比现有基于网格的抽象图像方法实现 2--14 倍加速。这项工作对视觉自主系统的形式化验证和安全关键应用具有重要意义。
+
+\paragraph{稳定性框架（stability framework）。} Feng et al.（2026.02）~\cite{2602_09415}为 3DGS 建立了稳定性与统计集中性的严格数学框架。该工作将 3DGS 建模为非线性逆问题 $\mathbf{y} = \mathcal{A}(\mathbf{Z}^*) + \boldsymbol{\varepsilon}$，在块间 Lipschitz 几何、局部可辨识性和亚高斯噪声等假设下，作者推导出了确定性稳定性不等式和全局 Lipschitz 界，还给出了非渐近的高概率参数误差界。核心结论指出了 3DGS 的\textbf{内在稳定性-分辨率权衡}：提高图像分辨率能增强局部可观测性，但增加高斯数量（即模型复杂度）会使全局敏感性增大。因此，重建精度从根本上受制于分辨率与模型复杂度之间的权衡，无法通过算法改进来消除。
+
+\subsection{优化与可学习性}
+\label{sec:01_4_3}
+
+3DGS 训练收敛后，高斯参数究竟呈现什么样的规律？Wang et al.（2026.02）~\cite{2602_08909}对这一问题进行了系统分析。该工作将标准 3DGS 优化收敛后的参数称为渲染最优参考（Rendering-Optimal References, RORs），并发现一个关键现象：收敛后的高斯在点云密集处和稀疏处扮演完全不同的角色。以一个室外场景为例，一辆停在路边的汽车，COLMAP 会在车身表面重建出大量点，这就是\textbf{密集区域}——3DGS 的高斯像一层薄壳贴在车身上，位置和大小主要由几何决定，优化过程稳定收敛。但远处的天空和山丘，COLMAP 几乎重建不出任何点，这就是\textbf{稀疏区域}——3DGS 仍需在此放置高斯来渲染正确的颜色，而这里的高斯没有几何约束，参数完全由多视角渲染损失驱动。论文进一步分析了稀疏区域训练困难的根本原因。在 3DGS 的渲染中，每个高斯投影到屏幕后覆盖一个椭圆形区域，影响该区域内所有像素的颜色。
+
+在密集区域，一个像素通常被大量高斯覆盖，单个高斯的形状稍微变化，对最终颜色的影响很小；但在稀疏区域，一个像素可能只被一两个高斯覆盖，此时单个高斯的形状或位置稍有变化，就可能从"覆盖这个像素"变为"不再覆盖"，导致该像素颜色突然剧变。这意味着渲染结果对几何参数极度敏感，梯度信号在每次迭代中剧烈波动。更麻烦的是，几何参数和外观参数的梯度共享这个不稳定的信号——渲染结果一波动，两者的梯度同时大幅震荡且方向纠缠，导致总梯度方差远超单独任何一组参数的方差。论文将这种现象称为"协方差主导耦合"：几何和外观参数的梯度协方差超过各自方差之和，主导了整个训练过程的走向。这就是稀疏区域训练天然不稳定的根源。
+
+\subsection{几何精度与表示效率}
+\label{sec:01_4_4}
+
+理论分析也延伸到 3DGS 在具体应用场景中的几何精度评估。De Smijter et al.（2025.09）~\cite{2509_10241}聚焦一个特殊场景：太空中的在轨服务卫星需要对目标卫星进行 3D 重建，以支持交会对接和碰撞规避等操作。该场景的独特挑战在于：随着卫星沿轨道运动，太阳光照方向不断变化，同一表面在不同照片中的亮度差异极大。为此，研究者引入了外观嵌入（appearance embedding）——为每张训练图像额外学习一个低维向量，用于吸收光照变化带来的颜色差异，使底层几何不必为了迁就光照变化而扭曲。论文系统比较了隐式方法（K-Planes）和两种显式方法（Gaussian Splatting、Convex Splatting）。核心发现有两个：第一，外观嵌入确实改善了渲染出的照片质量，但对几何精度几乎没有帮助——它主要作用在于减少显式方法所需的基元数量（Gaussian Splatting 从约 6.9 万个高斯降至约 2.4 万个）；第二，Convex Splatting（用凸多面体代替高斯椭球作为基元）只需约 6000 个凸体就能达到与 6.9 万个高斯相当的重建质量，且几乎不产生"飞点"（floating artifacts）——即漂浮在物体表面附近的孤立基元。这对于碰撞规避等安全关键应用至关重要：飞点会被误判为障碍物，导致机器人做出错误的规避动作。
+
+从信息论角度，Ding et al.（2025.06）~\cite{2506_15948}分析了非线性变换中的信息-计算权衡，系统对比了隐式神经表示（INRs）和 2D 高斯泼溅在图像压缩中的特性差异。研究发现 INR 提供紧凑、分辨率灵活的神经场表示，但优化速度慢；而 GS 支持高并行化和空间可解释性拟合，但存储开销更大。该工作还提出了文本变换（textual transform）用于超低码率高效压缩，以及 LZ78 变换保证渐近通用性。这些发现从信息论角度揭示了编码效率与计算成本之间的基本权衡，为混合压缩感知框架的设计提供了理论依据。
+
+\begin{takeaway}
+3DGS 的理论分析揭示了两个核心洞察：收敛后的高斯在点云密集区域和稀疏区域表现出根本性差异——密集区域的高斯可从点云直接预测，稀疏区域则必须依赖多视角约束，这一差异由信息论极限决定，无法通过模型改进消除；此外，重建精度受限于分辨率与模型复杂度之间的内在稳定性-分辨率权衡，同样无法通过算法改进来消除。
+\end{takeaway}
+
+% ======================================================================
+% 1.5 开源工具与框架
+% ======================================================================
+
+
+\section{开源工具与框架}
+\label{sec:01_5}
+
+3DGS 的快速发展离不开开源生态的支持。本节介绍的工具和框架分别实现了第~\ref{sec:01_1}~节中描述的流水线的不同环节——从核心训练库到集成平台，从桌面端到 Web 端。
+
+\subsection{核心训练与渲染库}
+
+Ye et al.（2024.09）~\cite{2409_06765} 开发的 gsplat 是目前最具影响力的开源 3DGS 库之一。gsplat 的架构将 PyTorch 兼容的 Python 前端与高度优化的 CUDA 后端结合在一起，提供了模块化 API，包含前向和反向传播的 CUDA 核函数（投影、排序、光栅化）、自动微分支持和多种优化特性（内存高效的高斯存储、改进的排序算法、收敛加速策略）。与原始 3DGS 实现相比，gsplat 实现了约 10\% 的训练时间减少和 4 倍的内存节省，同时渲染质量保持一致。自 2023 年 10 月首次发布以来，gsplat 在 GitHub 上已获得超过 1600 个星标和 39 位贡献者，被大量研究项目采用。
+
+Chen et al.（2026.05）~\cite{2605_00219} 提出的 VkSplat 是首个完全基于 Vulkan compute 的 3DGS 训练流水线，打破了 CUDA 生态的垄断。VkSplat 将整个训练过程从头实现为纯 Vulkan compute shader，消除了 PyTorch 运行时的额外开销和 CPU-GPU 同步瓶颈，实现了 3.3 倍训练加速和 33\% 显存节省。关键优化包括融合核（将高斯投影与 $\alpha$-混合权重计算合并为同一次 shader pass）、内存高效的 tile 排序算法（减少 33\% VRAM）和自定义梯度计算核。通过 Vulkan 标准计算 API，VkSplat 在 NVIDIA、AMD 和 Intel GPU 上均实现统一支持。
+
+\subsection{模块化与集成平台}
+
+面向更广泛的研究需求，多个框架致力于提供模块化、可扩展的 3DGS 开发环境。Ye et al.（2024.03）~\cite{2403_19632} 开发的 GauStudio 是首个面向 3DGS 的模块化框架，将 3DGS 流程分解为可定制的即插即用组件，包括场景初始化（SfM 或 splatting 先验）、带几何正则化的高斯优化、表示能力增强步骤和场景压缩。研究者可自由组合不同的前景模型（高斯模型）、背景模型（环境贴图或 Gaussian Sky 模型）和外观编码方式（球谐系数、神经特征向量或特征缓存结构）。GauStudio 还提出了前景加天空球的混合高斯表示，在无界户外场景中减少约 30--50\% 的漂浮伪影。此外，GauS 表面重建方法采用"渲染-后融合"策略从已优化的 3DGS 直接进行网格重建，无需额外微调，Chamfer Distance 降低约 10--15\%。
+
+Ma et al.（2025.03）~\cite{2503_21364} 提出的 LandMarkSystem 则面向大规模多尺度场景的挑战，通过组件化模型适配层同时支持 NeRF 和 3DGS 结构。其核心设计包括：分布式并行计算（针对 3DGS 的像素级和高斯级分布式训练，针对 NeRF 的通道并行和分支并行训练）、模型参数卸载和动态加载策略（支持有限 GPU 内存下的大规模场景训练），以及优化的 3D 稀疏计算算子库。其中，分支并行策略将场景在 x-y 平面划分为网格区域，每个区域使用独立编码分支，理论上可实现无限规模扩展。该系统已验证支持从室内到城市级别（数百平方公里）的多尺度场景重建和渲染。
+
+Ma et al.（2026.03）~\cite{2603_09632} 提出的 X-GS 框架代表了 3DGS 工具集成的新范式，将此前孤立运行的多种 3DGS 技术统一到一个可扩展框架中。X-GS 包含两大组件：X-GS-Perceiver 统一了无位姿 3DGS、在线 SLAM 和语义蒸馏，通过在线向量量化（Vector Quantization, VQ）模块大幅降低语义通道维度，配合 GPU 加速网格采样方案和高度并行化流水线设计实现实时性能。X-GS-Thinker 则对接下游多模态模型，利用 Perceiver 产生的 3D 语义高斯实现文本提示 3D 物体检测、零样本场景描述等能力。值得一提的是，该框架引入了指数移动平均（Exponential Moving Average, EMA）更新机制，使原本只能离线使用的 VQ 模块可以用于在线连续学习。
+
+\subsection{可视化与跨平台工具}
+
+3DGS 的实际应用需要与现有的图形工具链无缝集成。Xu et al.（2026.01）~\cite{2601_15431} 开发的 SplatBus 是一个基于 Nvidia GPU 进程间通信（Inter-Process Communication, IPC）的客户端-服务器框架，将 3DGS 光栅化器与查看器解耦。渲染器作为独立的 Python 服务器运行，通过 CUDA IPC 内存句柄暴露 RGBA32F 颜色缓冲和 R32F 深度缓冲。这使得 Unity、Blender、Unreal Engine 和 OpenGL 等多种客户端可通过共享 GPU 内存直接访问渲染结果，避免额外内存拷贝。客户端通过深度感知混合将 Gaussian 渲染与网格渲染合成，支持混合 3DGS 与传统网格的可视化。
+
+在 Web 端，Han et al.（2026.02）~\cite{2602_03207} 提出的 WebSplatter 构建了端到端的 WebGPU 渲染管线，实现了浏览器中高效的跨设备 3DGS 渲染。WebSplatter 有两个核心技术贡献：一是无等待层次化基数排序，规避了 WebGPU 不支持全局原子操作的限制，确保在不同硬件上的一致执行；二是不透明度感知几何剔除，在光栅化前动态裁剪贡献极小的 splat，减少过度绘制和峰值内存占用。相比现有的 WebGL 和 WebGPU 实现的查看器，WebSplatter 实现了 1.2--4.5 倍的加速，使大规模 3DGS 场景在浏览器中的实时渲染成为可能。
+
+\subsection{性能优化工具}
+
+在基准评测方面，Kulhanek et al.（2024.06）~\cite{2406_17345} 开发的 NerfBaselines 解决了一个关键但被忽视的问题：不同新视角合成方法使用不同评估协议导致比较不公平。该工作通过实验证明，即使微小的评估协议差异（如图像缩放策略、LPIPS 版本、背景色选择等）也会显著影响方法排名。NerfBaselines 使用官方实现而非重实现，通过统一 API 的薄封装调用原始代码，封装为隔离的固定环境（Docker/Apptainer/Conda），将模型逻辑与数据加载和评估分离。框架还提供在线平台比较常用方法在 Mip-NeRF 360、Blender、Tanks and Temples 等标准基准上的结果，确保了定量结果的可比性。
+
+在底层优化方面，Hu et al.（2025.09）~\cite{2509_25626} 首次将大语言模型（LLM）应用于 3DGS GPU 内核的代码分析和优化。该方法采用两级优化策略：规划器 LLM（GPT-5）根据 Nsight Compute 收集的系统性能信息剪枝优化方案，执行器 LLM（Deepseek R1）生成优化代码。在原始 3DGS 代码上，LLM 分别实现 19\%（Deepseek）和 24\%（GPT-5）的加速；结合性能分析器的额外信息后，性能提升最高达 42\%（平均 38\%），接近手动优化最优的 48\%（平均 39\%）。值得注意的是，即使在已有算法优化的 Seele 框架上，LLM 仍能额外提升 6\% 的性能。这表明 LLM 能发现领域专家遗漏的优化机会。
+
+Vicente（2026.03）~\cite{2603_08661} 的 ImprovedGS+ 则展示了通过底层 C++/CUDA 重实现提升训练效率的路径。该工作将 ImprovedGS 策略从 Python 重实现为硬件优化的 C++/CUDA 内核，引入了 Long-Axis-Split（LAS）CUDA 内核（将所有几何和属性操作在单个高斯级别并行计算）、自定义拉普拉斯重要性内核配合非极大值抑制（Non-Maximum Suppression, NMS）和自适应指数缩放调度器。在 Mip-NeRF 360 数据集上，1M 预算变体训练时间减少 26.8\%、高斯数减少 13.3\%。全变体 PSNR 提升 1.28 dB 且参数复杂度降低 38.4\%，构成了新的帕累托最优前沿（Pareto optimal frontier）。
+
+\begin{takeaway}
+3DGS 开源工具生态已覆盖从核心训练库（gsplat、VkSplat）到集成平台（GauStudio、LandMarkSystem、X-GS）再到跨平台可视化（SplatBus、WebSplatter）的完整链路。VkSplat 证明了跨 GPU 厂商统一支持的可行性，LLM 辅助优化实现了接近手动调优的性能提升，而 NerfBaselines 则通过冻结环境解决了方法间公平比较的长期难题。
+\end{takeaway}
+
+% ======================================================================
+% ======================================================================
+% 本章小结
+% ======================================================================
+
+\subsection{近期方法脉络：可微渲染框架}
+
+这一组近期工作延续 Gaussian Splatting，主要把改动集中在增量改进等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{XPR}
+XPR（2026.06）~\cite{2606_11529} 延续 Gaussian Splatting 在“可微渲染框架”上的基本设定，主要改变是：XPR：可扩展跨平台点基可微渲染框架，将方法特定逻辑与共享渲染管线分离。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：提供高层接口和模块化静态形状并行管线，使新渲染方法可用少量代码实现并由跨平台编译器下放到不同GPU硬件。
+具体而言，框架把渲染拆成通用并行操作和方法特定逻辑，自动处理反向传播和硬件后端，便于实现点云、surfels和高斯splatting变体。
+适用边界是：作为框架工具，具体3DGS质量提升取决于用户实现；性能可能不及高度手写专用CUDA内核。
+
+\section{检索边界与弱相关工作}
+
+本轮检索中还包含若干只共享 Gaussian、splatting 或三维表示背景的论文。这些工作不改变 3DGS 的表示、渲染或优化主线，因此在本节集中说明其检索边界，避免把弱相关工作误并入后续技术路线。
+
+\paragraph{边界相关：Advances in Neural 3D Mesh Texturing}
+Advances in Neural 3D Mesh Texturing（2026.05）~\cite{2606_00137} 与 3DGS 主线关系较弱：该综述关注网格纹理而非3DGS本体，只把Gaussian Splatting作为现代3D生成背景之一。当前材料能确认的联系是：将GS作为可直接生成纹理化3D资产的相关趋势；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Robust Dreamer}
+Robust Dreamer（2026.05）~\cite{2605_30855} 与 3DGS 主线关系较弱：Robust Dreamer使用高斯记忆维护视频生成的一致性，但不是3D Gaussian Splatting重建方法。当前材料能确认的联系是：使用高斯式记忆结构，但不属于3DGS论文；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：DeblurNVS}
+DeblurNVS（2026.05）~\cite{2606_01315} 与 3DGS 主线关系较弱：DeblurNVS关注模糊输入下的新视角合成，和3DGS是问题背景关系而非直接3DGS方法。当前材料能确认的联系是：将3DGS列为NVS背景技术之一；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Fast and Lightweight Novel View Synthesis with Differentiable Multiplane Image}
+Fast and Lightweight Novel View Synthesis with Differentiable Multiplane Image（2026.06）~\cite{2606_02068} 与 3DGS 主线关系较弱：该论文主要提出MPI轻量NVS，不是3DGS方法；3DGS作为对比背景出现。当前材料能确认的联系是：以MPI作为更轻量的替代NVS表示；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：UnsOcc}
+UnsOcc（2026.06）~\cite{2606_03581} 与 3DGS 主线关系较弱：UnsOcc关注非结构化场景占用预测，并非3DGS方法；与3DGS关联较弱。当前材料能确认的联系是：未见直接方法关系；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：GraspFoM}
+GraspFoM（2026.06）~\cite{2606_08440} 与 3DGS 主线关系较弱：GraspFoM是抓取和3D基础先验工作，与3DGS没有直接方法关系。当前材料能确认的联系是：未见直接3DGS技术关系；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Continuous Splatting meets Retinex}
+Continuous Splatting meets Retinex（2026.06）~\cite{2606_16159} 与 3DGS 主线关系较弱：CGS-Retinex使用连续Gaussian splatting做2D低光增强，和3DGS重建关系较弱。当前材料能确认的联系是：将splatting思想用于2D连续图像建模；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Dehaze-GaussianImage}
+Dehaze-GaussianImage（2026.06）~\cite{2606_16163} 与 3DGS 主线关系较弱：Dehaze-GaussianImage把2DGS用于单图去雾，属于2D图像处理的弱相关工作。当前材料能确认的联系是：将2DGS用于图像去雾；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Fi-Gaussian}
+Fi-Gaussian（2026.06）~\cite{2606_16168} 与 3DGS 主线关系较弱：Fi-Gaussian是2D特征空间的隐式高斯去雾网络，不属于3DGS论文。当前材料能确认的联系是：借用高斯splatting思想到2D特征建模；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：TerraTransfer}
+TerraTransfer（2026.06）~\cite{2606_17386} 与 3DGS 主线关系较弱：TerraTransfer主要是自动驾驶策略学习方法，和3DGS没有明确直接关系。当前材料能确认的联系是：未见直接3DGS组件；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Gaussian Light Field Splatting}
+Gaussian Light Field Splatting（2026.06）~\cite{2606_17985} 与 3DGS 主线关系较弱：GLFS把高斯光场splatting作为2D照明建模先验，不是3DGS场景方法。当前材料能确认的联系是：将高斯叠加用于2D照明场建模；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：AIGS-Net}
+AIGS-Net（2026.06）~\cite{2606_17998} 与 3DGS 主线关系较弱：AIGS-Net用自适应2D Gaussian Splatting照明场做快速低光增强，和3DGS弱相关。当前材料能确认的联系是：用于自适应照明场建模；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Building Drift}
+Building Drift（2026.06）~\cite{2606_19609} 与 3DGS 主线关系较弱：Building Drift是建筑材料生命周期文档研究，与3DGS技术无直接关系。当前材料能确认的联系是：无直接技术关系；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：See-and-Reach}
+See-and-Reach（2026.06）~\cite{2606_20045} 与 3DGS 主线关系较弱：See-and-Reach关注UAV-VLN终端抵近，3DG指动态3D方向线索而非3D Gaussian Splatting。当前材料能确认的联系是：无直接技术关系；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：MM-TRELLIS}
+MM-TRELLIS（2026.06）~\cite{2606_24301} 与 3DGS 主线关系较弱：MM-TRELLIS主要是原生3D生成模型的车辆生成工作，不以3DGS为核心。当前材料能确认的联系是：未见直接3DGS方法关系；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Open-Vocabulary BEV Segmentation with 3D-Aware Geometric Constraints}
+Open-Vocabulary BEV Segmentation with 3D-Aware Geometric Constraints（2026.06）~\cite{2606_24353} 与 3DGS 主线关系较弱：该文面向开放词表 BEV 分割，核心贡献是几何一致的语义提升与 BEV 预测，并非 3D Gaussian Splatting 方法。当前材料能确认的联系是：摘要未体现 Gaussian Splatting 表示、渲染或优化；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Learning to Adaptively Allocate Gaussians for Arbitrary-Scale Image Super-Resolution}
+Learning to Adaptively Allocate Gaussians for Arbitrary-Scale Image Super-Resolution（2026.06）~\cite{2606_29400} 与 3DGS 主线关系较弱：该文使用 Gaussian 表示处理任意尺度图像超分，但不涉及三维场景或 3DGS 重建。当前材料能确认的联系是：使用二维 Gaussian 表示思想，但不是 3DGS 场景方法；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Resonant Brane Splatting for Arbitrary-Scale Super-Resolution}
+Resonant Brane Splatting for Arbitrary-Scale Super-Resolution（2026.06）~\cite{2606_29453} 与 3DGS 主线关系较弱：RBS 是 2D 图像超分中的 splatting primitive 创新，与 3DGS 只有表示思想上的弱关联。当前材料能确认的联系是：在 2D ASR 中提出 Gaussian 之外的 splatting primitive；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：Learning Video Dynamics with Predictive Differentiable Rendering}
+Learning Video Dynamics with Predictive Differentiable Rendering（2026.06）~\cite{2606_31050} 与 3DGS 主线关系较弱：该文将 2D Gaussian Splatting 引入视频预测，用连续表示缓解像素 MSE 导致的过平滑。当前材料能确认的联系是：借鉴 Gaussian splatting 的可微连续表示，但用于二维视频预测；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\paragraph{边界相关：The Turning Point of 3D Plant Phenotyping}
+The Turning Point of 3D Plant Phenotyping（2026.07）~\cite{2607_01753} 与 3DGS 主线关系较弱：该文主要讨论 3D foundation models 对植物表型管线的加速，摘要未显示其使用 3DGS。当前材料能确认的联系是：摘要和章节标题未显示直接使用 Gaussian Splatting；该工作不改变 3DGS 的表示、渲染或优化管线，因此作为边界相关工作保留，不进入主技术线。
+
+\input{chapters/recent/ch01}
+
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+\begin{futurebox}{本章总结与展望}{ch01_summary}
+本章为理解全书内容建立了基础框架，涵盖以下核心内容：
+\begin{itemize}
+\item \textbf{3DGS 技术详解}（第~\ref{sec:01_1}~节）：系统阐述了 3DGS 的完整技术流程——从三维高斯基元的定义和参数化，到 3D-to-2D 投影和 $\alpha$-混合渲染，再到优化策略、自适应密度控制和基于tile的光栅化器。特别强调了 NeRF 体渲染与 3DGS $\alpha$-混合在数学上的等价性，这一等价性解释了 3DGS 为何能在保持实时渲染的同时达到 NeRF 级别的渲染质量。
+\item \textbf{领域综述与分类观点}（第~\ref{sec:01_2}~节）：提取了主要综述论文的分类学框架，并与本书的六部分结构进行了对比，帮助读者理解不同分类方式的异同和各自的优势。
+\item \textbf{基准评测与数据集}（第~\ref{sec:01_3}~节）：从 NeRF 时代的经典数据集到 3DGS 专用的新兴基准，全面覆盖了评估 3DGS 方法所需的数据资源和评测方法。
+\item \textbf{理论分析}（第~\ref{sec:01_4}~节）：从数学推导、不确定性量化、优化理论和几何精度四个角度，建立了 3DGS 的理论框架，揭示了收敛解的密度差异和内在的稳定性-分辨率权衡。
+\item \textbf{开源工具与框架}（第~\ref{sec:01_5}~节）：总结了 3DGS 生态系统的工具链，涵盖核心训练库、集成平台和跨平台可视化工具。
+\end{itemize}
+
+当前该领域最突出的开放问题包括：
+\begin{itemize}
+\item \textbf{理论基础仍然薄弱}：3DGS 的收敛性保证、泛化界和最优高斯数量选择等基本问题缺乏完整答案（参见第~\ref{sec:01_4}~节）。
+\item \textbf{不确定性量化的工程化}：现有理论框架尚未转化为可实用的工具，鲁棒性和安全关键应用亟需不确定性感知的 3DGS 系统。
+\item \textbf{评估标准化尚未统一}：尽管 NerfBaselines 等工具提供了统一评测框架，但社区层面的共识仍需加强。
+\item \textbf{大规模场景的系统瓶颈}：从室内到城市级别，内存、计算和存储的扩展性仍是实际部署的主要障碍。
+\item \textbf{跨平台与跨硬件生态}：虽然 VkSplat 证明了跨 GPU 厂商的可行性，但完整的工具链生态仍以 CUDA 为中心。
+\end{itemize}
+
+在第~\ref{sec:01_1_6}~节的路线图（表~\ref{tab:design_research}）中，我们列出了原始 3DGS 的设计选择如何引出后续研究方向。第~2~章将首先深入探讨渲染算法的改进——包括抗锯齿、密度控制优化和正则化——这些改进都是对第~\ref{sec:01_1}~节所述渲染管线和 ADC 机制的直接优化。
+\end{futurebox}

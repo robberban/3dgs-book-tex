@@ -1,0 +1,1213 @@
+% 第5章：材质、光照与逆渲染
+\chapter{材质、光照与逆渲染}
+\label{ch:05}
+
+\paragraph*{本章阅读锚点}
+本章的锚点是外观可解释性。原始 3DGS 主要学习视角相关颜色；逆渲染方法把颜色拆成材质、光照、阴影和反射，让渲染结果不只好看，还能被编辑、重光照和分析。
+
+
+3DGS 的渲染方程基于 $\alpha$-混合，用球谐函数（SH, Spherical Harmonics）编码每个高斯的视角相关颜色。这种设计在重建 Lambertian（漫反射）场景时效果出色，因为漫反射的颜色几乎不随视角变化，低阶球谐即可拟合。然而，真实世界的物体表面远比漫反射复杂：镜面反射（镜子、金属）产生尖锐的高光；透明物体（玻璃、水）允许光线穿透并折射；半透明物体（皮肤、蜡）发生次表面散射。这些现象有一个共同特征——外观\textbf{高度依赖视角和光照}，而球谐函数既无法表达这种强视角依赖性，也无法将材质属性与光照条件分离。
+
+这种局限性不仅是渲染质量问题，更阻碍了下游应用：无法在重建场景中改变光照（重光照，Relighting），无法编辑物体材质，也无法将重建的物体插入新场景。本章围绕”如何让 3DGS 理解材质和光照”这一问题展开，从反射建模、材质分解、重光照、HDR（High Dynamic Range，高动态范围）处理到物理渲染，逐层深入（图~\ref{fig:05_routes}）。
+
+\begin{figure}[htbp]
+  \centering
+  \resizebox{0.95\textwidth}{!}{\input{tikz/ch05_inverse_rendering.tikz}}
+  \caption{3DGS 材质、光照与逆渲染技术路线图。从标准球谐编码出发，五条技术路线分别解决反射建模、材质分解、重光照、HDR/光照变化和物理渲染问题，最终汇聚为可重光照的材质资产。}
+  \label{fig:05_routes}
+\end{figure}
+
+%% ============================================================
+\section{反射与镜面建模}
+\label{sec:05_1}
+
+本节聚焦于如何让 3DGS 表达镜面反射、镜面成像、偏振辅助反射以及透明折射等视角高度相关的光学现象。内容按五条路线组织：首先分析球谐函数的视角表达能力瓶颈（\S\ref{sec:05_1} 问题背景），然后分别介绍镜面反射与延迟反射、镜面建模、偏振先验辅助反射建模、透明与折射建模，最后讨论特定对象的反射建模方法。
+
+\subsection{问题背景：球谐函数的视角表达能力瓶颈}
+
+本节讨论五条技术路线：（1）镜面反射与延迟反射；（2）镜面建模；（3）偏振先验辅助反射建模；（4）透明与折射建模；（5）特定对象的反射建模。
+
+标准 3DGS 用 3 阶球谐（16 个系数）编码每个高斯的视角相关颜色。对于漫反射表面，颜色几乎不随视角变化，0--1 阶球谐即可拟合。但对于镜面反射，颜色在空间中急剧变化——高光仅在镜面反射方向附近可见，偏离几度就消失。球谐是球面上的低频基函数，要拟合这种高频尖锐的视角变化需要极高阶的球谐，计算代价高昂且容易过拟合。
+
+更根本的问题是：球谐编码的是”从这个方向看是什么颜色”，而非”这个表面的材质是什么、光照是什么”。它将材质和光照的联合效果混为一体，无法分解。这两个问题正是后续方法试图解决的核心挑战。
+
+\subsubsection{镜面反射与延迟反射}
+
+本路线介绍通过延迟着色、潜特征编码、物理材质分解等技术让 3DGS 表达镜面反射等强视角相关光学现象的方法。
+
+以下介绍 7 个处理镜面反射的代表性方法，涵盖延迟反射管线（Deferred Reflection）、潜特征球谐（SpecGaussian）、高光分离（SSR-GS）、反射感知高斯（Reflective GS）、几何感知反射解耦（Reflections Unlock）、多视角一致材质推断（MaterialRefGS）以及视角-不透明度相关建模（VoD-3DGS）。
+
+\paragraph{两阶段延迟着色替代 SH 颜色泼溅}
+
+3D Gaussian Splatting with Deferred Reflection（2024.04）~\cite{2404_18454} 修改了原始 3DGS 的渲染管线——用两阶段延迟着色（deferred shading）替代单遍 SH 颜色 Splatting——高斯的位置、协方差、不透明度等几何参数保持不变。
+
+\textbf{动机。} 标准 3DGS 用球谐（SH）编码视角相关颜色，将几何信息和外观信息混在同一组参数中——当场景包含镜面反射表面时，SH 的表达能力不足以同时编码漫反射和反射内容，导致重建质量受限。直觉上，延迟着色的思路是"先收集几何信息，再统一着色"——就像画家先画好线稿再上色，而不是边画边决定最终颜色。
+
+第一阶段是标准高斯 Splatting，但除了颜色 $c_i(v)$ 外，同时将每个高斯的法线向量 $\mathbf{n}_i$（取椭球最短轴）和镜面反射强度 $r_i$（标量）作为额外属性一起 Splat 到屏幕空间：
+
+\begin{equation}
+N(v) = \sum_i \mathbf{n}_i \, G(\boldsymbol{\mu}_i, v), \quad R(v) = \sum_i r_i \, G(\boldsymbol{\mu}_i, v)
+\end{equation}
+
+其中 $G(\boldsymbol{\mu}_i, v)$ 是标准 Splatting 的 $\alpha$-混合 权重，复用了已经计算好的排序结果，因此额外开销极小。法线 $\mathbf{n}_i$ 根据视角方向翻转以确保始终朝向相机。
+
+\textbf{第二阶段：延迟反射着色。}在屏幕空间中组合最终像素颜色：
+
+\begin{equation}
+C'(v) = (1 - R(v)) \, C(v) + R(v) \, E\!\left(\frac{2\langle v, N(v)\rangle N(v)}{\|N(v)\|} - v\right)
+\end{equation}
+
+直觉上，$R(v)$ 是逐像素的反射强度图：$R(v) \approx 0$ 处保留原始漫反射颜色 $C(v)$；$R(v) \approx 1$ 处完全由环境贴图（Environment Map）$E$ 提供反射颜色。$E$ 在反射方向上用双线性插值查询。
+
+\textbf{训练策略。}关键设计在于：环境贴图 $E$ 完全从最终渲染损失端到端训练，与高斯参数解耦。反射强度 $r_i$ 初始化为 $0$，训练初期先进行几千次迭代的视角无关优化（SH 限制在 0 阶，即常数颜色）。仅当某些高斯的 $r_i > 0.1$ 时才触发法线传播（normal propagation）——将这些高斯的两条长轴放大 $1.5$ 倍并强制不透明度 $\geq 0.9$，使其覆盖邻居，从而将正确的法线梯度传播到附近高斯。为防止漫反射颜色在反射训练期间过拟合，还引入了颜色破坏（color sabotage）机制：对 $r_i < 0.1$ 的高斯周期性添加 $10\%$ 噪声。该两阶段管线将几何重建与外观渲染解耦，使 3DGS 专注于几何质量，镜面反射由物理着色模型处理。
+
+\paragraph{高维潜特征替代 RGB 球谐编码}
+
+如果说 Deferred Reflection 是在渲染管线上做手术，那么 SpecGaussian with Latent Features（2024.09）~\cite{2409_05868} 则是在高斯基元的表示上做文章。针对 SpecGaussian 在外观参数物理化环节的局限：尽管其潜特征编码有效捕捉了锐利的视角依赖颜色变化，但 16 维潜特征向量缺乏明确的物理含义——漫反射与镜面特征经由神经网络解码后仍是"黑箱"RGB，无法与真实材质属性（菲涅尔反射率 $f_0$、粗糙度等）对应，难以支持重光照、基于物理的材质编辑等需要显式材质参数的下游应用。它修改了原始 3DGS 的颜色编码——用 16 维潜特征替代直接 RGB 的 SH 系数——Splatting 流程和 $\alpha$-混合机制保持不变。
+
+\textbf{动机。} 球谐直接编码 RGB 颜色时，高光区域的 RGB 值变化剧烈，低阶球谐无法拟合——但如果先编码到一个高维潜空间，再用解码器映射回 RGB，网络的非线性表达能力就能捕捉尖锐的视角变化。
+
+具体而言，每个高斯的 SH 系数被替换为 16 维潜特征向量 $\mathbf{f}_i$，分为漫反射潜特征 $\mathbf{f}_d \in \mathbb{R}^8$ 和镜面潜特征 $\mathbf{f}_s \in \mathbb{R}^8$ 两部分：$\mathbf{f}_i = \mathbf{f}_d \parallel \mathbf{f}_s$。每个高斯还额外预测一个法线方向 $\mathbf{n}$（由小型 MLP 从潜特征预测）和一个视角遮罩特征（view-mask feature）$f_m$。渲染时，不再 Splat 颜色，而是通过特征 Splatting（Feature Gaussian Splatting）将潜特征投影到屏幕空间：
+
+\begin{equation}
+\mathbf{f}(p) = \sum_{i=1}^{N} T_i \, \alpha_i \, \mathbf{f}_i, \quad T_i = \prod_{j=1}^{i-1}(1 - \alpha_j)
+\end{equation}
+
+得到逐像素的漫反射特征图和镜面特征图后，分别送入两个解码网络：漫反射分支使用 UNet 架构（先下采样到 $1/8$ 尺寸再上采样恢复，含残差模块和跳跃连接），镜面分支使用带视角位置编码的紧凑 CNN。
+
+\textbf{视角遮罩与颜色合成。}视角遮罩特征 $f_m$ 由另一个 MLP 预测，输入为球谐编码的视角方向 $\mathbf{d}$ 和预测法线 $\mathbf{n}$：$f_m = F_\theta(\text{SH}(\mathbf{d}), \mathbf{n})$。最终颜色合成遵循 Cook-Torrance 物理模型（基于微面理论的经典 BRDF 模型）的简化形式，输出为
+\begin{equation}
+c = F_{\text{UNet}}(\mathbf{f}_d) + F_{\text{Spec-CNN}}(\text{PE}(\mathbf{d}_{\text{pixel}}), \mathbf{f}_s) \odot \text{mask}
+\end{equation}
+
+其中 $\odot$ 表示逐元素乘法。直觉上，view-mask 扮演了 Cook-Torrance 模型中 BRDF（Bidirectional Reflectance Distribution Function，双向反射分布函数）预积分项的角色：它学习在哪些方向上应该出现高光以及强度多大，而非让解码网络直接输出全部视角相关颜色。法线预测还引入了伪法线（pseudo normal）正则化——取高斯椭球最短轴作为伪法线监督信号，迫使 MLP 预测的法线向物理法线对齐，损失权重 $\lambda_{\text{normal}} = 0.001$，刻意保持较小以允许一定偏离。
+
+\paragraph{物理材质参数分解漫反射与镜面反射}
+
+SpecGaussian 用潜特征绕开了球谐的局限性，但并未赋予高斯参数以明确的物理含义。SSR-GS: Separating Specular Reflection（2026.03）~\cite{2603_05152} 走得更远，它修改了原始 3DGS 的外观参数——用物理意义明确的材质参数（菲涅尔反射率 $f_0$ 和漫反射分量 $c_{\text{diff}}$）替代 SH 系数对漫反射和镜面反射的混合编码——$\alpha$-混合流程保持不变。
+
+\textbf{动机。} SpecGaussian 用潜特征绕开了球谐的局限性，但并未赋予高斯参数以明确的物理含义——没有物理参数就无法支持重光照、材质编辑等下游应用。渲染方程由此分解为漫反射和镜面反射两项：
+
+\begin{equation}
+L_{\text{rgb}} = L_{\text{diff}} + L_{\text{spec}}, \quad L_{\text{diff}} = (1 - F) \, C_{\text{diff}}
+\end{equation}
+
+其中菲涅尔项 $F$ 由 $F_0$ 和视角按 Schlick 近似计算，$C_{\text{diff}}$ 对应 $(1 - \text{metallic}) \cdot \text{albedo}$。
+
+\textbf{直接与间接镜面反射。}镜面反射项进一步分为直接镜面反射和间接镜面反射：
+
+\begin{equation}
+L_{\text{spec}} = M_{\text{spec}} \!\left( (1 - w_{\text{vis}}) \, L_{\text{spec}}^{\text{direct}} + w_{\text{vis}} \, L_{\text{spec}}^{\text{indi}} \right)
+\end{equation}
+
+直接镜面反射使用 Mip-Cubemap 查询：构建环境贴图的粗糙度感知 mipmap 层级 $\{\ell_0, \ldots, \ell_{L-1}\}$，粗糙度 $r$ 决定查询的 mip 层级 $\ell = r^2 (L - 1)$，在反射方向上做三线性插值采样。直觉上，粗糙表面查询高 mip 层级（更模糊），光滑表面查询低 mip 层级（更锐利），从而避免了显式的半球积分。
+
+\textbf{间接镜面反射与几何先验。}间接镜面反射用 IndiASG（Indirect Anisotropic Spherical Gaussian，各向异性球面高斯）建模：在每个表面点布置 $N_{\text{lobe}} = 33$ 个固定的 ASG（各向异性球面高斯，一种方向敏感的基函数，能集中在一个特定方向上产生高响应）瓣（1 个天顶 + 4 圈各 8 个方位），由神经网络预测每个瓣的 RGB 振幅 $a_j$ 和锐度参数 $\lambda_j, \mu_j$，反射方向上的间接镜面辐射为各瓣贡献之和：
+
+\begin{equation}
+L_{\text{spec}}^{\text{indi}}(\mathbf{v}_r) = \sum_{j=1}^{33} a_j \, \mathbb{1}_{(\mathbf{v}_r \cdot \boldsymbol{\zeta}_j > 0)} \exp\!\left(-\lambda_j (\mathbf{v}_r \cdot \boldsymbol{\zeta}_j^\perp)^2 - \mu_j (\mathbf{v}_r \cdot \boldsymbol{\zeta}_j^{\hat{\phantom{\perp}}})^2\right)
+\end{equation}
+
+可见性权重 $w_{\text{vis}}$ 通过在 TSDF（Truncated Signed Distance Function，截断符号距离函数）提取的网格上做射线追踪（BVH 加速）判断反射方向是否被遮挡。此外，还引入了视觉几何先验（Visual Geometry Priors）：用反射分数（Reflection Score）$RS(u)$ 度量每个像素的多视角光度偏差，在高 $RS$ 区域降低光度损失的梯度权重，防止镜面反射的外观变化干扰几何优化。同时利用 VGGT 模型提供的深度和法线先验作为正则化，进一步提升反射区域的几何稳定性。
+
+\paragraph{2D 高斯基元与物理延迟着色}
+
+前三个方法（Deferred Reflection、SpecGaussian、SSR-GS）都在 3DGS 的框架内增强反射建模，但保留了 3D 高斯基元本身。Reflective Gaussian Splatting（2024.12）~\cite{2412_19282} 修改了原始 3DGS 的基元设计与渲染管线——用 2D 高斯基元 + 物理延迟着色替代 3D 高斯 + SH 颜色——训练优化流程保持不变。设计动机是：标准 3DGS 无法区分漫反射和镜面反射的物理成因，也无法处理反射物体之间的相互反射（inter-reflection，即一面镜子的反射内容中包含另一面镜子的反射）。
+
+\textbf{第一项改变：2D 高斯基元。}用 2D 高斯基元替代 3D 高斯：每个基元由位置 $\mathbf{p}$、切向量 $\mathbf{t}_u, \mathbf{t}_v$ 和缩放因子 $(s_u, s_v)$ 定义，法线直接由叉积得到 $\mathbf{n} = \mathbf{t}_u \times \mathbf{t}_v$，避免了 3D 椭球法线估计的多视角不一致问题。每个 2D 高斯附加材质属性：反照率 $\mathbf{a} \in \mathbb{R}^3$、金属度 $m$ 和粗糙度 $r$。
+
+\textbf{第二项改变：物理延迟着色。}渲染采用物理延迟着色（physically based deferred rendering）：先将所有高斯的材质属性通过 $\alpha$-混合 累积到屏幕空间的材质图（反照率 $\mathbf{A}$、金属度 $M$、粗糙度 $R$、法线 $N$），再在像素级应用简化版 Disney BRDF 和 split-sum 近似。直觉上，延迟着色将 $\alpha$-混合视为平滑滤波器，稳定了特征优化，产生更一致的渲染结果。镜面反射的 BRDF 项为：
+
+\begin{equation}
+f_s(\boldsymbol{\omega}_i, \boldsymbol{\omega}_o) = \frac{D \, F \, G}{4 \, (\boldsymbol{\omega}_o \cdot N) \, (\boldsymbol{\omega}_i \cdot N)}
+\end{equation}
+
+其中 $D$ 是 GGX（GTR/GGX 法线分布函数，微面模型中描述微面朝向分布的经典函数）法线分布函数，$F$ 是菲涅尔项，$G$ 是阴影-遮蔽项。用 split-sum 近似将积分拆分为预计算的 2D 查找表和环境贴图积分两部分，避免实时蒙特卡洛采样。
+
+\textbf{相互反射建模。}相互反射（inter-reflection）建模将镜面光照分为直接光 $L_{\text{dir}}$（反射方向无遮挡）和间接光 $L_{\text{ind}}$（有遮挡的部分）。可见性 $V \in \{0, 1\}$ 通过在 TSDF 提取的网格上做射线追踪（BVH，Bounding Volume Hierarchy，层次包围盒，加速）实时判断。每个高斯额外分配一组球谐系数编码间接光照 $l_{\text{ind}}$，在反射方向上求值后 $\alpha$-混合累积：
+
+\begin{equation}
+L_{\text{spec}}' \approx \left(\int f_s \, (\boldsymbol{\omega}_i \cdot N) \, d\boldsymbol{\omega}_i\right) \left[ L_{\text{dir}} \cdot V + L_{\text{ind}} \cdot (1 - V) \right]
+\end{equation}
+
+训练中还有两项重要设计。其一，初始阶段采用逐高斯着色（而非像素级延迟着色），帮助梯度更有效地回传到高斯基元。其二，材质感知的法线传播——周期性放大高金属度、低粗糙度高斯的尺度，将准确的法线信息传播到相邻高斯。
+
+\paragraph{双分支反射-透射颜色与高阶球谐}
+
+Reflective GS 通过 2D 基元和延迟着色将材质与几何分离，但仍假设每个高斯只有一种"外观"。Reflections Unlock（2025.07）~\cite{2507_06103} 修改了原始 3DGS 的高斯属性——用双分支（反射 + 透射）颜色和不透明度替代单分支 SH 编码——Splatting 和 $\alpha$-混合 流程保持不变。设计动机源于一个物理事实：反射光和透射光遵循不同的传播规律。镜面反射的颜色来自环境而非物体本身，改变视角时反射内容剧烈变化，但物体几何和本征颜色保持不变。用一组球谐系数同时编码两者，必然导致高光模糊或伪影。
+
+为此，方法为每个高斯引入一个可学习的反射置信度 $\sigma_{\text{ref}} \in [0,1]$，表示该高斯主要代表反射成分还是透射成分。
+
+\textbf{反射图与能量守恒。}通过 $\alpha$-混合 沿光线累积，得到逐像素的反射图：
+
+\begin{equation}
+\Phi_{\text{ref}}^p = \sum_{i \in N_{\text{cov}}} \sigma_{\text{ref}}^i \cdot \alpha_{\text{trans}}^i \prod_{j=1}^{i-1}(1 - \alpha_{\text{ref}}^j)
+\end{equation}
+
+直觉上，$\sigma_{\text{ref}}^i$ 衡量第 $i$ 个高斯代表反射的``纯度''，乘积项 $\prod(1-\alpha_{\text{ref}}^j)$ 物理上建模了前方高斯对反射光线的累积遮挡效应。该公式遵循能量守恒原理：$\alpha_{\text{ref}} + \alpha_{\text{trans}} = 1$，确保反射与透射互补。最终像素颜色由反射图加权融合得到：
+
+\begin{equation}
+C^p = (1 - \Phi_{\text{ref}}^p) \cdot C_{\text{trans}}^p + \Phi_{\text{ref}}^p \cdot C_{\text{ref}}^p
+\end{equation}
+
+\textbf{高阶球谐与辅助监督。}另一个关键设计是将球谐函数的阶数从标准的 3 阶提升到 5 阶。低阶球谐只能编码平滑的低频信号（如漫反射光照），而镜面反射具有尖锐的角度变化，需要更高阶的基函数才能准确重建。理论上，球谐投影的逼近误差随阶数指数衰减：
+
+\begin{equation}
+\|L(\theta, \phi) - \sum_{l=0}^{n}\sum_{m=-l}^{l} q_l^m Y_l^m(\theta, \phi)\|_2 \leq A \cdot e^{-bn}
+\end{equation}
+
+其中 $A$、$b$ 是与反射锐度相关的常数。将阶数从 3 提升到 5，使反射分支能够捕捉高光和阴影等高频细节。此外，方法利用 Depth Anything v2 生成伪深度图监督几何，并用辅助的反射去除模型生成无反射伪图像 $I_{\text{clean}}$ 监督透射分支，进一步增强了解耦质量。
+
+\paragraph{跨视角材质一致性约束与反射先验}
+
+Reflections Unlock 通过分支解耦实现了反射与透射的分离，但基于 PBR 框架的方法还面临一个更深层的问题：同一表面点从不同视角渲染出的材质参数互相矛盾。MaterialRefGS（2025.10）~\cite{2510_11387} 在原始 2DGS 的基础上修改了材质参数的约束机制——用跨视角材质一致性约束替代无约束的自由优化——Splatting 流程和 BRDF 着色模型保持不变。
+
+\textbf{动机。} PBR 框架假设视角无关的材质属性（反照率、粗糙度、金属度）可以通过 BRDF 解耦出视角相关的镜面反射，但在实际优化中，不同视角下高斯覆盖的像素不同、$\alpha$-混合权重各异，同一表面点从不同视角渲染出的材质图往往严重不一致——BRDF 难以从这些矛盾的材质观测中推断出全局物理反射效果。
+
+MaterialRefGS 以 2DGS 为基线表示，为每个高斯附加四个材质属性：漫反射颜色 $c_d^3$、反照率 $a$、金属度 $m$、粗糙度 $r$。通过 $\alpha$-混合 分别渲染出对应的材质图 $\hat{C}_d, \hat{A}, \hat{M}, \hat{R}$。着色采用简化版 Disney BRDF，漫反射项直接由高斯编码的 $c_d$ 渲染，镜面项则通过 split-sum 近似分解为预计算的 BRDF LUT 查询和环境贴图查询：
+
+\begin{equation}
+c(\omega_o) = (1 - m) \cdot c_d + L_s(\omega_o, a, m, r, \mathbf{n})
+\end{equation}
+\begin{equation}
+L_s(\omega_o) \approx \underbrace{\int f_s(\omega_i, \omega_o)(\omega_i \cdot \mathbf{n}) d\omega_i}_{\text{BRDF LUT（由 $a, m, r$ 预计算）}} \cdot \underbrace{\int L_i(\omega_i) D(\omega_i, \omega_o)(\omega_i \cdot \mathbf{n}) d\omega_i}_{\text{环境贴图查询（反射方向 $+$ $r$）}}
+\end{equation}
+
+直觉上，漫反射颜色 $c_d$ 与视角无关，由高斯直接编码；镜面高光 $L_s$ 与视角强相关，由 BRDF 模型根据材质参数和视角方向实时计算。将两者分开建模而非联合推断，降低了优化难度。
+
+\textbf{跨视角材质一致性约束。}为解决多视角材质不一致问题，方法提出：对参考视角 $v_i$ 中表面点 $p$ 周围的 $7 \times 7$ 像素块 $P(\pi_i(p))$，通过单应变换 warp 到相邻视角 $v_j$，然后最小化两视角材质图的差异：
+
+\begin{equation}
+\mathcal{L}_{mv} = \|P(\pi_i(p)) - \hat{\Psi}_j[P'(\pi_j(p))]\|_2
+\end{equation}
+
+其中单应矩阵 $H_{ij} = K_j(R_{ij} - \frac{\mathbf{t}_{ij}\mathbf{n}_i^T}{d_i})K_i^{-1}$ 由相机内参、相对位姿和表面法线计算。该约束作用于漫反射、粗糙度和金属度三个材质图，但不作用于反照率图——因为反照率对大多数非反射表面贡献很小，强行约束反而有害。
+
+\textbf{反射强度先验与间接光照。}方法还引入反射强度先验：对多视角图像计算像素级亮度方差作为反射分数，反投影到 3D 空间后通过球查询融合为反射强度图 $w_{\text{ref}}$，以此加权约束高反射区域的金属度。对于间接光照，方法沿反射方向执行高斯光线追踪，计算遮挡概率 $O(\omega_i)$ 和间接辐射 $L_{\text{indirect}}$，解决了环境贴图无法感知场景遮挡的问题。
+
+\paragraph{SGGX 微面片参数化的视角相关不透明度}
+
+MaterialRefGS 聚焦于材质参数的多视角一致性，但还有一个更基础的属性被忽略了：不透明度本身也可以是视角相关的。VoD-3DGS（2025.01）~\cite{2501_17978}（View-opacity-Dependent）修改了原始 3DGS 的不透明度参数——用 SGGX（Self-contained Geometry-aware Gaussian，一种微面片分布参数化方法）微面片分布的对称矩阵参数化视角相关不透明度替代常数标量不透明度——高斯的其他属性保持不变。设计动机是：标准 3DGS 的不透明度是常数标量 $\alpha_i = \sigma(o_i)$（$o_i$ 为可学习参数，$\sigma$ 为 sigmoid 函数），无法建模反射高光和透明表面的角度敏感性。例如，玻璃从正面近乎透明，从掠射角度却几乎不透明。
+
+具体而言，$S_i$ 是一个 $3 \times 3$ 对称正定矩阵，由 6 个可学习分量参数化，与原始标量 $o_i$ 结合，定义新的不透明度函数：
+
+\begin{equation}
+\alpha_i(\mathbf{v}_{i,j}) = \sigma(o_i + \mathbf{v}_{i,j}^\top S_i \mathbf{v}_{i,j})
+\end{equation}
+
+其中 $\mathbf{v}_{i,j}$ 是从高斯中心指向相机 $j$ 中心的视角向量。直觉上，$\mathbf{v}^\top S \mathbf{v}$ 定义了一个对称的角分布：矩阵 $S$ 的特征值决定不同方向上的``通透程度''——沿某特征向量方向，特征值越大，该方向越不透明。这使高斯能够模拟类似毛玻璃或拉丝金属的各向异性反射行为，而非仅限于简单的 Lambertian 透射。
+
+\textbf{配套机制调整。}这一改动需要对 3DGS 的多个配套机制进行调整。密度控制中的剪枝策略改为：仅当一个高斯在所有训练视角中的最大不透明度低于阈值 $\epsilon$ 时才剪枝，即 $\max_j \alpha_i(\mathbf{v}_{i,j}) < \epsilon$，因为视角相关不透明度可能在多数角度都低、仅在特定角度才高。不透明度重置机制也做了适配：对 $S_i$ 做特征分解后，VoD-3DGS[L] 方案将最大特征值重置为 $\sigma_0$（接近零）而保留其余两个特征值，VoD-3DGS[S] 方案则重置最小特征值——两种方案在不同数据集上各有优势。
+
+\textbf{视角一致性正则化。}此外，方法引入视角一致性正则化损失：对训练视角 $i$，按特征点匹配数加权采样相邻视角 $j$，约束相似视角下不透明度的一致性：
+
+\begin{equation}
+\mathcal{L}_{vc} = \frac{1}{|G|}\sum_{g \in G} |\alpha_g(\mathbf{v}_{g,i}) - \alpha_g(\mathbf{v}_{g,j})|, \quad \text{其中 } \delta = \angle(\mathbf{v}_{g,i}, \mathbf{v}_{g,j})
+\end{equation}
+
+最终训练损失为 $\mathcal{L} = (1-\lambda)\mathcal{L}_1 + \lambda \mathcal{L}_{\text{D-SSIM}} + \mathcal{L}_{vc}$，视角一致性项帮助避免高斯在未见视角产生退化效果。
+
+\subsubsection{镜面建模}
+
+本路线介绍针对场景中实际存在的镜子/镜面进行建模的方法，利用几何光学的镜像对称实现物理正确的镜面反射渲染。上一小节的方法聚焦于"如何让 3DGS 表达镜面反射这一物理现象"，而本小节的方法针对一个更具体的目标：场景中实际存在的镜子/镜面。镜子的特殊性在于，反射内容构成一幅完整的"虚拟图像"，需要几何光学的镜像对称来建模。
+
+\paragraph{虚拟镜像视角双路渲染}
+
+Mirror-3DGS（2024.04）~\cite{2404_01168} 修改了原始 3DGS 的渲染管线——用虚拟镜像视角的双路渲染替代单视角 $\alpha$-混合——高斯的几何参数和 SH 颜色保持不变。
+
+\textbf{动机。} 镜子的特殊性在于反射内容构成一幅完整的"虚拟图像"，Baseline 3DGS 的 $\alpha$-混合沿光线累积颜色，容易在镜子后方生成错误的高斯——这些高斯违反物理规律（物体不可能在镜子内部），严重损害渲染质量。核心思路来自几何光学的镜像成像原理：镜面呈现的虚拟图像等价于从镜子后方的对称位置观察真实世界，因此无需昂贵的光线追踪即可实现物理正确的镜面反射。
+
+Mirror-3DGS 的实现分为三个关键步骤。首先，为每个高斯添加可学习的镜面属性 $m \in [0,1]$，表示该高斯属于镜子的概率，通过与 $\alpha$-混合 相同的方式渲染出镜面掩码：
+
+\begin{equation}
+M(p) = \sum_{i=0}^{N} m_i \cdot \alpha_i \prod_{j=1}^{i-1}(1 - \alpha_j)
+\end{equation}
+
+使用数据集提供的真值镜面掩码 $M_{gt}$ 通过 $\mathcal{L}_{mask} = \mathcal{L}_1(M, M_{gt})$ 监督学习。然后，基于高镜面概率的高斯点，用改进的 RANSAC 算法剔除噪声后拟合镜面平面方程 $\Pi = (\mathbf{n}_\Pi^\top, d)$，其中 $\mathbf{n}_\Pi$ 为法向量，$d$ 为平面到原点的距离。平面约束损失为：
+
+\begin{equation}
+\mathcal{L}_{plane} = \frac{1}{N_f}\sum_{i=1}^{N_f}|\mathbf{n}_\Pi^\top p_i + d|
+\end{equation}
+
+确保所有镜面高斯都落在同一平面上。最后，基于平面方程构造虚拟镜像视角：将原始相机位姿 $P_o \in \mathbb{R}^{4 \times 4}$ 通过镜像变换矩阵 $T_m$ 映射到镜后位置 $P_m = T_m P_o$。
+
+\textbf{掩码融合与两阶段训练。}渲染时从原始视角得到图像 $C_{P_o}$（保留镜外区域），从虚拟视角得到图像 $C_{P_m}$（保留镜内区域），最后通过掩码融合：
+
+\begin{equation}
+C_{fuse} = C_{P_o} \odot (1 - M) + C_{P_m} \odot M
+\end{equation}
+
+其中 $\odot$ 为逐元素乘法。
+
+训练采用两阶段策略。第一阶段用红色填充真值图像中的镜面区域（消除镜面内容干扰），联合优化高斯表示和镜面平面方程，损失为 $\mathcal{L}_{stage}^1 = \lambda_{mask}\mathcal{L}_{mask} + \mathcal{L}_{rgb}^1 + \lambda_{depth}\mathcal{L}_{depth} + \mathcal{L}_{plane}$。第二阶段固定镜面平面方程，使用完整的未遮挡真值图像 $C_{gt}$ 监督融合结果，损失为 $\mathcal{L}_{stage}^2 = \lambda_{mask}\mathcal{L}_{mask} + \mathcal{L}_{rgb}^2$。分阶段训练的动机是：先让高斯学会场景的几何结构和镜面位置，再通过虚拟视角补充镜面反射的细节。
+
+\paragraph{镜像变换生成独立反射高斯}
+
+Mirror-3DGS 在渲染时通过虚拟视角获取镜面内容，但真实场景的高斯和镜面反射的高斯仍然是同一组。MirrorGaussian（2024.05）~\cite{2405_11921} 修改了原始 3DGS 的场景表示——用镜像变换生成独立的反射高斯替代单组高斯同时承担真实和反射内容——$\alpha$-混合 和光栅化流程保持不变。核心改进是将真实世界高斯 $P_r$ 关于镜面平面 $P$ 执行镜像变换，生成镜面空间中的虚拟高斯 $P_m$，从而使反射区域拥有独立的几何表示。镜面平面参数化为 $P: \mathbf{n} \cdot \mathbf{x} + b = 0$，其中 $\mathbf{n}$ 为法向量，$b$ 为偏移量。对每个高斯 $G=(\boldsymbol{\mu}, R, S, \alpha, c)$，反射高斯 $G'$ 保持不透明度 $\alpha$ 和尺度 $S$ 不变，但修改三个属性：均值 $\boldsymbol{\mu}' = F(\boldsymbol{\mu}) = \boldsymbol{\mu} - 2(\mathbf{n} \cdot \boldsymbol{\mu} + b)\mathbf{n}/\|\mathbf{n}\|^2$；旋转矩阵 $R$ 的三个特征向量方向各自关于镜面翻转；视角相关颜色 $c(\mathbf{d})$ 不直接修改 SH 系数，而是在渲染时将观测方向镜像为 $\mathbf{d}' = -F(\boldsymbol{\mu}_{\text{cam}}) - \boldsymbol{\mu}_{\text{cam}}$，令 $c'(\mathbf{d}) = c(\mathbf{d}')$。之所以镜像观测方向而非 SH 系数，是因为后者过于复杂，而镜像观测方向在数学上等价且实现简洁。
+
+\textbf{双路渲染与三阶段训练。}渲染时使用真实高斯和反射高斯分别渲染真实图像 $I_r$ 和镜面图像 $I_m$，再用掩码融合：$I = I_r \cdot M + I_m \cdot (1-M)$。训练分为三阶段：前 $s_1=20{,}000$ 步训练原始 3DGS；中间 $s_2=1{,}000$ 步冻结高斯参数、仅优化镜面平面方程；最后 $s_3=9{,}000$ 步联合优化所有参数并学习镜面标签 $k \in [0,1]$ 以自动生成任意视角的镜面掩码。
+
+\paragraph{镜面因子调制与对称映射重建遮挡}
+
+MirrorGaussian 通过镜像高斯重建镜面反射，但它的出发点是"如何渲染正确的镜面内容"。Gaussian Splatting in Mirrors（2024.10）~\cite{2410_01614}（即 ReflectiveGS）则从另一个角度出发——利用镜面反射作为补充信息来重建被遮挡物体。它修改了原始 3DGS 的不透明度计算——用可学习的镜面因子调制不透明度替代常数不透明度——高斯的位置和颜色保持不变。
+
+\textbf{镜面因子与平面估计。}核心改进是引入可学习的镜面因子（mirror factor）$m \in (0,1)$——每个 3DGS 点附加一个属性，表示该点属于镜面表面的概率。修改后的不透明度为 $\alpha'_i = m_i \cdot \alpha_i$，使镜面区域高斯在非镜面处趋于透明，从而自动学习出镜面掩码。基于学习到的镜面因子，使用 RANSAC 从高概率点拟合镜面平面方程 $ax + by + cz + d = 0$，然后通过对称映射矩阵将真实高斯变换到镜面空间：
+$$\mathbf{M} = \begin{pmatrix} 1-2a^2 & -2ab & -2ac & -2ad \\ -2ab & 1-2b^2 & -2bc & -2bd \\ -2ac & -2bc & 1-2c^2 & -2cd \\ 0 & 0 & 0 & 1 \end{pmatrix}$$
+该矩阵将坐标 $(x,y,z)$ 变换为镜像坐标 $(x',y',z')$。设计动机是：镜面反射中包含了直视无法观测到的物体特征，通过对称映射可以将这些信息补充到重建中。
+
+\textbf{对称一致性约束。}为约束真实高斯和镜像高斯的一致性，引入空间对称一致性损失 $L_{\text{sym}} = \frac{1}{N}\|\boldsymbol{\mu}_G - \boldsymbol{\mu}'_G\|$，最小化对称变换前后高斯中心的距离。总损失为 $L = L_{\text{rgb}} + \beta_m L_m + \beta_{\text{sym}} L_{\text{sym}}$，其中 $\beta_m = 1.0$，$\beta_{\text{sym}} = 10.0$（对称一致性损失权重较高，强调前后对称约束的重要性）。
+
+\paragraph{稠密深度法线先验替代稀疏平面拟合}
+
+前三个方法都假设镜面平面可以从数据中学习，但平面估计的精度直接影响重建质量。Seeing Through Reflections（2025.09）~\cite{2509_18956}（即 ReflectiveGS 另一独立工作）修改了原始 3DGS 的镜面平面估计流程——用稠密深度/法线先验替代稀疏 SfM 点云的平面拟合——后续的对称映射和高斯渲染保持不变。核心问题是：Baseline 3DGS 将反射内容与真实场景等同对待，导致镜面后方的虚假高斯干扰几何重建。
+
+具体而言，从预测的深度图 $\mathcal{D}$ 和法线图 $\mathcal{N}$ 中，利用镜面区域掩码 $M$ 提取镜面区域的深度值和法线值。通过相机外参 $[R|\mathbf{t}]$ 和内参 $K$，将镜面像素的深度反投影为世界坐标 $\mathcal{C}$，计算镜面区域法线均值作为平面法向量 $\mathbf{n}$，再用 RANSAC 拟合最佳平面偏移 $o$（距离阈值设为 0.1，最大迭代 1000 次，要求镜面区域像素数超过 30{,}000）。设计动机是：仅依赖 SfM 稀疏点云难以精确估计镜面平面，而利用深度和法线估计器提供的稠密几何先验可以显著提升平面估计精度。
+
+\paragraph{闪光/无闪光 3D 伪配对去除半透明反射}
+
+前四个方法都依赖场景的几何结构（镜面平面、法线等）来处理反射，但有些反射发生在无法精确建模几何的半透明表面上。Flash-Splat（2024.10）~\cite{2410_02764} 修改了原始 3DGS 的场景表示——用四组独立的 3DGS（闪光透射、无闪光透射、反射、反射比例因子）替代单组 3DGS——$\alpha$-混合 渲染流程保持不变。
+
+\textbf{动机。} 有些反射发生在无法精确建模几何的半透明表面（如玻璃窗），无法使用镜面平面等几何先验——闪光摄影提供了一个纯光学的解决方案：闪光照亮透射场景但不影响反射，从而可以分离两种成分。
+
+直觉上，闪光照片照亮了透射场景（玻璃后面的内容），而反射场景（玻璃前面的倒影）几乎不受闪光影响。因此闪光透射 $T_F$ 应是无闪光透射 $T_N$ 的亮度增强版本，而两者共享相同的反射 $R$。传统 2D 闪光方法需要同一视角拍摄配对图像，然后做差 $I_F - I_N \approx \beta \cdot T_N$ 得到无反射的透射场景，但对相机微小运动极其敏感。Flash-Splat 的核心改进是将此思路扩展到 3D：分别用闪光视角和无闪光视角各重建一组 3DGS，形成”3D 伪配对”（3D pseudo-pair），无需配对图像即可利用闪光先验。
+
+无闪光图像建模为 $I_N = T_N + \alpha R$，闪光图像建模为 $I_F = T_F + \alpha R$（假设闪光对反射场景亮度影响可忽略）。关键约束是闪光与无闪光透射之间满足线性关系 $T_F \approx (1+\beta) T_N$，用 Pearson 相关系数作为损失来软约束此线性关系：
+$$L_{\text{linearity}} = -\frac{\text{cov}(T_N, T_F)}{\sqrt{\text{var}(T_N) \cdot \text{var}(T_F)}}$$
+设计动机是：硬约束（强制差值无反射）对不完美闪光条件过于严格，而 Pearson 系数可以容忍闪光不均匀等实际偏差。
+
+\textbf{初始化与训练。}初始化阶段，通过比较 3D 伪配对的点云强度差异，将亮度增加的点分类为”透射点”（用于初始化 $T_F$、$T_N$），亮度不变的点分类为”反射点”（用于初始化 $R$）。总损失为 $L = \lambda_1 L_1 + \lambda_2 L_{\text{DSSIM}} + \lambda_3 L_{\text{linearity}} + \lambda_4 L_{\text{depth}}$，其中 $L_1$ 和 DSSIM 在色调映射空间 $\sigma(x)=x^{0.22}$ 下计算，以避免 RAW 空间偏向亮像素的问题。
+
+\subsubsection{偏振先验辅助反射建模}
+
+本路线介绍利用偏振信息作为几何和材质物理先验来辅助反射建模的方法。前两小节的方法仅依赖 RGB 图像作为监督信号，但 RGB 图像无法区分"表面本身是白色"和"白色高光反射"。偏振（polarization）提供了第三个信息通道：光线在反射后偏振态发生改变，而偏振态的变化规律与表面法线和材质直接相关，因此可以作为几何和材质的物理先验，弥补 RGB 图像无法区分反射成分的不足。
+
+\paragraph{Stokes 向量输出与 pBRDF 模型}
+
+PolGS（2025.09）~\cite{2509_19726}（Polarimetric Gaussian Splatting）修改了原始 3DGS 的渲染输出和监督信号——用 Stokes 向量（偏振光的完整描述，包含强度和偏振方向）替代纯 RGB 输出，并用偏振损失替代纯光度损失——高斯的几何参数和 Splatting 流程保持不变。
+
+\textbf{动机。} RGB 图像无法区分"表面本身是白色"和"白色高光反射"——偏振提供了第三个信息通道：光线在反射后偏振态发生改变，而偏振态的变化规律与表面法线和材质直接相关，可以作为几何和材质的物理先验。核心动机是：3DGS 中单个高斯核的法线由 2D 椭圆面的法向量直接定义，法线与透明度之间缺乏像 SDF（Signed Distance Function，符号距离函数）方法那样的耦合关系（SDF 中法线由梯度推导、透明度由 SDF 值经 sigmoid 得到），导致多种高斯配置可表达等价几何，重建存在固有歧义。偏振的介入将这一困境逆转：Fresnel 方程天然建立偏振态-入射角-折射率三者的物理映射，偏振观测即可反向推导法线方向，使法线估计从"多解歧义"变为"物理唯一"。
+
+\textbf{pBRDF 模型。}PolGS 引入 pBRDF（偏振双向反射分布函数）模型，将每个高斯建模为 Gaussian Surfel（仅保留零阶球谐系数以保证漫反射分量视角无关），同时引入 CubeMap Encoder 处理镜面反射。渲染方程输出完整的 Stokes 向量：漫反射项 $C \cdot [T_o^+, T_o^-, 0]^T$ 与镜面反射项 $L_r \cdot [R^+, -R^-, 0]^T$ 之和，其中 $C$ 是 Gaussian Surfel 渲染的漫反射颜色，$L_r = E(r_d - 2(r_d \cdot n)n)$ 是 CubeMap 查询的镜面辐射，$T_o^{\pm}$ 和 $R^{\pm}$ 分别为透射/反射的 Fresnel 系数。直觉上：漫反射分量的偏振方向与镜面反射正交，因此 Stokes 参数中的 $s_1, s_2$ 与表面法线强相关，可直接用于几何约束。
+
+\textbf{训练损失。}训练损失定义为 $L = L_\text{rgb} + \lambda_1 L_\text{pol} + \lambda_2 L_m + \lambda_3 L_o + \lambda_4 L_d$，其中 $L_\text{rgb} = 0.8\, L_1(s_0, \hat{s}_0) + 0.2\, L_\text{DSSIM}(s_0, \hat{s}_0)$，偏振损失 $L_\text{pol} = L_1(s_1, \hat{s}_1) + L_1(s_2, \hat{s}_2)$，$\lambda_1{=}1, \lambda_2{=}0.1, \lambda_3{=}0.01, \lambda_4{=}0.01{+}0.1(\text{iter}/15000)$。整个训练约 10 分钟即可完成。
+
+\paragraph{深度引导可见性掩码与多视角切空间一致性}
+
+PolGS 用偏振信息约束了单视角的法线，但未考虑多视角之间的一致性。PolGS++（2026.03）~\cite{2603_10801} 在 PolGS 基础上修改了监督机制——用深度引导的可见性掩码 + 多视角切空间一致性损失替代单视角偏振监督——pBRDF 模型和渲染管线保持不变。核心瓶颈在于：原始 PolGS 虽然用偏振信息约束法线，但无法判断某个表面点在相邻视角中是否可见，被遮挡视角可能引入错误梯度。
+
+\textbf{深度引导可见性掩码。}引入深度引导的可见性掩码（depth-guided visibility mask）：先将参考视角渲染的深度图反投影为伪表面点集 $X = \{x_s\}$，对每个相邻视角 $k$，计算几何距离 $d_k(x_s) = \|x_s - x_c^k\|_2$，再与该视角渲染深度 $\hat{z}_k(\pi_k(x_s))$ 比较，定义可见性掩码 $V(x_s, k) = \mathbb{1}[|\hat{z}_k(\pi_k(x_s)) - d_k(x_s)| < \epsilon]$——即深度差小于阈值 $\epsilon$ 则认为可见。这替代了 SDF 方法中基于光线追踪的可见性判断，适配 3DGS 的泼溅渲染范式。
+
+\textbf{多视角切空间一致性。}在获得可见性掩码的基础上，PolGS++ 进一步构建了多视角切空间一致性损失。其公式为 $L_\text{tsc} = \sum_{x_s \in X} \sum_{k \in K} V(x_s, k) \, \|T_k(x_s) \cdot n(x_s)\|_2^2$，其中 $T_k(x_s)$ 是视角 $k$ 下表面点 $x_s$ 处的切线向量，$n(x_s)$ 是预测法线。直觉上，如果法线正确，那么偏振方向的切线应与法线正交。这一损失只在点确实可见时施加，从而避免被遮挡视角引入错误梯度。训练损失为 $L = L_\text{rgb} + \lambda_1 L_\text{pol} + \lambda_2 L_\text{tsc} + \lambda_3 L_m + \lambda_4 L_o + \lambda_5 L_d$，其中 $\lambda_1{=}1, \lambda_2{=}0.1, \lambda_3{=}0.1, \lambda_4{=}0.01, \lambda_5{=}0.01{+}0.1(\text{iter}/15000)$。训练同样仅需约 10 分钟。
+
+\paragraph{偏振分离镜面漫反射分量作为监督信号}
+
+PolGS/PolGS++ 直接将偏振作为渲染目标的一部分，但偏振信号本身存在歧义——同一个偏振观测可能对应多个法线方向。PolarGuide-GSDR（2025.12）~\cite{2512_02664} 在 3DGS-DR 延迟反射管线的基础上修改了监督机制——用偏振物理模型分离的镜面/漫反射分量作为伪真值替代 RGB 损失——延迟着色的两阶段管线保持不变。
+
+\textbf{动机。} 直接用偏振作为渲染目标存在歧义——同一个偏振观测可能对应多个法线方向，而 3DGS 的几何先验恰好可以帮助消除这种歧义，形成偏振与几何的双向耦合。它建立了偏振信息与 3DGS 之间的双向耦合机制：先用 3DGS 的几何先验消除偏振法线的歧义，再用修正后的偏振信息反过来指导 3DGS 的法线和球谐表示。
+
+\textbf{偏振镜面/漫反射分离。}基于偏振物理模型将反射光建模为偏振镜面分量 $S_{sp}$ 和偏振漫反射分量 $S_{dp}$，通过偏振相机四角度 $(0^\circ, 45^\circ, 90^\circ, 135^\circ)$ 拍摄的图像计算 Stokes 参数 $S_0, S_1, S_2$，再由 Mueller 矩阵和 Fresnel 方程反解两个分量。
+
+\textbf{偏振法线歧义校正。}AoLP（偏振角）对应法线的方位角但存在 $\pi$ 和 $\pi/2$ 周期歧义，因此引入 DoLP（偏振度）阈值 $\delta$：仅在 DoLP 高于 $\delta$ 的区域施加法线监督，并构建候选集 $C = \{n_\text{pol}, -n_\text{pol}, R_{\pi/2}(n_\text{pol}), -R_{\pi/2}(n_\text{pol})\}$，结合镜面反射图像选择最一致的候选法线。直觉上：偏振度高的区域偏振信号可靠，低区域则跳过；四选一的歧义用镜面反射图辅助判断哪个法线方向正确。联合监督损失 $L_\text{total} = \lambda_\text{rgb} L_\text{rgb} + \lambda_\text{refl} L_\text{refl} + \lambda_\text{base} L_\text{base} + \lambda_\text{normal} L_\text{normal}$，其中镜面损失和漫反射损失分别用偏振分离出的 $I_{sp}$ 和 $I_{dp}$ 作为伪真值监督。偏振先验仅用于训练监督，推理时不需要偏振输入。
+
+\paragraph{偏振延迟渲染与 GridMap 间接光照}
+
+PolarGuide-GSDR 用偏振分离的镜面/漫反射分量作为监督信号，但并未将偏振物理完全融入渲染方程。PhyGaP（2026.03）~\cite{2603_14001}（Physically-Grounded Gaussians with Polarization）在 Ref-Gaussian 延迟渲染管线的基础上修改了着色模型——用 PolarDR（Polarization Deferred Rendering，偏振延迟渲染）替代标准延迟渲染——高斯属性泼溅和 G-buffer（Geometry Buffer，几何缓冲区）生成保持不变。
+
+\textbf{动机。} PolGS/PolGS++ 直接将偏振作为渲染目标的一部分，但偏振信号本身存在歧义——同一个偏振观测可能对应多个法线方向，需要将偏振物理完全融入渲染方程来消除歧义。直觉上，Fresnel 方程将入射角和折射率转化为 s/p 偏振分量的反射率比，物理上精确描述了反射后偏振态的变化，因此偏振观测可以直接约束折射率和法线这两个关键物理量。
+
+\textbf{PolarDR 模型。}在假设入射光非偏振的条件下，镜面反射的 Stokes 输出为 $S_{o,\lambda}^s = \frac{1}{2} \Phi_s(\theta_n)[2\theta_n, -2\theta_n, 0]^T L_s(\lambda, o)$，漫反射为 $S_{o,\lambda}^d = \frac{1}{2} \Phi_d(\theta_n)[2\theta_n, -2\theta_n, 0]^T L_d(\lambda, o)$，其中 $\Phi_s(\theta_n) = (\hat{s}^2 - R^\perp)/(s^2 + R^\perp)$ 和 $\Phi_d(\theta_n) = (\hat{s}^2 - T^\perp)/(s^2 + T^\perp)$ 是 Fresnel 系数的函数，$\theta_n = \cos^{-1}(n \cdot o)$ 是天顶角。
+
+\textbf{GridMap 间接光照。}此外，PhyGaP 提出 GridMap 机制解决非凸物体的自遮挡问题：在物体包围盒每个面上放置 $3 \times 3$ 网格的锚点相机（共 $N{=}52$ 个），每个相机构建局部 cubemap 进行单步光线追踪，渲染时对表面点 $p$ 距离加权融合：$\tilde{S}_d = \sum_{i=1}^{N} \|p - c_i\|_2^{-1} S_d^{(i)} / \sum_{i=1}^{N} \|p - c_i\|_2^{-1}$。训练损失 $L = L_\text{rgb} + \lambda_1 L_\text{pol} + \lambda_2 L_\text{mask} + \lambda_3 L_\text{depth} + \lambda_4 L_\text{smooth}$，其中 $L_\text{rgb}$ 同样采用 $0.8\,L_1 + 0.2\,L_\text{DSSIM}$ 组合。相比纯 RGB 方法，PhyGaP 在 PSNR 上平均提升约 2\,dB，法线余弦距离改善 45.7\%。
+
+\subsubsection{透明与折射建模}
+
+本路线介绍处理透明物体折射现象的重建和渲染方法。前面三小节聚焦于镜面反射，但真实世界中还有一类同样棘手的现象：透明和折射。透明的玻璃、水面允许光线穿透并改变方向，这超出了 $\alpha$-混合的能力范围——$\alpha$-混合只能混合颜色，无法模拟光路的弯折。本小节的方法从不同角度解决透明物体的重建和渲染问题。
+
+\paragraph{三组独立高斯分离漫反射、反射与透射}
+
+RT-GS（2026.04）~\cite{2604_00509}（Reflection and Transmittance Primitives）修改了原始 2DGS 的高斯分组策略——用三组独立高斯（漫反射 $G_d$、反射 $G_r$、透射 $G_t$）替代单组高斯——$\alpha$-混合 光栅化流程保持不变。
+
+\textbf{动机。} 单组高斯用同一组球谐系数同时编码漫反射、反射和透射，三种光学现象的视角依赖模式完全不同——强行混合会导致高光模糊或透射伪影。
+
+\textbf{分组策略与延迟着色。}漫反射高斯由 SfM 稀疏点云初始化，通过标准 $\alpha$-混合 光栅化生成深度、法线 $\mathbf{n}$、粗糙度 $\alpha$、基础反射率 $f_0$ 和镜面混合权重 $k_s$ 等 G-buffer，供延迟着色使用。反射与透射高斯则在场景包围盒内随机初始化，通过可微光线追踪器沿反射/透射方向采样得到颜色 $C_r$ 和 $C_t$。直觉上，三组高斯各司其职：$G_d$ 负责"表面长什么样"；$G_r$ 负责"反射了什么"；$G_t$ 负责"透过来看到了什么"。最终颜色为
+\begin{equation}
+C = (1-k_s)\,C_d + k_s\bigl(f_r\,C_r + f_t\,C_t\bigr),
+\end{equation}
+
+其中镜面项中的 BRDF $f_r$ 采用 Torrance-Sparrow 微面模型（法线分布使用 GGX：$D(\mathbf{n},\mathbf{h},\alpha)=\alpha^2/\bigl[\pi\,((\mathbf{n}\cdot\mathbf{h})^2(\alpha^2-1)+1)^2\bigr]$），BTDF $f_t$ 取为 $f_t=(1-F)\,\delta(\boldsymbol{\omega}_i-\boldsymbol{\omega}_t)/(\boldsymbol{\omega}_i\cdot\mathbf{n})$，即假设薄透明面片的镜面透射。
+
+\textbf{三阶段训练。}训练采用三阶段策略：第一阶段只优化漫反射高斯以获得稳定的材质贴图；第二阶段联合优化漫反射与反射高斯并提取表面网格；第三阶段在网格引导下追踪透射光线，三组高斯联合优化。对于透明物体区域，通过 SAM2 + GroundingDINO 生成分割掩码，正则化镜面权重 $k_s$ 趋向高值：$\mathcal{L}_{spec}=\frac{1}{N_p}\sum_i m_i\,\text{ReLU}(K_0-k_{s,i})$，迫使透明表面由反射和透射颜色主导。粗糙度通过映射 $g(\alpha)$ 防止训练中趋零导致法线分布项爆炸。
+
+\paragraph{占据度-不透明度分解与混合延迟-前向管线}
+
+RT-GS 通过分组解决反射/透射的分离，但所有高斯仍共用同一个不透明度概念。RT-Splatting（2026.05）~\cite{2605_18263} 修改了原始 3DGS 的不透明度参数——用占据度-不透明度分解（Occupancy-Opacity Factorization）替代单一标量不透明度——Splatting 和渲染流程保持不变。
+
+\textbf{动机。} 半透明表面的不透明度同时承担两个物理矛盾的角色——"这里有东西"（几何遮挡）和"它有多透明"（光学透过），用单一标量无法同时满足两种需求。
+
+\textbf{占据度-不透明度分解。}每个高斯的单个 opacity 被拆分为两个可学习属性：几何占据度 $\rho\in[0,1]$（射线与高斯物质交互的概率）和光学不透明度 $\tau\in[0,1]$（交互后光线被吸收或散射的条件概率），二者之积定义为有效不透明度 $\alpha_{\text{eff}}=\rho\cdot\tau$，用于体渲染合成。直觉上，透明物体可以用高 $\rho$（几何实体感）、低 $\tau$（光学透明）的高斯建模。延迟着色时按概率加权的首个表面提取公式为
+\begin{equation}
+A = \sum_i p_i\,a_i, \quad p_i = \rho_i G_i \prod_{j=1}^{i-1}(1-\rho_j G_j),
+\end{equation}
+
+即将高斯集合视为单一表面的概率表示而非离散半透明 surfel，为延迟着色中高分辨率镜面反射建模提供了物理解释。
+
+\textbf{混合延迟-前向管线。}渲染采用混合延迟-前向管线：延迟通道渲染镜面反射颜色 $C_{spec}$，前向通道用 $\alpha_{\text{eff}}$ 累积背景颜色 $C_{bg}$，再加上材料内散射颜色 $C_{scat}$ 和透射率 $\sigma$ 构成次表面传输分量 $C_{sub}=C_{scat}+(1-\sigma)\,C_{bg}$，最终颜色为 $C=C_{spec}+\beta\cdot C_{sub}$，其中衰减因子 $\beta\in[0,1]$ 由镜面着色网络输出，模拟强高光时背景细节被压制的感知效应。为防止反射残差梯度污染透射分支导致浮伪影，引入了镜面感知梯度门控：$g(\mathbf{x})=\exp\!\bigl(-k\,\text{Var}_{\mathbf{p}\in\mathcal{N}(\mathbf{x})}[C_{spec}(\mathbf{p})]\bigr)$，在镜面复杂区域自动衰减透射分支梯度。
+
+\paragraph{几何高斯与局部反射高斯双组表示}
+
+RT-Splatting 从不透明度的物理分解入手，而 Ref-DGS（2026.03）~\cite{2603_07664}（Reflective Dual Gaussian Splatting）修改了原始 2DGS 的场景表示——用双高斯组（几何 $G_{geo}$ + 局部反射 $G_{local}$）替代单组高斯——$\alpha$-混合光栅化保持不变。核心动机来自一个物理观察：光泽表面上镜面反射产生的虚像位于反射面后方，像距等于物距。因此，将局部反射特征直接编码进几何高斯会迫使表面几何向内坍缩以匹配虚像深度，破坏表面重建。
+
+\textbf{几何高斯与反射高斯。}几何高斯沿用 2DGS 参数化并附加漫反射颜色和粗糙度属性，光栅化后产生漫反射颜色图 $C_{diff}(\mathbf{p})$、粗糙度图 $\alpha(\mathbf{p})$、法线图和深度图。局部反射高斯 $G_{local}$ 每个基元存储一个可学习的局部反射特征 $\mathbf{f}\in\mathbb{R}^d$，光栅化后产生屏幕空间特征图 $F_{local}(\mathbf{p})$，隐式编码自反射和互反射等近场效果。远场环境反射则通过可学习球面特征图 $M$ 配合球面 Mipmap（Sph-Mip）编码获取：$F_{global}(\mathbf{p})=\text{Sph-Mip}(\mathbf{x}(\mathbf{r}),\,\phi(\alpha(\mathbf{p})),\,M)$，其中 $\mathbf{r}$ 为反射方向，$\phi$ 将粗糙度映射到 mipmap 级别。
+
+\textbf{自适应混合着色器。}两组特征由一个物理感知自适应混合着色器融合，该着色器以粗糙度 $\alpha$ 和法线-视角余弦 $\cos_{NV}=\max(\mathbf{n}\cdot\mathbf{v},0)$ 为条件输入，通过 MLP 预测镜面颜色：$C_{spec}(\mathbf{p})=f_\theta(F_{global},\,F_{local},\,\alpha,\,\cos_{NV})$。最终颜色为 $C(\mathbf{p})=C_{diff}(\mathbf{p})+C_{spec}(\mathbf{p})$。局部反射高斯的法线图呈现从物理表面向内延伸的凹面结构，显式建模了虚像几何。
+
+\paragraph{空间-方向低秩分解与球面 Mip 特征网格}
+
+Ref-DGS 用双高斯组分离几何与反射，但反射特征的编码仍然缺乏对方向的结构化建模。Ref-GS（2024.12）~\cite{2412_00905}（Directional Factorization）修改了原始 3DGS/2DGS 的方向编码——用方向分解（空间特征 $\times$ 方向特征的低秩外积）替代球谐系数——延迟着色管线保持不变。核心问题是"方向查询歧义"：直接用视角方向查询颜色偏向漫反射材质，而用反射方向查询时，由于球谐系数与高斯朝向的耦合歧义，每个基元的 SH 系数变化可以消除视角到反射方向的变换，导致噪声重建。
+
+\textbf{方向分解与 $\Phi$-Mip 编码。}Ref-GS 提出延迟高斯（Deferred Gaussian）管线，先将高斯属性（漫反射颜色 $\mathbf{c}_d$、特征 $\mathbf{f}$、粗糙度 $\alpha$）通过 $\alpha$-混合 积分为 G-buffer，再在图像空间着色。核心创新是方向分解（Directional Factorization）：将视角相关效果表示为空间特征 $\mathbf{k}\in\mathbb{R}^D$ 与方向特征 $\mathbf{s}\in\mathbb{R}^C$ 的低秩张量外积 $\mathbf{s}\circ\mathbf{k}$，展开后送入轻量 MLP 解码器预测颜色。直觉上，这类似于信号处理中将一个 2D 信号分解为两个 1D 信号的乘积，显著降低参数量。空间特征来自各高斯的光栅化，方向特征则来自可学习的多级球面特征网格（$\Phi$-Mip grid）。$\Phi$-Mip 编码将球面特征图用经纬度网格分布，给定反射方向 $\mathbf{r}$ 和粗糙度 $\alpha$，通过三线性插值查询特征：$\mathbf{s}=\Phi\text{-Mip}(\mathbf{r},\,\alpha,\,M)$，粗糙度映射到网格的 Z 轴层级，近似预滤波远场镜面反射。最终像素颜色为
+\begin{equation}
+I = I_d + f_\theta(\mathbf{s},\,\mathbf{K}\circ\mathbf{S}),
+\end{equation}
+
+其中 $\mathbf{K}\circ\mathbf{S}$ 表示逐像素外积（形状 $H\!\times\!W\!\times\!(D\cdot C)$）。这种分解同时降低了每个高斯基元的特征通道数，显著减少了体渲染的计算开销，且外积结构能有效捕捉全局光照、阴影和自遮挡等空间-角度耦合信息。
+
+\paragraph{双高斯反射-散射分离与三阶段残差引导}
+
+Ref-GS 通过方向分解高效编码视角相关外观，但透射场景的反射与散射耦合问题仍未解决。TransmissiveGS（2026.05）~\cite{2605_10705}（Residual-Guided Disentangled）修改了原始 3DGS 的高斯分组和训练策略——用双高斯表示（反射 $G_{refl}$ + 散射 $G_{scat}$）配合三阶段残差引导训练替代单组高斯的端到端训练——光栅化和 $\alpha$-混合 保持不变。核心动机是：光线遇到透射面时部分能量被反射、部分被透射后由内部结构散射，这两种传输模式应分别建模。
+
+\textbf{双高斯表示。}反射高斯 $G_{refl}$ 捕获高频视角相关反射，散射高斯 $G_{scat}$ 捕获多视角一致的漫散射辐射。两组高斯独立光栅化后在屏幕空间通过物理驱动的延迟着色函数合成：$I=(1-R)\,I_{scat}+R\,I_{refl}$，其中 $R$ 为光栅化得到的反射率图。反射图像 $I_{refl}$ 通过查询可学习的反射光场 $\Phi_{refl}$ 并施加 Schlick 近似的 Fresnel 调制得到：$I_{refl}=F\cdot\Phi_{refl}(\mathbf{x}^{refl},\mathbf{r})$，$F=F_0+(1-F_0)(1-\mathbf{n}\cdot\boldsymbol{\omega}_o)^5$。
+
+\textbf{三阶段残差引导策略。}阶段 I 仅优化 $G_{scat}$，漫反射表面被可靠重建，而反射/透射区域因视角不一致而留空，得到残差图 $\rho=I_{GT}-I_{scat}$；阶段 II 从收敛的 $G_{scat}$ 初始化 $G_{refl}$ 并冻结前者，每个反射高斯的颜色先验由可学习环境图提供：$\mathbf{c}_i^{refl}=\mathbf{f}_{0,i}\odot E(\mathbf{r}_{r,i})$。代入渲染方程并令光度误差为零，得最优条件 $R(I_{refl}-I_{scat})=\rho$——漫反射区域 $\rho\approx0$ 自然由 $R\to0$ 满足，反射/透射区域则迫使 $R>0$ 且 $I_{refl}$ 产生正确辐射，从而隐式驱动反射高斯恢复准确几何（因仅正确的法线才能查询到正确辐射）。阶段 III 联合优化反射光场与散射高斯，完成透射场景的完整重建。反射光场 $\Phi_{refl}$ 使用 8 层 MLP（256 隐藏单元），输入经 Fourier 特征编码（$L=12$），前 4 层只处理位置编码以提取空间特征，第 5 层起拼接方向编码并加入位置跳跃连接。
+
+\paragraph{表面嵌入替代 RGB 监督透明区域}
+
+TransmissiveGS 依靠残差引导策略自动分离反射与散射，但前提是 RGB 损失能有效约束高斯位置。对于透明物体，这一前提本身就不成立。TranSplat（2025.02）~\cite{2502_07840}（Surface Embedding-guided）修改了原始 3DGS 的监督信号——用表面嵌入（对光照不敏感的视角无关几何描述符）替代 RGB 光度损失作为透明区域的监督——Splatting 和 $\alpha$-混合 保持不变。针对标准 3DGS 依靠 RGB 光度损失约束高斯位置、但透明物体在 RGB 中几乎不可见导致不透明度 $\alpha$ 坍缩为零的局限，用表面嵌入（视角无关、对光照不敏感的几何描述符）替代 RGB 光度损失作为透明区域的监督信号。核心思想是：表面嵌入由潜在扩散模型生成，其梯度阻止透明表面上 $\alpha$ 坍缩为零。核心问题是：标准 3DGS 依靠 RGB 光度损失约束高斯位置，但透明物体在 RGB 图像中几乎不可见，导致其表面高斯的不透明度 $\alpha$ 在优化中坍缩为零，深度重建不完整。
+
+\textbf{表面嵌入生成。}具体流程分两阶段：第一阶段用潜在扩散模型结合 ControlNet，从 RGB 图像和透明区域掩码生成表面嵌入图，训练数据由改进的 SurfEmb 网络（类别级而非物体级）生成真值。
+
+\textbf{双通道联合光栅化。}第二阶段将 3DGS 的渲染方程扩展为双通道联合光栅化，同时对 RGB 和表面嵌入进行渲染：
+
+\begin{equation}
+C_{\text{RGB}} = \sum_{j=1}^{N} c_{\text{RGB},j}\,\alpha_j\,T_j, \quad C_{\text{Surf}} = \sum_{j=1}^{N} c_{\text{Surf},j}\,\alpha_j\,T_j
+\end{equation}
+
+其中 $T_j = \prod_{k=1}^{j-1}(1-\alpha_k)$ 为累积透射率。联合损失函数为 $L = \frac{1}{2}L_{\text{RGB}} + \frac{1}{2}L_{\text{Surf}}$，两项均采用 $\lambda=0.2$ 的 L1+D-SSIM 组合。关键设计在于反向传播时 RGB 与表面嵌入共享高斯的位置 $\mu$、协方差 $\Sigma$ 和不透明度 $\alpha$ 参数——表面嵌入的梯度阻止了 $\alpha$ 在透明表面上坍缩为零，从而保证完整几何重建。
+
+\paragraph{三阶段几何-外观-深度解耦透明重建}
+
+TranSplat 用表面嵌入绕过了 RGB 失效的问题，但透明表面的深度提取仍然面临固有矛盾。TSGS（2025.04）~\cite{2504_12799}（Improving Gaussian Splatting for Transparent Surface Reconstruction）修改了原始 3DGS 的训练流程——用三阶段策略（几何学习 $\to$ 外观升级 $\to$ 深度提取）替代单阶段端到端训练——Splatting 渲染流程保持不变。核心矛盾是”透明-深度困境”（transparency-depth dilemma）：同一组高斯的不透明度分布无法同时满足真实感 RGB 渲染（需要低不透明度混合前后景）和精确首表面深度提取（需要高不透明度集中在真实表面）。
+
+\textbf{阶段 I：几何学习。}利用 Grounded-SAM 分割透明区域掩码 $M_T$，将 StableDelight 生成的去光照图像 $I_D$ 与原始图像融合得到混合图 $I'_D = M_T \cdot I_D + (1 - M_T) \cdot I_{\text{GT}}$，仅抑制透明区域的高光；同时引入可学习的透明属性 $t_i \in [0,1]$ 标记每个高斯是否透明，用 BCE 损失监督渲染的透明掩码与 Grounded-SAM 真值的一致性；法线先验来自 StableNormal 预测的法线图，但加入鲁棒掩码 $M_n = \mathbb{1}(N_p^T N_r > \tau_n)$，在渲染法线与先验偏差过大时自动忽略该先验，防止错误先验破坏几何。
+
+\textbf{阶段 II-III：外观升级与深度提取。}第二阶段锁定不透明度 $o_i$ 不再更新，将外观模型从球谐函数升级为各向异性球面高斯（ASG）捕捉视角相关高光，用原始图像 $I_{\text{GT}}$ 监督。推理时使用累积透射率滑动窗口算法提取首表面深度：沿射线搜索 $T_i \in [T_{\text{end}}, T_{\text{start}}]$ 区间内权重最大的窗口 $W^* = \arg\max_j \sum_{i \in W_j} T_i \alpha_i$，然后在窗口内加权平均平面深度 $D_{\text{first}}(u) = \frac{\sum_{i \in W^*} T_i \alpha_i \delta_i(u)}{\sum_{i \in W^*} T_i \alpha_i}$，既隔离了首表面贡献又抑制了悬浮物噪声。超参数设置：$\lambda_t = 0.1$，$\lambda_n = 0.1$，$\lambda_f = 100$。
+
+\paragraph{物体感知分组与物理模拟场景更新}
+
+TSGS 解决了透明-深度困境但需要稠密输入。TRAN-D（2025.07）~\cite{2507_11069}（2DGS-based Sparse-view Transparent Object Depth Reconstruction）修改了原始 2DGS 的初始化、分组和正则化——用随机点初始化 + 物体感知分组 + 物理模拟场景更新替代标准流程——光栅化保持不变。核心挑战是稀疏视角（仅 6 张图像）下的三大难题：SfM 初始化失败、基础模型的泛化偏差导致透明-背景边界误判、以及物体动态变化（移除/倒塌）需完全重新扫描。TRAN-D 基于 2DGS 而非 3DGS，动机是 2D 高斯盘直接贴合表面，比 3D 高斯的体积表示更适合透明物体的表面建模。整体流程分三个模块：
+
+\textbf{透明物体分割。}使用类别特定文本提示（非字典词如 ``786dvpteg''）微调 Grounded SAM，所有透明物体视为单一类别。文本提示的非词典设计避免了通用提示（如 ``glass''）在杂乱场景中的误分类。仅微调图像主干 1 epoch，BERT 文本主干冻结。
+
+\textbf{物体感知 2DGS。}从随机点初始化（因 SfM 在透明场景中无法恢复可靠点云），联合光栅化三路信号——RGB 图像、实例分割掩码 $M \in \mathbb{R}^{3 \times H \times W}$ 和物体索引 one-hot 向量 $o_i \in \mathbb{R}^{N+1}$（$N$ 个物体 + 1 背景通道）。分割掩码渲染方程为 $m(\mathbf{x}) = \sum_{i=1}^{N} m_i\,\alpha_i\,\mathcal{G}_i(u(\mathbf{x})) \prod_{j=1}^{i-1}(1-\alpha_j\,\mathcal{G}_j(u(\mathbf{x})))$，one-hot 向量经 softmax 归一化后用 Dice 损失监督。核心创新是\textbf{物体感知 3D 损失}：为每个物体选取 $n_g$ 个最远 2D 高斯作为组中心，各取 $n_n$ 个最近邻，计算组内距离和 $S_i = \sum_{\mathbf{x} \in \text{NN}(c_i)} \|\mathbf{x} - c_i\|$ 及组间最小距离 $d_i = \min_{j \neq i}\|c_j - c_i\|$，通过最小化方差 $L_d = \text{Var}(d_1, \ldots, d_{n_g})$ 和 $L_S = \text{Var}(S_1, \ldots, S_{n_g})$ 促使被遮挡区域的高斯均匀分布。关键洞察：可见区域的高斯因 RGB 损失已稳定，而遮挡区域的高斯位置不确定、距离波动大——方差损失迫使波动距离向稳定距离靠拢，从而在遮挡区域形成合理的凸面。三层层次化分组 $(n_g, n_n) \in \{(16,16), (32,16), (64,32)\}$ 适应不同优化阶段的高斯数量。最终损失 $L = 0.5 L_c + 0.5 L_m + 1.0 L_{\text{one-hot}} + L_{\text{obj}}$，其中 $a_S = 10000/3$，$a_d = 1/3$。
+
+\textbf{物理模拟场景更新。}物体移除后，用 Material Point Method（MPM）在 Taichi 中模拟链式倒塌：先将 2DGS 渲染的深度图转为网格并采样粒子（杨氏模量 $5 \times 10^4$ Pa，泊松比 0.4），运行 100 步 MPM 模拟，再用单张鸟瞰图仅 100 次迭代重新优化高斯。在 TRansPose 合成数据集上，TRAN-D 将 MAE 降低超过 39\%，仅用 1 张图更新的 $\delta < 2.5\text{cm}$ 精度达 48.46\%，是基线方法使用 6 张图的 1.5 倍以上。
+
+\paragraph{透明高斯基元与延迟折射管线}
+
+TRAN-D 聚焦于稀疏视角的深度重建，但逆渲染（同时重建几何和材质参数）需要更完整的物理模型。TransparentGS（2025.04）~\cite{2504_18768}（Fast Inverse Rendering of Transparent Objects with Gaussians）修改了原始 3DGS 的高斯基元属性和渲染管线——用附加物理参数（法线、粗糙度、透明度、折射率）的透明高斯基元 + 延迟折射管线替代标准 SH 外观模型——Splatting 和 $\alpha$-混合 保持不变。核心难题有两个：3DGS 球谐系数无法建模镜面折射/反射的高频外观变化，以及光栅化框架无法处理折射产生的非直线路径（二级射线效应）。核心贡献有三：
+
+\textbf{透明高斯基元。}在 3DGS 形状参数（位置、协方差、不透明度）基础上，为每个高斯附加法线 $\mathbf{n}$、粗糙度 $\rho$、金属度 $m$、透明度 $t \in [0,1]$ 和折射率 $\eta$（IOR）。BSDF 分解为反射与透射两项 $f = (1-t)f_r + t f_t$，其中 BRDF $f_r$ 使用 Cook-Torrance 模型，BTDF $f_t$ 处理完美镜面折射。对于完美镜面（$\rho=0$），折射方向由 Snell 定律解析计算 $\mathbf{d}_t$，反射方向 $\mathbf{d}_r = 2(\boldsymbol{\omega}_{in}\cdot\mathbf{n})\mathbf{n} - \boldsymbol{\omega}_{in}$。关键设计是不用不透明度 $o$ 本身表示透明度——低不透明度会破坏表面表示使折射/反射不可计算——而是引入独立参数 $t$ 在不透明和透明材质间插值。着色遵循渲染方程 $L = \int_{\Omega_{in}} L_{in}(\mathbf{x},\boldsymbol{\omega}_{in})\,f(\mathbf{x},\boldsymbol{\omega}_o,\boldsymbol{\omega}_{in})\,|\mathbf{n}\cdot\boldsymbol{\omega}_{in}|\,\mathrm{d}\boldsymbol{\omega}_{in}$。
+
+\textbf{延迟折射。}标准 3DGS 的前向着色先算各高斯的颜色再 $\alpha$-混合，但折射公式 $L_t = (1-F)L_{in}(\mathbf{x},\mathbf{d}_t)$ 关于法线 $\mathbf{n}$ 非线性，操作顺序影响结果。TransparentGS 采用延迟着色：先用 alpha-weighted 聚合所有折射相关属性（法线 $N = \sum_i T_i \alpha_i \mathbf{n}_i$），再计算命中点——考虑高斯各向异性，射线 $\mathbf{o}_{cam}+t\mathbf{v}$ 上高斯响应最大的深度通过解析求解 $G(t) = \exp(-\frac{1}{2}(\mathbf{o}_{cam}+t\mathbf{v}-\boldsymbol{\mu}_i)^\top\Sigma^{-1}(\mathbf{o}_{cam}+t\mathbf{v}-\boldsymbol{\mu}_i))$，聚合为 alpha-weighted 命中点 $X = \mathbf{o}_{cam} + \mathbf{v}\frac{\sum_i T_i \alpha_i \boldsymbol{\mu}_i^{\top}\Sigma_i^{-1}\mathbf{v}}{\sum_i T_i \alpha_i \mathbf{v}^{\top}\Sigma_i^{-1}\mathbf{v}}$。此公式利用各高斯协方差矩阵的各向异性计算最优射线-高斯交点，比简单取高斯中心更准确。对于有色透明物体，透射颜色扩展为 $L_t = (1-F)L_{in}(\mathbf{x},\mathbf{d}_t) e^{-\sigma(\lambda) d}$，其中指数吸收项用 alpha-weighted 基础颜色近似 $\sum_i T_i \alpha_i b_i$，实现折射与固有颜色的解耦。
+
+\textbf{高斯光场探针（GaussProbe）。}传统环境贴图只有 2 个自由度，无法表示附近物体的间接光照，导致视差伪影。GaussProbe 先用标准 3DGS 重建环境，体素化场景并在透明物体包围盒周围放置探针（8 或 64 个）。每个探针沿单位球切平面全景渲染（替代标准图像平面投影，Jacobian 矩阵修改为 $J = \frac{1}{(x^2+y^2+z^2)^{3/2}}\begin{bmatrix} y^2+z^2 & -xy & -xz \\ -xy & x^2+z^2 & -yz \\ -xz & -yz & x^2+y^2 \end{bmatrix}$），存储颜色全景和深度全景。
+
+\textbf{深度迭代查询（IterQuery）}算法消除视差：初始化各探针查询方向 $\mathbf{d}_i := \mathbf{d}$，查询深度 $t_i = \Phi_d(p_i, \mathbf{d}_i)$ 得交点 $p_i + t_i\mathbf{d}_i$，三线性插值投影到被查询射线得新深度 $\hat{t} = \sum_{i=1}^K w_i((p_i + t_i\mathbf{d}_i - \mathbf{o})\cdot\mathbf{d})$，更新方向 $\mathbf{d}_i := \frac{\mathbf{o}+\hat{t}\mathbf{d}-p_i}{\|\mathbf{o}+\hat{t}\mathbf{d}-p_i\|}$，迭代 5 次。收敛时探针深度与射线交点一致，等价于射线与场景表面的真实交点。多阶段重建流程：阶段 1 环境重建并烘焙 GaussProbe；阶段 2 用透明高斯基元在物理延迟渲染管线中联合 GS 与 SDF 重建几何与材质——GS 渲染的命中点图引导 SDF 采样，SDF 提取的网格代理二级射线追踪查询 GaussProbe。总损失 $L = (1-\lambda_1)L_1 + \lambda_1 L_{\text{D-SSIM}} + \lambda_2 L_{\text{normal}} + \lambda_3 L_{\text{mask}}$，其中 $\lambda_1=0.2$，$\lambda_2=0.2$，$\lambda_3=1$。1 小时内完成重建，支持实时新视角合成。
+
+\paragraph{SortFree 加权 OIT 与活跃集加速}
+
+TransparentGS 通过延迟折射管线处理折射光路，但其计算开销较大。SparseOIT（2026.05）~\cite{2605_13855}（Order-Independent Transparency）修改了原始 3DGS 的渲染方程——用 SortFree 加权 OIT 方程替代排序依赖的 $\alpha$-混合——高斯属性保持不变。它解决 OIT（顺序无关透明）3DGS 方法的两大瓶颈：训练速度远慢于标准体渲染 3DGS，且新视角渲染质量显著下降。
+
+\textbf{梯度独立性与活跃集。}核心洞察：OIT 渲染方程移除排序后，各高斯之间几乎解耦——反向传播中每个高斯的梯度 $\frac{\partial C}{\partial c_i} = (1-T)\frac{\alpha_i w_i}{Q}$、$\frac{\partial C}{\partial \alpha_i} = (1-\alpha_i)(F-c_0) + (1-T)\frac{\alpha_i}{Q}(c_i-F)$、$\frac{\partial C}{\partial w_i} = (1-T)\frac{\alpha_i}{Q}(c_i-F)$ 仅依赖于全局聚合量 $P = \sum_i c_i\alpha_i w_i$、$Q = \sum_i \alpha_i w_i$、$F = P/Q$，各高斯变量\textbf{相互独立}。这意味着大部分高斯在优化后期已经收敛，不需要每步都参与计算。
+
+SparseOIT 采用\textbf{活跃集方法}（active set method）利用这种稀疏性。首先采用 SortFree 的加权 OIT 渲染方程替代标准 $\alpha$-混合：$C = T\,c_0 + (1-T)\frac{\sum_{i=1}^N c_i\alpha_i w_i}{\sum_{i=1}^N \alpha_i w_i}$，$T = \prod_{i=1}^N(1-\alpha_i)$，其中权重 $w_i = \max(0, 1-\eta\,v(\mathbf{d}))$ 由可学习参数 $\eta$ 和三阶球谐 $v(\mathbf{d}) \in \mathbb{R}^{4^2 \times 3}$ 定义（近处高斯权重大）。由于 OIT 方程不含累积透射率对排序的依赖，可以独立渲染不同子集的高斯然后合成。
+
+\textbf{活跃集加速。}高斯的活跃性定义为 $\mathbb{1}_{\text{active}}(i) = \exists\,v \in \{\boldsymbol{\mu}_i, \mathbf{q}_i, \mathbf{s}_i, o_i, \mathbf{h}_i, w_i\},\,(\|\nabla_v\| > \epsilon_v)$，即至少一个属性的梯度非零。维护活跃集 $\mathcal{A}$ 和非活跃集 $\mathcal{B}$：对非活跃高斯，利用 OIT 方程的可分解性维护每个训练视角的\textbf{预渲染图}（pre-rendered image），训练时只对活跃高斯重新渲染，拟合目标图与预渲染图的差值。活跃集更新通过在 30 个最远点采样视角上评估梯度完成（子采样策略避免全局扫描），更新间隔 500 次迭代。从 3DGS 致密化终止的 15000 步开始应用活跃集策略。
+
+\textbf{GPU 加速。}设计递归 Per-Splat 并行化策略：由于各高斯梯度相互独立，反向传播无需全局同步，每个高斯可独立完成梯度的计算和参数更新。结合 CUDA 软件光栅化器，预渲染图在活跃集更新时批量计算并缓存。在 Mip-NeRF 360、Tanks and Temples 和 Deep Blending 数据集上，SparseOIT 的渲染质量大幅超越 SortFree 等 OIT 方法（PSNR 提升 1--2 dB），达到与标准体渲染 3DGS 可比的水平，同时训练时间显著缩短。损失函数与标准 3DGS 一致（L1 + D-SSIM），权重 $v$ 的学习率为 0.005，不透明度 $o$ 学习率 0.01，其余与 3DGS 相同。
+
+\paragraph{俄罗斯轮盘赌蒙特卡洛光线追踪}
+
+SparseOIT 通过活跃集方法加速了 OIT 训练，但本质上仍是光栅化方法，无法处理光线折射等需要射线追踪的效果。Stochastic Ray Tracing of Transparent 3D Gaussians（2025.04）~\cite{2504_06598} 修改了原始 3DGS 的渲染范式——用蒙特卡洛光线追踪（俄罗斯轮盘赌采样）替代排序后逐高斯 $\alpha$-混合——高斯的位置、协方差、颜色等属性保持不变。直觉上，这种方法将不透明度 $\alpha_i$ 视为一个概率开关：以概率 $\alpha_i$ "接受"该高斯（将其颜色作为最终颜色），以概率 $1-\alpha_i$ "跳过"。这种随机化使得每条射线只需处理一个交点，显著降低计算量。
+
+核心方法是将每个高斯的不透明度 $\alpha_i \in [0,1]$ 视为\textbf{俄罗斯轮盘赌}的二值随机变量：$\tilde{\alpha}_i = 1$（概率 $\alpha_i$）或 $\tilde{\alpha}_i = 0$（概率 $1-\alpha_i$），即 $E[\tilde{\alpha}_i] = \alpha_i$。由于标准体渲染 $L = \sum_{i=1}^M T_i \alpha_i c_i$（$T_i = \prod_{j=1}^{i-1}(1-\alpha_j)$）关于每个 $\alpha_i$ 线性，将 $\alpha_i$ 替换为独立二值变量 $\tilde{\alpha}_i$ 后得到\textbf{无偏估计} $\hat{L} = \sum_{i=1}^M \tilde{T}_i \tilde{\alpha}_i c_i$。关键推论：一旦某个高斯被接受（$\tilde{\alpha}_i=1$），所有更远的高斯自动被遮蔽——因为 $\tilde{T}_{i+1}$ 包含因子 $(1-\tilde{\alpha}_i)=0$——所以每条射线只需要着色\textbf{最近一个被接受的交点}，估计量退化为 $\hat{L} = c_i$。
+
+\textbf{BVH 加速实现。}实现上，为所有 3D 高斯构建 BVH 加速结构（AABB 取 $s = \sqrt{22.2/2} \approx 2.8$ 标准差范围），射线在 BVH 中单次遍历：对每个潜在交点计算 1D 高斯均值深度 $t$（射线与高斯椭球的交点取 1D 高斯峰值），用无状态三角哈希 $r(\mathbf{p}) = h_2(h_2(\mathbf{B}_2^T\mathbf{p}_{xy}) + r_1(p_z))$ 生成伪随机数并与 $\alpha_i$ 比较做俄罗斯轮盘赌。接受后立即将射线的远裁剪面设为当前深度 $t$，跳过更远的 BVH 节点——每条射线只遍历一次 BVH，不需要存储交点列表，不需要排序，载荷（payload）只保存最近被接受交点的索引和深度。多样本时（$N$ spp）在同一 BVH 遍历中维护 $N$ 个独立实例的状态，共享遍历开销。单样本在低端 GPU（MacBook M1 Max）上即可交互渲染，RTX 3090 上 room 场景（128 万高斯，$1557{\times}1038$）平均 12.2ms/帧（64 spp），而 3DGRT 需 34.3ms/帧。该方法已集成至 Adobe Substance 3D Viewer。
+
+\paragraph{神经高度场与递归细分追踪水面折射}
+
+前面方法的透明物体建模较为通用，而 RefracGS（2026.03）~\cite{2603_21695} 专门处理水面折射这一特定场景。它修改了原始 3DGS 的水面几何表示——用神经高度场（MLP 参数化的水面高度函数）替代高斯隐式表示——水下场景仍由标准 3DGS 渲染。核心挑战是：标准 3DGS 的光栅化假设光线直线传播，无法处理水面折射导致的光路弯曲；3DGRT 虽然引入了光线追踪，但其折射表面参数不可微，无法从图像中重建未知折射面。
+
+\textbf{递归细分追踪。}水面表示为 MLP 参数化的高度函数 $H(x,y)=z$，给定射线 $\mathbf{o}+t\mathbf{d}$，先在粗代理网格（训练时 $200{\times}200$ 分辨率）上做光线-网格求交，再对命中三角形执行 $N{=}2$ 次中点细分递归逼近 MLP 定义的真实等值面，每次只细分命中三角形，避免重建 BVH 和冗余 MLP 查询。直觉上，这就像用越来越细的三角形去逼近一个光滑曲面，每次只在光线命中的位置加细。命中点的法线通过重心坐标插值顶点法线获得（类似 Phong 着色），然后用向量形式的 Snell 定律计算折射方向：$\mathbf{T} = \eta(\mathbf{I} + c_1\mathbf{N}) - c_2\mathbf{N}$，其中 $\eta{=}n_1/n_2$ 为折射率之比，$c_1{=}\mathbf{N}{\cdot}\mathbf{I}$，$c_2{=}\sqrt{1{-}\eta^2(1{-}c_1^2)}$。折射后的光线沿新方向穿越水下场景，与高斯集合交互累积颜色。反向传播时，梯度沿折射光线回传至水面交点和法线，进而优化 MLP 参数，实现水面几何与水下场景的联合重建。训练中还引入不透明度损失 $L_o = \frac{1}{N}\sum_{i=1}^{N}\alpha_i^2$（权重 $\lambda_3{=}0.007$）来抑制稀疏视角区域的高不透明度漂浮物，总训练 15k 步，损失权重 $\lambda_1{=}0.8$（L1）、$\lambda_2{=}0.2$（SSIM）。
+
+\paragraph{三分量线性混合建模平面玻璃}
+
+RefracGS 专门处理水面折射，而 TR-Gaussians（2025.11）~\cite{2511_13009}（Planar Transmission and Reflection）处理平面玻璃等同时具有透射和反射性质的物体。它修改了原始 3DGS 的渲染输出——用三分量线性混合（透射 + 反射 + Fresnel 反射率）替代单路 $\alpha$-混合 颜色——高斯的几何参数保持不变。核心问题是：标准 3DGS 用单组高斯表示整个场景，无法区分透过玻璃看到的背景和在玻璃表面反射的虚像，导致透明表面区域出现严重的伪影和几何模糊。
+
+\textbf{三分量渲染。}最终图像 $C = (1{-}R)\,C_t + R\,C_r$，其中 $C_t$ 为透射图像（背景真实场景），$C_r$ 为反射图像（镜面对称的虚像），$R$ 为反射强度图。反射平面由可学习参数 $(\mathbf{u}_p, \mathbf{n}_p, w, h, R_0)$ 定义（中心位置、法线、宽高、基础反射率），反射强度使用 Schlick 近似的 Fresnel 模型计算：$R_{\text{raw}}(\mathbf{u}) = R_0 + (1{-}R_0)(1{-}\mathbf{n}_p{\cdot}\mathbf{d})^5$，其中 $\mathbf{d}$ 为视线方向。直觉上，视线越接近掠射角（$\mathbf{n}_p{\cdot}\mathbf{d}$ 越小），反射越强、透射越弱，这与日常经验一致——从正面看窗户是透明的，从侧面看则像镜子。
+
+\textbf{镜像高斯与正则化。}反射图像通过将主高斯关于反射平面做镜像变换生成：镜像位置 $\tilde{\mathbf{u}}_i = \mathbf{u}_i - 2(\mathbf{u}_i{-}\mathbf{u}_p)^T\mathbf{n}_p/\|\mathbf{n}_p\|\,\mathbf{n}_p$，旋转矩阵的主轴也做相应对称变换。为区分玻璃区域，每个高斯增加可学习的玻璃标记 $m_i$，渲染出反射遮罩 $M(\mathbf{u})$。正则化方面，引入深度方差损失 $L_d$ 促使高斯聚集在真实表面附近（分离反射与透射分量），以及梯度冲突损失 $L_c$ 最小化透射图像与反射图像梯度的内积。训练分三阶段：前 3k 步仅优化主高斯，中间 3k 步冻结高斯梯度调整反射平面，最后 24k 步联合优化，总 30k 步。
+
+\paragraph{界面-透射-反射三组高斯分解式表示}
+
+TR-Gaussians 限定于平面玻璃，GLINT（2026.03）~\cite{2603_26181}（Gaussian Radiance Transport）则提出场景级的透明度建模。它修改了原始 3DGS 的场景表示——用分解式高斯表示（界面集 + 透射集 + 反射集三组高斯）替代单组高斯——每组高斯内部的 Splatting 流程保持不变。核心问题是标准 3DGS 的”透明度-深度两难”：透明表面贡献的辐射低时优化会将其不透明度压至零导致被剪枝消失，而提高不透明度又使其变为不透明遮挡物阻挡背景。
+
+\textbf{分解式高斯表示。}将场景高斯按光学角色显式分为三组：界面集 $G_{\text{intr}}$（捕获主可见表面）、透射集 $G_{\text{trans}}$（建模透过透明表面的背景）、反射集 $G_{\text{refl}}$（编码环境反射辐射）。直觉上，就像给场景安排了三个”演员”分别扮演不透明表面、透明背景和反射内容，各司其职。
+
+\textbf{BSDF 分解渲染。}渲染时，先用光栅化从 $G_{\text{intr}}$ 生成 G-buffer（深度、法线、透明度 $t$、高光率 $s$），再用光线追踪分别查询 $G_{\text{trans}}$ 和 $G_{\text{refl}}$。出射辐射按 BSDF 启发的分解计算：$L_o = (1{-}t)\,L_{\text{opaque}} + t\,L_{\text{transparent}}$，其中不透明分支 $L_{\text{opaque}} = (1{-}k_s)\,L_{\text{intr}} + k_s\,L_{\text{refl}}$ 混合界面基色与反射辐射，透明分支 $L_{\text{transparent}} = (1{-}k_s)\,L_{\text{trans}} + k_s\,L_{\text{refl}}$ 混合透射与反射。Fresnel 反射率使用 Schlick 近似：$F(\omega_o) = F_0 + (1{-}F_0)(1{-}\max(0, \omega_o{\cdot}n))^5$，高光权重 $k_s = s + (1{-}s)F(\omega_o)$ 由可学习的逐像素高光率 $s$ 调制。透明度定位无需人工标注遮罩，而是利用界面深度与透射深度之差 $\Delta z = |z_{\text{intr}} - z_{\text{trans}}|$ 自举生成二值透明度遮罩。
+
+\subsubsection{特定对象的反射建模}
+
+本路线介绍针对汽车、光泽表面等特定类型物体的反射建模方法。前面四小节按物理现象分类（镜面反射、镜面、偏振、透明/折射），本小节聚焦于特定类型物体的反射建模。汽车、光泽表面等物体有独特的反射特性，通用方法难以覆盖，需要专门的解决方案。
+
+\paragraph{视角相关高斯与双通道不透明度}
+
+Car-GS（2025.01）~\cite{2501_11020} 专门针对 3D 汽车重建中的反射和透明表面挑战。它修改了原始 2DGS 的不透明度和监督机制——用可学习混合不透明度（外观/几何双通道）+ 视角相关高斯替代单一不透明度参数——Splatting 流程保持不变。核心难题是：汽车车身高光泽金属漆面产生强烈的视角相关镜面反射，车窗则同时具有透明与反射双重属性——标准 2DGS 用同一组不透明度参数渲染外观图和几何图，无法处理这种复杂性：外观射线应穿透车窗继续传播，而深度射线应在车窗表面终止。
+
+Car-GS 的核心设计有三个组件。第一，\textbf{视角相关高斯}（VDG）：为每个训练视角定义一组专用高斯来拟合镜面高光，训练时加入不透明度正则化 $L_{\text{vdg}} = w_{\text{vdg}}\frac{\sum_{i=1}^{N_{\text{vdg}}} o_{\text{vdg},i}}{N_{\text{vdg}}}$（$w_{\text{vdg}}{=}0.2$），确保 VDG 仅在必要时贡献高光，推理时丢弃 VDG 仅保留视角共享高斯。直觉上，VDG 是"一次性"高光——只在训练时存在，帮助模型学会车身的几何，推理时被丢弃后高光信息已隐式编码在剩余高斯中。第二，\textbf{可学习混合不透明度}（LHO）：每个高斯拥有独立的外观不透明度 $o_k$ 和几何不透明度 $\text{geo}\_o_k$，分别用于渲染 RGB 图和法线/深度图，透明表面可通过设置 $\text{geo}\_o_k{=}1, o_k{=}0$ 来建模；一致性损失 $L_{\text{lho}} = w_{\text{lho}}\frac{\sum_{k=1}^{N}|o_k - \text{geo}\_o_k|}{N}$（$w_{\text{lho}}{=}3.0$）防止两者过度偏离。第三，\textbf{质量感知监督模块}：利用预训练法线估计模型的预测作为伪标签，但当视角射线与 2D 高斯法线夹角 $\theta$ 小于阈值 $\tau$ 时自动置零监督权重（$w_n{=}0$），因为这些掠射角度下的法线预测不可靠。VDG 初始化使用单目深度估计的伪点云而非 COLMAP 稀疏点云，以覆盖无纹理的反射区域。
+
+\paragraph{延迟 PBR 着色与基础模型几何先验}
+
+Car-GS 为汽车量身定制了双通道不透明度，而 GS-2DGS（2025.06）~\cite{2506_13110}（Geometrically Supervised 2DGS for Reflective Objects）修改了原始 2DGS 的外观模型——用延迟 PBR 着色管线 + 基础模型几何先验替代 SH 外观编码——Splatting 和 $\alpha$-混合 保持不变。核心矛盾是：标准 2DGS 使用球谐（SH）编码视角相关颜色，但 SH 的低频特性无法表达镜面反射的尖锐峰值，导致反射区域几何退化。
+
+具体而言，GS-2DGS 在每个 2D 高斯基元上附加 PBR 参数（反照率 $a$、金属度 $m$、粗糙度 $\alpha$），并采用延迟着色（deferred shading）：先将所有基元的材质属性经 $\alpha$-混合写入 G-Buffer，再在像素级执行 Cook-Torrance BRDF 着色。直觉上，延迟着色的动机是避免前向着色中沿光线各基元法线不一致导致的镜面反射模糊化——当多个重叠高斯具有略微不同的法线时，前向着色先独立计算各基元的 BRDF 再混合，等效于加宽了 BRDF 波瓣。
+
+\textbf{几何监督与 PBR 正则化。}几何监督方面，利用单目法线估计模型和深度估计模型提供伪真值，分别用法线损失 $L_n = \|\hat{n}_i - \tilde{n}_i\|_1 + (1 - \hat{n}_i^T \tilde{n}_i)$ 和尺度不变深度损失 $L_d = \|(\sigma D + b) - \tilde{D}\|^2$（其中 $\sigma$ 和 $b$ 通过最小二乘法对齐渲染深度与预测深度）进行正则化。PBR 参数通过边缘感知平滑项 $L_{pbr} = \|\nabla X\| \cdot \exp(-\|\nabla C_{gt}\|)$ 约束，在颜色变化剧烈处允许材质突变。总损失为 $L = L_{GS} + \lambda_n L_n + \lambda_d L_d + \lambda_{light} L_{light} + \lambda_{pbr} L_{pbr}$，其中环境光用可学习的 HDR cube map 表示，通过 split-sum 近似计算镜面反射。
+
+\paragraph{延迟着色与 SDF 互监督消除浮游体}
+
+GS-2DGS 通过基础模型先验改善了几何质量，但高斯本身仍然容易出现浮游体（floaters）——远离表面的零散高斯。GS-ROR²（2024.06）~\cite{2406_18544}（Bidirectional-guided 3DGS and SDF）修改了原始 3DGS 的着色和正则化——用延迟着色 + SDF 互监督替代前向着色 + 纯光度监督——Splatting 流程保持不变。核心问题是反射物体逆渲染中高斯的几何退化。
+
+然而延迟着色仅解决了渲染模糊问题，高斯的几何仍存在浮游体（floaters）和错误表面，因为高斯倾向于过拟合训练光照下的外观。
+
+\textbf{SDF 互监督与感知剪枝。}GS-ROR² 引入 SDF 作为\textbf{几何正则化先验}，提出无渲染的互监督（rendering-free mutual supervision）：高斯渲染的深度和法线监督 SDF 训练，SDF 的零等值面反过来约束高斯几何，即 $L_{gs \to sdf} = |sg[D_{gs}] - D_{sdf}| + (1 - \langle sg[\mathbf{n}_{gs}], \mathbf{n}_{sdf} \rangle)$ 和 $L_{sdf \to gs} = |D_{gs} - sg[D_{sdf}]| + (1 - \langle \mathbf{n}_{gs}, sg[\mathbf{n}_{sdf}] \rangle)$，其中 $sg[\cdot]$ 为 stop-gradient 操作，使双向监督强度可以不对称。为消除远离表面的浮游高斯，GS-ROR² 提出\textbf{SDF 感知剪枝}：对每个高斯中心检查 SDF 值，若超过阈值 $s_\tau$ 则剪除。阈值 $s_\tau$ 通过 SDF 的概率密度函数自动确定，$s_\tau = \Phi^{-1}(2p_t) \cdot \sigma$，其中 $p_t = 0.01$ 为预设超参数，$\sigma$ 为 SDF 场的标准差，随优化自动收紧。最后，利用高斯的精炼法线对上采样后的 SDF 做微调，提取高质量网格——整个流程仅需 TensoSDF 全分辨率训练时间的 33\%。
+
+\paragraph{两阶段快速几何与蒙特卡洛逆渲染}
+
+GS-ROR² 用 SDF 互监督消除浮游体，但未对材质分解的精度做进一步优化。GOGS（2025.08）~\cite{2508_14563}（Geometry and Relighting for Glossy Objects）修改了原始 3DGS 的材质求解策略——用两阶段管线（快速几何 + 精确逆渲染）替代单阶段联合优化——Splatting 和延迟着色保持不变。直觉上，第一阶段"快而粗"地建立几何，第二阶段"慢而精"地分解材质。
+
+\textbf{阶段 I：快速几何重建。}使用延迟着色 + split-sum 近似快速获得初始几何和粗材质：$L_s(\omega_o) \approx \underbrace{\int f_s(\omega_i) (\omega_i \cdot n) d\omega_i}_{\text{BRDF factor}} \cdot \underbrace{\int L_i(\omega) D(\omega)(\omega \cdot n) d\omega}_{\text{Lighting factor}}$，其中 BRDF factor 预计算为 2D 查找纹理，Lighting factor 通过三线性插值查询预滤波 Mipmap cube map（索引为反射方向 $\omega_r = 2(n \cdot \omega_o)n - \omega_o$ 和粗糙度 $R$）。同时利用基础模型提供法线和深度先验监督：$L_{geo\text{-}n} = \|\hat{N} - \tilde{N}\|_1 + (1 - \frac{\hat{N} \cdot \tilde{N}}{\|\hat{N}\| \|\tilde{N}\|})$。
+
+\textbf{阶段 II：蒙特卡洛逆渲染。}固定几何，用\textbf{蒙特卡洛重要性采样}优化完整渲染方程，精确求解金属度 $m$、反照率 $a$ 和粗糙度 $\rho$。漫反射分量按 Lambertian 分布采样 $p_d(\omega_i) = \frac{1}{\pi}$，镜面分量按 GGX 法线分布采样 $p_s(\omega_i) = \frac{D(h)}{4(\omega_o \cdot h)}$，并通过 balance heuristic 多重重要性采样合并：$w_k(\omega_i) = \frac{\alpha_k p_k(\omega_i)}{\sum_{m \in \{d,s\}} \alpha_m p_m(\omega_i)}$，其中 $\alpha_d = N_d / (N_d + N_s)$ 为策略比例。为补偿高频镜面伪影，引入球面 Mipmap 特征补偿 $L_c = f_c(K, h)$，其中 $h = M(\theta_r, \phi_r, R)$ 通过球面 Mip-grid 查询反射方向和粗糙度编码特征，$K$ 为 G-Buffer 中的混合特征图。最终着色为 $L_o^{final} = L_o^{pbr} + L_c$，其中补偿项 $L_c$ 仅在训练时启用，重光照时禁用以确保物理正确性。
+
+\paragraph{逐基元纹理映射替代单色属性}
+
+GOGS 在像素级优化材质参数，TextureSplat（2025.06）~\cite{2506_13348} 则将材质建模下沉到基元级别。它修改了原始 2DGS 的颜色编码——用逐基元纹理映射替代每个基元的单一颜色属性——Splatting 和延迟着色管线保持不变。核心问题是：标准 2DGS 中，每个基元的颜色由 SH 编码为一个常数（类比 Gouraud 着色），无法表达基元覆盖区域内的纹理变化。
+
+TextureSplat 的核心创新是利用 2D 高斯基元天然的局部 $(u,v)$ 参数化，为每个基元定义纹理映射：$a_k(x,y) = T_k(u_k(x,y), v_k(x,y))$，即将局部坐标映射到纹理空间（类比 Phong 着色），实现逐基元的法线贴图、反照率贴图等。直觉上，这就像给每个小面片贴上自己的"皮肤"，而非统一涂一个颜色。
+
+纹理坐标映射考虑了高斯核的有效支撑范围 $S_\sigma = 3$（高斯值在 $3\sigma$ 处近似为零），将 $[-S_\sigma, S_\sigma]^2$ 映射到纹理空间 $[0,1]^2$：$s = \frac{u + S_\sigma}{2S_\sigma}$, $t = \frac{v + S_\sigma}{2S_\sigma}$，然后在纹理图集上做双线性过滤采样。纹理图集通过硬件加速的纹理图集打包实现高效渲染（受 Ptex 启发）。每个基元存储反照率纹理 $T_k^a$、金属度纹理 $T_k^m$、粗糙度纹理 $T_k^r$ 和切空间法线贴图 $T_k^{n^t}$（仅存储 $n_x^t, n_y^t$ 两个分量，运行时重建 $n_z^t = \sqrt{1 - (n_x^t)^2 - (n_y^t)^2}$）。法线贴图通过基元旋转矩阵变换到世界空间：$\mathbf{n}_k(x,y) = R_k \mathbf{n}^t_k(x,y)$，使得单个基元表面产生精细的法线变化，这对捕获高频镜面效果至关重要。渲染采用延迟 PBR 管线，使用 Cook-Torrance BRDF 和 split-sum 近似，训练损失为 $L = L_{img} + \lambda L_n$，其中 $L_{img} = (1-\beta) L_1 + \beta L_{D\text{-}SSIM}$，$\beta = 0.2$。
+
+\paragraph{软 Voronoi 分区替代球谐方向编码}
+
+TextureSplat 通过纹理映射增加基元内的空间细节，但视角相关的方向建模仍然依赖 SH 或 SG。Spherical Voronoi（2025.12）~\cite{2512_14180} 修改了原始 2DGS 的方向编码——用 softmax 温度控制的软 Voronoi 分区替代球谐或球面高斯——延迟着色管线保持不变。直觉上，Spherical Voronoi 将单位球面分成若干"领地"（Voronoi 区域），每个领地有一个方向站点和对应的颜色，方向 $\omega$ 落在哪个领地就取什么颜色。温度参数控制领地边界的锐度：高温时边界清晰，低温时平滑过渡。
+
+核心问题是 SH 和 SG 的根本缺陷：SH 表达不连续函数时产生 Gibbs 振铃伪影，需要极高阶数才能拟合尖锐峰值；SG 的多个平滑波瓣之间存在梯度竞争，初始化敏感且高浓度参数下梯度病态。
+
+具体而言，在单位球上放置 $K$ 个方向站点 $\mathbf{s}_1, \ldots, \mathbf{s}_K \in S^2$ 及对应颜色值 $c_1, \ldots, c_K$，方向 $\omega$ 处的函数值为加权组合 $f_{SV}(\omega; \tau, \mathbf{s}, \mathbf{c}) = \sum_{k=1}^K w_k(\omega; \tau) \, c_k$，权重通过 softmax 计算：$w_k(\omega; \tau) = \frac{\exp(\tau_k \, \mathbf{s}_k \cdot \omega)}{\sum_{k'=1}^K \exp(\tau_{k'} \, \mathbf{s}_{k'} \cdot \omega)}$。温度参数 $\tau_k > 0$ 控制分区锐度——$\tau$ 趋于无穷时退化为硬 Voronoi 剖分，$\tau$ 较小时产生平滑过渡。
+
+在反射建模场景中，Spherical Voronoi 结合 2DGS 骨架，每个基元额外学习粗糙度 $r$ 和漫反射色 $d$。渲染采用延迟管线：最终颜色 $C = D + C_{spec}$，其中镜面色 $C_{spec} = \lambda \, C_n + (1-\lambda) \, C_f$ 分为近场和远场两项。远场项 $C_f$ 用可学习 cube map 查询反射方向。近场项 $C_n$ 使用\textbf{可学习 Voronoi 光探针}：在场景中放置若干探针，每个探针存储一组 Voronoi 函数参数 $(\tau_i, \mathbf{s}_i, \mathbf{c}_i)$，对表面点 $P$ 查询 $k$ 近邻探针并用逆距离加权插值。关键设计是粗糙度 $R$ 调制温度 $\tau$：$\tau = (1-R)\tau_- + R\tau_+$，其中 $\tau_-$ 和 $\tau_+$ 为固定超参数——低粗糙度（光滑表面）对应高温度，产生尖锐反射；高粗糙度展宽波瓣，产生模糊反射。这提供了一个统一的、可微的、显式的漫反射 + 镜面外观模型。
+
+\begin{takeaway}
+反射与镜面建模的核心挑战是标准 SH 在表示尖锐镜面高光时的 Gibbs 振铃和梯度竞争问题。Spherical Voronoi 用可学习的不重叠球面分区替代 SH 和 SG，为漫反射与镜面反射提供统一的颜色表示，其温度参数可动态调制反射锐度。环境贴图和高斯环境表示则提供了高效的全局光照查询方案。
+\end{takeaway}
+
+%% ============================================================
+
+
+\section{材质分解与逆渲染}
+\label{sec:05_2}
+
+本节从"重建外观"迈向"分解材质"——目标是从观测图像中反推每个表面的物理材质参数（BRDF）和场景光照，使重建结果支持重光照和材质编辑。首先讨论问题背景，然后按基于物理的逆渲染框架和全局光照分解两条主线展开。
+
+\subsection{问题背景：从外观到物理材质}
+
+本节讨论七条技术路线：（1）基于物理的逆渲染框架；（2）全局光照分解；（3）光泽与各向异性材质；（4）次表面散射；（5）水下与特殊环境；（6）光度立体与多视角约束；（7）其他逆渲染方法。
+
+第三章建立的球谐编码机制和第四章建立的几何重建能力，使 3DGS 能够重建外观精确的场景。但球谐编码的是“这个高斯从这个方向看是什么颜色”，而非“这个表面的物理材质是什么”。逆渲染（inverse rendering）的目标是：从观测的 RGB 图像出发，反推每个表面的物理材质参数（BRDF：双向反射分布函数）和场景光照（环境光），使得在任意新光照条件下都能正确渲染。
+
+逆渲染的核心挑战有三：第一，问题是欠约束的——同一外观可能由不同的材质-光照组合产生（如白色高光既可能是光滑白色表面在强光下的反射，也可能是金属表面在弱光下的漫反射）。第二，需要可微的物理渲染方程，将材质参数映射到渲染图像，以便通过梯度下降优化。第三，全局光照效果（阴影、相互反射）使问题进一步复杂化——每个像素的颜色不仅取决于该点的材质和光照，还受周围物体遮挡和反射的影响。
+
+\subsubsection{基于物理的逆渲染框架}
+
+本路线介绍将物理渲染方程（BRDF、可微光传输等）引入 3DGS 实现材质分解和逆渲染的方法。
+
+以下介绍 8 个将物理渲染方程引入 3DGS 的逆渲染方法，包括从 PBR 参数替换到可微光传输、统一着色、几何引导、空间变化、延迟反射及表面面元等多种逆渲染策略。
+
+\paragraph{PBR 参数替代球谐的两阶段逆渲染}
+
+Phys3DGS（2024.09）~\cite{2409_10335}（Physically-based 3D Gaussian Splatting）修改了原始 3DGS 的外观表示环节——用物理 PBR 参数（反照率、粗糙度、金属度）替代球谐颜色编码——几何重建和泼溅渲染管线保持不变。该方法采用\textbf{两阶段训练}策略，逐步从"重建外观"过渡到"分解材质"。
+
+\textbf{第一阶段：几何与混合表示。}先用标准 3DGS 训练并提取网格，得到 mesh-3DGS 混合表示：每个三角面片上分配一个扁平高斯，位置和形状由面片顶点决定。为解决 SDF 正则化导致的大高斯问题，提出 masked opacity 正则化 $L_o = -(1 - M) \log(1 - o)$（其中 $M$ 为二值掩码）。直觉上，这个损失只约束"应该透明"的背景区域，对前景高斯"放手不管"，从而不干扰后续 BRDF 参数的学习。同时引入高斯尺度正则化 $L_{sc} = \sum_i \max((s^i) - \lambda_{r_c} r^i_{sc}, 0)$，其中 $r^i_{sc}$ 为面片外接圆半径，$\lambda_{r_c} = 0.2$，防止高斯超出其对应三角面片的范围。法线通过\textbf{四元数增强}机制学习：每个网格高斯额外训练一个旋转四元数，稳定顶点位置并改善法线质量。
+
+\textbf{第二阶段：PBR 材质训练。}在混合表示上优化 BRDF 参数（反照率 $k_d$、粗糙度 $\alpha$、金属度 $m$）和间接光照 SH 系数。渲染方程为 Cook-Torrance 模型——这是图形学中标准的微面 BRDF 模型，将反射分解为漫反射项（$k_d \cdot L_i$）和镜面反射项（包含法线分布 $D$、Fresnel 项 $F$ 和几何遮蔽 $G$ 三个微面因子）：
+
+\begin{equation}
+L_o = k_d \cdot L_i + k_s \cdot \frac{D(\alpha) F(\mathbf{v}, \mathbf{h}) G(\mathbf{l}, \mathbf{v})}{4 (\mathbf{n} \cdot \mathbf{l})(\mathbf{n} \cdot \mathbf{v})}
+\end{equation}
+
+环境光照用球面高斯（SG）基表示，使渲染方程可解析积分——直觉上，SG 的指数形式与 Cook-Torrance 中的余弦项相乘后可以闭式求积，避免了 Monte Carlo 采样的噪声。由于 PBR 训练在 HDR 空间中产生大梯度，可能导致顶点位置剧变，引入表面正则化 $L_{sr} = \|\mathbf{x} - \mathbf{x}_{init}\|_2^2$ 约束高斯留在原始面片附近。总损失为 $L_{total} = L_{L1} + L_{PBR} + \lambda_{smooth} L_{smooth} + \lambda_o L_o + \lambda_{sc} L_{sc} + \lambda_{sr} L_{sr}$，整个管线端到端可微。
+
+\paragraph{屏幕空间光线追踪近似一次弹射间接光照}
+
+Phys3DGS 实现了完整的物理逆渲染管线，但其间接光照仅用 SH 编码，无法建模阴影和相互反射。3D Gaussian Inverse Rendering with Approximated Global Illumination（2025.04）~\cite{2504_01358} 进一步解决直接光照逆渲染忽略阴影和相互反射导致材质估计偏差的问题。基线方法使用延迟着色管线——直觉上，延迟着色是一种"先收集所有材质信息到像素级（G-Buffer），再统一做物理着色"的策略——将每个高斯的漫反射反照率 $a$、粗糙度 $\alpha$、金属度 $m$ 经 $\alpha$-混合写入 G-Buffer，再用简化 Disney BRDF $f = (1-m) \frac{a}{\pi} f_d + \frac{DFG}{4(\omega_i \cdot n)(\omega_o \cdot n)} f_s$ 做第一遍着色。关键改进是将表面法线从\textbf{渲染法线}（$\alpha$-混合各高斯法线）改为\textbf{深度法线}（从渲染深度图的有限差分计算），因为渲染法线仅反映沿光线各基元的独立朝向而不考虑局部几何结构，在新视角下不稳定。
+
+在此基础上，3D Gaussian IR 引入\textbf{屏幕空间光线追踪}近似一次弹射间接光照。对每个像素，从法线和视角方向生成反射射线 $r(t)$，在屏幕空间中以固定步长行进。每步 $i$ 比较射线深度 $z_i$ 与场景深度 $z_s$：$z_i = z_r(t_i) - z_s(\text{proj}(r(t_i)))$，当 $z_i$ 由负变正时检测到交点。实践中从 GGX 分布采样 $N_s = 8$ 条反射射线，用蒙特卡洛积分合并：$c_s' = \frac{1}{N_s} \sum_{i=1}^{N_s} \frac{f_s \, c_{1,i} (\omega_i \cdot n)}{p_{GGX}(\omega_i)}$，其中 $c_{1,i}$ 为第 $i$ 条射线追踪到的第一遍着色颜色。环境光用可学习 cube map 参数化，mipmap 级别由粗糙度决定：$\ell = \log_2(G_\alpha + 1) \cdot \ell_{max}$。总损失 $L_{total} = L_{rgb} + \lambda_{norm} L_{norm} + \lambda_{depth} L_{depth} + \lambda_{tv} L_{tv}$，其中深度-法线一致性损失和总变差损失分别约束几何质量和 G-Buffer 平滑性。
+
+\paragraph{可微辐射度方法适配高斯面元}
+
+3D Gaussian IR 在屏幕空间近似全局光照，但精度有限。Differentiable Light Transport with Gaussian Surfels（2025.09）~\cite{2509_18497}（via Adapted Radiosity）则追求更彻底的目标：将经典辐射度方法（radiosity，一种通过表面间能量传递计算全局光照的方法）适配到高斯面元框架中，实现真正的\textbf{可微全局光照}。传统 3DGS 逆渲染方法要么忽略可见性、要么冻结/二值化可见性，且只支持远场光源。本方法的核心假设是：每个高斯面元核内的材质、发射和出射辐射度为常数，并用 SH 展开。BRDF 采用漫反射 + Phong 混合模型：$f_i(\omega_I, \omega_O) = k_i \frac{a^d_i}{\pi} + (1-k_i) a^s_i \frac{s_i+1}{2\pi} |\omega_r \cdot \omega_I|^{s_i}$，其中 $k_i$ 为漫反射-镜面混合系数，$s_i$ 为 Phong 指数。
+
+\textbf{直接光照}方程为 $B^c_i = E^c_i + \frac{o_i(p_i)}{\Omega_i} \sum_{j \in LS} \int_{P_i} f_i(\omega_I) (Y(\omega_I)^T E^c_j) V_{ji}(p_j, x) dx$，其中 $V_{ji}$ 融合了角度衰减因子、高斯核和可见性（标准泼溅形式的透射率累积），$E^c_j$ 为光源的 SH 系数。直觉上，这个方程说"面元 $i$ 的出射辐射 = 自身发射 + 从所有光源 $j$ 接收并反射的辐射"，由于只考虑光源的直射，不涉及其他面元的反射，所以是非递归的，可直接求值。
+
+\textbf{全局光照}方程推广为递归形式——直觉上，此时"面元 $i$ 的出射辐射不仅来自光源，还来自所有其他面元 $j$ 的反射"，而面元 $j$ 本身的出射辐射又取决于其他面元，形成"鸡生蛋"的循环依赖：
+
+\begin{equation}
+B^c_i = E^c_i + \sum_{j=1}^{N} \int_{P_i} \int_{P_j} f_i(\omega_I) (Y(\omega_I)^T B^c_j) V_{ji}(x', x) dx' dx
+\end{equation}
+
+其中 $B^c$ 同时出现在等式两边，需要迭代求解。该方程形式上类似经典辐射度方程，但可见性 $V_{ji}$ 是非二值的（半透明高斯），且支持近场和远场光源。光源被建模为特殊的无穷小发射面元，方向光通过将点光源置于远处并禁用逆平方衰减来近似。求解器支持三种模式：自动微分（精确但内存开销大）、蒙特卡洛采样（高效近似）、以及伴随方法（反向传播仅需一次额外前向传播）。通过同时优化几何（面元位置和法线）、材质（BRDF 参数）和光照（发射 SH 系数），实现端到端的可微全局光照逆渲染。
+
+\paragraph{前向-延迟双路着色统一框架}
+
+前面的方法各自选择了前向着色或延迟着色中的一种。GUS-IR（2024.11）~\cite{2411_07478}（Gaussian Splatting with Unified Shading）则认识到两者各有优劣，\textbf{核心思想是}：前向着色与延迟着色并非对立选择，而是分别适配漫反射与光泽表面的不同物理先验——统一框架的本质是通过可学习权重实现先验的自适应选择。核心创新是\textbf{统一着色}：同时计算前向和延迟两条着色路径，通过可学习的权重平衡两者。前向着色（如 GaussianShader）先在每个高斯上独立计算 BRDF 再 $\alpha$-混合——这有利于漫反射表面的反照率恢复，因为各基元独立着色后混合的颜色更接近真实漫反射。延迟着色（如 GS-IR）先将材质属性混合到像素级再计算 BRDF——这有利于光泽表面，因为混合后的单一法线能保持镜面高光的锐利。
+
+具体而言，GUS-IR 首先分析并比较了两种着色方案：前向着色的渲染方程为 $\hat{\mathbf{c}}(\mathbf{u}) = \sum_{k=1}^N T_k \alpha_k \, c_{PBR}(p_k, \mathbf{n}_k, a_k, \rho_k, m_k)$，其中每个高斯的 BRDF 值 $c_{PBR}$ 先独立计算再混合；延迟着色为 $\hat{\mathbf{c}}(\mathbf{u}) = c_{PBR}(\bar{p}, \bar{\mathbf{n}}, \bar{a}, \bar{\rho}, \bar{m})$，其中 $\bar{\cdot}$ 表示 $\alpha$-混合后的像素级属性。在法线建模方面，GUS-IR 将每个高斯视为面元（surfel），使用\textbf{最短轴}作为法线方向（而非 GS-IR 中附加可学习向量或 GaussianShader 中预测法线残差），并配合深度相关正则化 $L_{depth} = \sum_i \|d_i - \hat{d}_i\|^2$ 改善几何重建。对于间接光照，GUS-IR 改进了 GS-IR 的探针烘焙方案，使用密集二值 cube map（而非 SH 系数）缓存遮挡信息，更精确地建模环境光遮蔽（AO），实现更好的间接光照处理。
+
+\paragraph{可优化网格显式构建表面贴合高斯}
+
+前述方法通过高斯的最短轴或附加可学习向量来隐式估计法线，其精度受到一定限制。GeoSplatting（2024.10）~\cite{2410_24204}（Geometry Guided Gaussian Splatting）反其道而行，\textbf{从可优化网格显式构建表面贴合的 3DGS}，从根本上解决法线精度问题。具体做法是使用 FlexiCubes 作为底层几何表示，在立方体网格上定义标量函数 $S: \mathbb{R}^3 \to \mathbb{R}$，通过可微 Dual Marching Cubes 提取等值面。然后将每个三角面片解析转换为一个各向异性高斯：在面片局部坐标系中计算三角形的二阶矩得到 2D 协方差，再提升为 3D 协方差并匹配高斯 $1\sigma$ 椭圆面积与三角形面积。
+
+PBR 属性（反照率 $a$、粗糙度 $\rho$、金属度 $m$）不是直接作为每个高斯的可学习参数，而是通过\textbf{多分辨率哈希网格}构建属性场：$\theta = E_d(\mathbf{x}) \to (a, m)$，$\phi = E_s(\mathbf{x}) \to \rho$，其中 $E_d, E_s$ 为 Instant-NGP 风格的多分辨率哈希编码器加小型 MLP。这使得属性在空间中连续变化且参数量与高斯数量解耦。训练分两阶段：先用前向着色（per-Gaussian Monte Carlo PBR + $\alpha$-混合）快速收敛，再切换到延迟着色（将属性泼溅到屏幕空间再像素级 PBR）精修外观，切换过程仅需 100 步优化（约 1 分钟）调整高斯的位移。损失函数包含光度项 $L_{photo} = L_1 + 0.2 \cdot L_{SSIM} + 5.0 \cdot L_{mask}$、SDF 熵正则化 $L_{sdf}$（从 $\lambda_{sdf} = 0.2$ 线性衰减至 $0.01$）、平滑正则化 $L_{smooth}$（$\lambda_{smooth} = 0.03$，扰动 $\sigma = 0.01$）和光照正则化 $L_{light}$（$\lambda_{light} = 0.15$，约束去调制光照的灰度一致性）。光传输通过 mesh-based 光线追踪计算遮挡感知的可见性，确保精确的材质分解。可选地，可集成 ReSTIR 路径追踪替代 SH 间接光照，以约 3 倍训练时间为代价获得更精确的间接光照。
+
+\paragraph{高斯顶点空间变化材质插值}
+
+前面所有方法都假设一个高斯内材质均匀。SVG-IR（2025.04）~\cite{2504_06815}（Spatially-Varying Gaussian Splatting）指出这是一个根本性的表示缺陷：原始3DGS中每个高斯只能持有一组常数材质参数，在整个高斯覆盖区域内产生均匀颜色，无法捕获材质的空间变化。SVG-IR 的核心创新是\textbf{空间变化高斯}（SVG）表示：在每个高斯的切空间中定义 $M$ 个\emph{高斯顶点}（Gaussian Vertex），类比三角网格的顶点概念，每个顶点持有独立的反照率 $a_i$、粗糙度 $r_i$ 和法线偏移 $\delta_i$。实践中 $M=4$。渲染时采用类光栅化的两阶段流程：\textbf{顶点着色}阶段对每个高斯顶点用基于物理的光照模型计算辐射度，得到 $M$ 个颜色 $c_i^{\{M\}}$；\textbf{片段着色}阶段对像素对应切空间坐标 $(u,v)$ 进行双线性插值，再经 $\alpha$-混合得到最终像素颜色：$C = \sum_{i=0}^n c_i \alpha_i T_i$，其中 $c_i = \text{interp}(c_i^{\{M\}}, u, v)$。光照模型方面，SVG-IR 对每个高斯顶点求解渲染方程 $L_o(x, \omega_o) = \int_{\Omega} f(x, a, r, \omega_i, \omega_o) L_i(x, \omega_i)(\omega_i \cdot n) d\omega_i$，均匀采样 $K$ 个方向，分别计算直接光照和间接光照。间接光照通过 BVH 加速的光线追踪在已学习的辐射场中累积：$L_i^{ind}(x, \omega_i) = \sum_{l=0}^n c_l \alpha_l T_l$，可见性阈值设为 $\tau=0.8$。重光照时，SVG-IR 将训练光下的间接光照替换为一次弹射的物理间接光照，从光线命中点出发用 BRDF 重新着色，实现动态间接光照。
+
+\paragraph{延迟渲染与残差渲染通道}
+
+RGS-DR（2025.04）~\cite{2504_18468}（Deferred Reflections and Residual Shading）针对前向着色的两个固有缺陷——镜面反射在 $\alpha$-混合时被模糊化、3D 高斯最短轴法线精度不够——采用\textbf{延迟渲染}架构。首先，每个面元（2D Gaussian Surfel）存储漫反射颜色 $c_d$、粗糙度 $\rho$、镜面色调 $s$ 和特征向量 $f$；渲染时先把这些属性经 $\alpha$-混合写入 G-Buffer（包括漫反射图 $I_d$、粗糙度图 $M$、镜面色调图 $S$、特征图 $K$、法线图 $N$）。然后在\textbf{像素级延迟着色}中计算物理反射：$c(\omega_o) = c_d + s \cdot L_s(\omega_o, n) + c_r(\omega_o)$，其中镜面光照 $L_s$ 通过 split-sum 近似（一种将 BRDF 积分和光照积分分离的近似技巧）从预滤波立方体 mipmap $E$ 中查询，根据粗糙度选择 mip 级别。好处是：只在可见像素上计算光照（节省计算），且使用2D面元产生的平滑法线（无需法线残差）。对于物理着色无法捕获的复杂效果（如相互反射），RGS-DR 引入\textbf{残差渲染通道}：利用球面 mipmap 方向编码 $h = \text{Sph-Mip}(\theta_r, \phi_r, \rho, M)$ 将反射方向和粗糙度编码为特征，与高斯特征 $k$ 做外积后送入浅层 MLP 产生残差颜色 $c_r = f_\theta(h, k \otimes h)$。训练损失为 $L = L_c + \lambda_d L_d + \lambda_n L_n + \lambda_\alpha L_\alpha$，其中法线一致性损失 $L_n = \sum_i w_i(1 - n_i^T N)$ 强制渲染法线与深度梯度法线一致，深度扭曲损失 $L_d = \sum_{i,j} w_i w_j |z_i - z_j|$ 迫使泼溅权重集中在表面附近。
+
+\paragraph{面元泼溅与深度区间分组}
+
+3DSS（2026.05）~\cite{2605_05876}（3D Surface Splatting for Inverse Rendering）从根本上重新设计了泼溅渲染管线。前面方法使用3D高斯作为渲染基元，但3D高斯本质是体积表示，没有明确的表面法线，导致逆渲染中法线估计和材质分解存在根本歧义。3DSS 改用\textbf{面元}（Surfel，即带方向的 2D 盘片）作为基本基元：每个面元由中心位置 $c \in \mathbb{R}^3$、两个切向量 $t_u, t_v \in \mathbb{R}^3$（同时编码方向和各向异性缩放）以及 PBR 材质属性（反照率 $\boldsymbol{a} \in [0,1]^3$、金属度 $m \in [0,1]$、粗糙度 $r \in [0,1]$）定义，表面法线隐式由 $n = t_u \times t_v / \|t_u \times t_v\|$ 给出。渲染基于经典的\textbf{椭圆加权平均}（EWA）面元泼溅——直觉上，EWA 是在屏幕空间对每个面元的贡献做高斯加权平均，而非简单的 $\alpha$-混合——对每个像素计算射线-面元交点的局部坐标 $(u,v)$，通过高斯重建核 $w = n_f \exp(-\frac{1}{2} \boldsymbol{u}^T \Sigma_{\text{mip}}^{-1} \boldsymbol{u})$ 加权，再经 Shepard 归一化 $\bar{a} = \sum_k w_k a_k / \sum_k w_k$ 得到属性值。3DSS 的关键创新是\textbf{深度区间分组}（Depth-Interval Grouping）：不同于3DGS按中心深度排序，3DSS 按深度区间起始值 $z_{\text{start}} = z - \delta_z$ 排序（其中 $\delta_z = \sqrt{t'^2_{u,z} + t'^2_{v,z}} \cdot r_{\text{cut}}$），当相邻面元的深度区间不重叠时精确分离不同表面层，避免跨深度不连续的属性插值污染。前向着色采用 split-sum IBL：$c_k = k_d \cdot \boldsymbol{a} \cdot L_d(n) + L_s(r, \mathbf{r}) \cdot (F_0 \cdot b_1 + b_2)$，其中 $F_0 = 0.04(1-m) + \boldsymbol{a} \cdot m$，基础反射率在电介质 Fresnel 值 0.04 和金属反照率之间插值。多层合成采用覆盖度模型：$\alpha_k = 1 - \exp(-\gamma \cdot W_k / 2\pi)$（$\gamma=2$），将累积高斯核权重转化为覆盖不透明度，最终 $C_{\text{out}} = \sum_{k=1}^K \tau_k \alpha_k \bar{c}_k$，$\tau_k$ 为残差透过率。
+
+\subsubsection{全局光照分解}
+
+本路线介绍将直接光照、间接光照、阴影等全局光照成分显式分离以实现独立编辑和重光照的方法。
+
+上面的方法主要关注如何将物理 BRDF 引入 3DGS 渲染管线。本节的方法则聚焦于\textbf{全局光照的分解}——将直接光照、间接光照、阴影等物理成分显式分离，使每个成分可独立编辑和重光照。以下介绍 7 个方法，涵盖全局光照分解、张量化光照、光照分解、相互反射建模、渐进辐射蒸馏、延迟着色以及辐射传输与反射。
+
+\paragraph{三阶段直接-阴影-间接光照分解}
+
+GI-GS（2024.10）~\cite{2410_02619}（Global Illumination Decomposition）通过三阶段管线将全局光照显式分解为直接光照、阴影和间接光照。Baseline 方法（如 GS-IR）用球谐编码间接光照，但球谐缺乏物理约束，学到的间接光照不可重光照。GI-GS 的设计动机是：将每个物理成分建模为独立的可微操作，使分解结果可编辑、可重光照。
+
+\textbf{第一阶段}用标准3DGS重建几何，法线作为高斯属性优化，通过深度图导出的伪法线 $\hat{n}$ 监督渲染法线：$L_n = \|n - \hat{n}\| + \lambda_{TV} L_{TV_{\text{normal}}}$，避免强制高斯退化为扁平盘的几何正则化导致的渲染质量下降。
+
+\textbf{第二阶段}建模直接光照：镜面分量通过 split-sum 近似分解为 $L_s = \underbrace{R}_{\text{BRDF积分}} \cdot \underbrace{I_s}_{\text{预滤波环境贴图}}$，漫反射分量从预卷积环境贴图 $I_d$ 查询。环境光遮蔽 $O(\mathbf{p})$ 通过从表面点向半球均匀采样射线、射线行进检测交点来计算：$O(\mathbf{p}) = 1 - \frac{1}{\pi}\int_{\Omega^+} V(\mathbf{p}, \omega) (\omega \cdot n) d\omega$，其中可见性 $V=1$ 当射线与表面相交。直接光照最终为 $L_{\text{dir}} = (1-m)\boldsymbol{a} \cdot O(\mathbf{p}) \cdot I_d + R \cdot I_s$。
+
+\textbf{第三阶段}建模间接光照：从第一阶段渲染的直接光照图像 $I_{\text{dir}}$ 出发，对每个表面点做路径追踪，命中点的出射辐射度直接索引 $I_{\text{dir}}$ 中对应像素值：$L_i(\mathbf{p}, \omega_i) = V(\mathbf{p}, \omega_i) \cdot I_{\text{dir}}(\mathbf{p}')$。最终渲染为两阶段之和 $L_o = L_{\text{dir}} + (1-m)\boldsymbol{a} \cdot L_{\text{ind}}$。对于复杂场景，GI-GS 进一步将屏幕空间路径追踪扩展到基于立方体图（Cubemap）的世界空间，渲染六面深度图和 RGB 图覆盖完整场景几何，使间接光照能捕获视锥外的遮挡和反射。
+
+\paragraph{连续张量光照场替代逐高斯球谐}
+
+3iGS（2024.08）~\cite{2408_03753}（Factorised Tensorial Illumination）的出发点是：标准3DGS中每个高斯独立优化球谐系数作为出射辐射度，忽略了高斯之间共享的场景光照——同一光源照亮多个高斯，它们的光照应该一致而非各自独立。3iGS 将每个高斯的出射颜色分解为漫反射 $c_d$ 和镜面反射 $c_s(\omega_o)$，关键创新是用\textbf{连续张量光照场}替代逐高斯球谐：$G_l: \mathbf{x}_i \mapsto L_i$，输入高斯中心坐标，输出入射光照特征。光照场采用类似 TensoRF 的向量-矩阵分解：$G_l = \sum_{r=1}^{R_L} A_{L,r}^X \otimes b_{3r-2} + A_{L,r}^Y \otimes b_{3r-1} + A_{L,r}^Z \otimes b_{3r}$，其中 $A$ 为特征矩阵、$b$ 为特征向量、$R_L$ 为光照特征通道数。这种分解将3D张量的参数量从 $O(N^3)$ 压缩到 $O(R_L \cdot N^2)$，且3iGS 使用的体素数比 TensoRF 少 87.5\%，内存占用远低于高斯数量（通常差一个数量级）。着色时，每个高斯的 BRDF 特征 $\phi_i$ 与光照特征 $L_i$ 通过小型网络 $F$ 映射为镜面颜色：$c_s = F(\phi_i, L_i, \omega_o)$，视角方向用集成方向编码（IDE）编码。设计动机是：不做严格的物理 BRDF 分解（反照率/粗糙度/金属度），而是让 BRDF 特征作为权重来调制入射光照场，避免过度约束的物理简化与不适定的分解问题，同时通过共享光照场保证多高斯间的光照一致性。
+
+\paragraph{球面高斯混合自适应局部光源建模}
+
+GS-ID（2024.08）~\cite{2408_08524}（Illumination Decomposition）的核心挑战是光照-材质分解的不适定性：同一观测可由“强光+暗材质”或“弱光+亮材质”等多种组合解释。Baseline 方法用单张环境贴图建模全局光照，无法捕获场景中的局部光源（如台灯、窗户），导致高光位置和形状不正确。GS-ID 的核心改进是\textbf{球面高斯混合}（SGM）自适应光照模型：场景光照分解为局部光源 $L_i^{\text{local}}$（由 $N_{\text{light}}$ 个 SGM 建模高频率离散发射体）和环境光 $L_i^{\text{ambient}}$（可学习环境贴图）。每个 SGM 包含 $n_{\text{SG}}$ 个球面高斯（SG），第 $k$ 个 SG 参数化为 $(\boldsymbol{\xi}_k, \lambda_k, \mu_k, \boldsymbol{w}_k)$（主方向、锐度、幅度、RGB色度），在3D空间中初始化于 $[-3,3]^3$ 网格后联合优化位置和参数。出射辐射度为 $L_o^{\text{local}}(\mathbf{p}, \omega_o) = \sum_j^{N_{\text{light}}} \frac{\boldsymbol{\rho}^{(j)} \cdot \text{SG}(\omega_o^{(j)}; \boldsymbol{\xi}, \lambda, \mu) \cdot (\mathbf{n} \cdot \omega_i^{(j)}) \cdot V_j}{|\mathbf{p}_j - \mathbf{p}|^2}$，其中 $V_j$ 是可微阴影权重，$|\mathbf{p}_j - \mathbf{p}|^2$ 建模距离衰减。阴影处理方面，GS-ID 为每个高斯分配可学习单位向量 $\mathbf{s} \in \mathbb{S}^2$ 捕获主阴影方向，$\alpha$-混合到屏幕空间后通过 $V_j = \sigma(\mathbf{\bar{S}} \cdot \omega_i^{(j)} + \beta)$ 计算可见性（$\sigma$ 为 sigmoid，$\tau=8, \beta=10^{-3}$），实现无需光线追踪的可微阴影预测。为防止 SGM 退化为环境光，引入位置正则化 $L_{\text{pos}} = \sum_j \max(d_{\min}^{(j)} - d_{\max}, 0)$（$d_{\max}=3$）推动光源靠近表面。材质先验来自预训练扩散模型 RGB$\rightarrow$X，提供法线监督（深度掩码阈值 0.8）和材质监督（粗糙度 $\lambda_R=0.1$、反照率 $\lambda_A=1.0$），在 10k 迭代后激活以先重建初步场景几何。
+
+\paragraph{2D 高斯光线追踪显式建模相互反射}
+
+IRGS（2024.12）~\cite{2412_15867}（Inter-Reflective Gaussian Splatting）显式处理表面间的相互反射。传统 3DGS 逆渲染方法（如 R3DG）无法高效查询任意方向的可见性和间接辐射，只能采用 split-sum 近似或可学习参数建模间接光照。IRGS 提出在 2D 高斯基元上直接进行光线追踪（2D Gaussian Ray Tracing, 2DGRT），利用 2D 高斯盘具有明确定义的射线-面片交点这一特性，消除 3D 高斯交点不一致的问题。具体地，给定 2D 高斯的中心 $\mu$、两个切向量 $t_u, t_v$ 和缩放 $s=(s_u,s_v)$，射线-面片交点解析计算为 $p = r_o + t r_d$，其中 $t = (\mu - r_o) \cdot n / (r_d \cdot n)$，法线 $n = t_u \times t_v$。通过为每个 2D 高斯构建自适应二十面体包围体并建立 BVH，利用 NVIDIA OptiX 的硬件加速光线-三角形求交实现高效追踪。框架分两阶段训练：Stage I 用标准 2DGS 预训练获取可靠几何（含法线一致性损失 $L_n$、深度畸变损失 $L_d$、边缘感知法线平滑 $L_{s,n}$ 和 mask 熵损失 $L_o$）；Stage II 赋予每个高斯漫反射反照率 $a$ 和粗糙度 $r$ 参数，通过延迟着色在像素级评估完整渲染方程。入射辐射分解为直接辐射和间接辐射：$L_i(\omega_i, x) = V(\omega_i, x) L_{dir}(\omega_i) + L_{ind}(\omega_i, x)$，其中环境 cubemap 建模直接光照，可见性 $V$ 和间接辐射 $L_{ind}$ 通过 2DGRT 实时查询。每个像素用 Monte Carlo 采样 $N_r$ 个入射方向均匀采样半球，最终颜色 $c_{pbr} = \frac{2\pi}{N_r}\sum_{i=1}^{N_r}(f_d+f_s) L_i(\omega_i, x)(\omega_i \cdot n)$。白光先验正则化 $L_{light} = \sum_c (L_{diffuse} - \frac{1}{3}\sum_c L_{diffuse})$ 约束漫反射入射光趋向白色。重光照时采用 split-sum 近似替代递归光线追踪，并结合重要性采样（按环境光强度分布采样）提高渲染方程评估精度。
+
+\paragraph{四阶段渐进蒸馏从 SH 辐射到物理着色}
+
+Progressive Radiance Distillation（2024.08）~\cite{2408_07595}（PRD）用四阶段渐进蒸馏策略处理逆渲染中材质-光照解耦的歧义性。原始 3DGS 用 4 阶球谐（SH）编码视角相关外观，无法将材质与光照分离。PRD 将最终辐射定义为物理着色与原始辐射的混合：$I(x,\omega) = \alpha_x I_{phy}(x,\omega) + (1-\alpha_x) I_{raw}(x,\omega)$，其中 $\alpha_x$ 是可学习的蒸馏进度参数。Stage 1（预训练）：冻结 $\alpha_x=0$，仅训练标准 3DGS 的 SH 辐射，获取基础几何。Stage 2（镜面蒸馏）：初始化 $\alpha_x=0.01$，固定金属度 $m_x=1$ 以完全禁用漫反射项，仅拟合镜面反射 $I_{spec} = \int BRDF(\cdot; r_x, m_x) L(\omega) (\omega \cdot n_x) d\omega$（split-sum 近似）。由于物理镜面反射比 SH 更好地近似高频视角效果，低粗糙度区域的 $\alpha$ 自然增长。Stage 3（漫反射蒸馏）：解冻 $m_x$，引入蒸馏损失 $L_\alpha = \text{MSE}(I_{mask}, \alpha_x)$ 推动物理建模接管原始辐射，同时施加白光先验 $L_{light} = \sum_{i=1}^{3}|l_i - \frac{1}{3}\sum_{j=1}^{3} l_j|$ 约束环境光趋向中性白。Stage 4（联合精修）：降低 $\alpha_x$ 学习率，移除 $L_\alpha$，聚焦图像损失精修整体质量。可见性项 $V(\omega, x)$ 在 Stage 2 结束时一次性烘焙到规则体素网格（每个单元投影不透明度立方体贴图并投影到 SH 系数），训练期间保持冻结。四个阶段按镜面$\to$漫反射的顺序逐步蒸馏，利用物理着色的层次化优势避免一步到位的材质-光照歧义，损失权重 $\lambda_1=1.0, \lambda_2=0.08, \lambda_3=0.003$。
+
+\paragraph{SDF 法线蒸馏与延迟着色材质分解}
+
+DeferredGS（2024.04）~\cite{2404_09412}（Decoupled and Editable）将延迟着色引入 3DGS 材质分解。直接在逐高斯上进行前向着色（forward shading）再 $\alpha$-混合 的方法存在致命缺陷：即使法线蒸馏损失在像素级约束了混合法线的正确性，每个高斯的个体法线和着色颜色可能仍然错误，因为几何属性（位置、协方差、不透明度）可能过拟合到特定光照条件以产生正确的混合法线——换光照后混合就失效。DeferredGS 的解决方案是延迟着色：先将位置 $P$、法线 $n$、漫反射反照率 $k_d$、粗糙度 $r$、镜面反射率 $k_s$ 和不透明度 $\alpha$ 通过 $\alpha$-混合 投影为 2D 像素属性图 $I_P, I_n, I_{k_d}, I_r, I_{k_s}, I_\alpha$，然后对 $I_\alpha > 0.5$ 的像素用 Disney BRDF 着色。光照用 $6\times512\times512$ HDR cubemap 建模，漫反射辐照 $c_{diff} = k_d \int L_i(\omega_i)(\omega_i \cdot n) d\omega_i$ 预计算为 2D 纹理，镜面反射采用 split-sum 近似分解为预过滤环境光贴图（mipmap，每级对应固定粗糙度）和 BRDF 积分 LUT。法线估计依赖联合训练的 SDF 网络（基于 multi-level hash encoding 的 NeuS 架构）：SDF 的体渲染密度 $\rho(t) = \max(-\frac{d}{dt}\Phi_s(f(x(t))), 0)$（$\Phi_s$ 为 Sigmoid），法线蒸馏损失 $L_{nd} = \sum_v \sum_{i=1}^M \|1 - C_n(v) \cdot \nabla f_s(x_{v,i})\|$ 将 SDF 法线场的连续性注入离散高斯。纹理编辑通过从输入视角绘制修改后的纹理图，然后用 ASR（As-Rigid-As-Possible）变形代理 mesh 扩展到随机视角优化。
+
+\paragraph{预计算辐射传输与延迟着色混合渲染}
+
+RTR-GS（2025.07）~\cite{2507_07733}（Radiance Transfer and Reflection）结合预计算辐射传输（PRT）和延迟着色反射，解决标准 3DGS 用 SH 编码外观时无法重光照的问题。核心设计是混合渲染模型，将辐射（低频）和反射（高频）分离：$I_{rgb} = C_r (1.0 - R_i) + C_{ref} R_i$，其中 $C_r$ 为辐射颜色（前向着色），$C_{ref}$ 为反射颜色（延迟着色），$R_i$ 为反射强度。反射分量采用延迟渲染，每个高斯额外学习反射色调 $R_t$ 和反射粗糙度 $R_r$，反射颜色 $C_{ref} = R_t \cdot F_{ref}(E_r, R_r, n, v)$（$E_r$ 为可学习反射贴图，$F_{ref}$ 为 split-sum 近似）。辐射分量用辐射传输替代 SH：漫反射辐射 $C_d \approx k_d \sum_{j=0}^{n^2} c_j c_j^t$（$c_j$ 为全局 SH 光照系数，$c_j^t$ 为每个高斯的独立传输向量），镜面辐射 $C_s(\omega_o) \approx k_s \sum_{j=0}^{n^2} c_j c_j^t(\omega_o)$，其中 $c_j^t(\omega_o) = G(f_t, \omega_o)$ 由 3 层 MLP（64 隐藏单元）从可学习传输特征 $f_t$ 和反射方向解码。所有高斯共享 SH 光照 $c_j$ 和 MLP $G$，形成全局低频约束，同时每个高斯的独立传输向量处理局部反射和阴影。PBR 分支为每个高斯赋予反照率 $c$、金属度 $m$、粗糙度 $r$ 和间接光照 $L_{ind} \in [0,1]^3$，可见性通过将场景投影为 cubemap 转换为 SH 系数并存储在体素网格中烘焙。金属度先验 $L_m = L_1(m, R_i)$ 鼓励 PBR 金属度与混合渲染的反射强度一致，损失权重 $\lambda_0=0.003, \lambda_1=0.1, \lambda_2=0.02$。
+
+\subsubsection{光泽与各向异性材质}
+
+本路线介绍专门处理光泽和各向异性材质的逆渲染方法。前面两节的方法大多假设各向同性（iso-tropic）BRDF——表面在所有方向的反射特性相同。然而真实世界中许多材质是各向异性的（如拉丝金属、丝绸），它们的反射强度随方向变化。本节的方法专门处理光泽和各向异性材质的逆渲染问题。
+
+\paragraph{法线预滤波与微面几何分割先验}
+
+GlossyGS（2024.10）~\cite{2410_13349}（Inverse Rendering of Glossy Objects）专门解决光泽表面逆渲染中的两个核心问题：着色顺序歧义和微观-宏观法线分布耦合。
+
+\textbf{着色顺序歧义。}对于着色顺序问题，漫反射颜色与法线呈线性关系（$c_{diffuse} = a(1-m)\int L(\omega_i)(\omega_i \cdot n) d\omega_i$，blending 和 shading 可交换），但镜面反射非线性（$\sum_k w_k c_{specular}(n_k) \neq c_{specular}(\sum_k w_k n_k)$），直接在高斯上着色再 blending 会导致模糊的高光。GlossyGS 提出 normal map prefiltering：先 $\alpha$-混合 法线图，再在混合后的法线上做着色，保持单个反射方向的采样精度。
+
+\textbf{宏观-微观法线耦合。}对于宏观-微观法线耦合歧义——低频宏观法线+大粗糙度 vs.\ 高频宏观法线+小粗糙度可产生相同外观——GlossyGS 引入微面几何分割先验：用 DINOv2 编码器 + DPT 解码器的分割模型（在自建数据集上训练），将图像分割为至多 6 个粗糙度一致的区域，分割损失为交叉熵 $L_{ce}$。在每个分割区域 $S(c)$ 内约束粗糙度方差 $L_e = \sum_{c \in C}\{\frac{1}{|S(c)|-1}\sum_{i=1}^{|S(c)|}(z_i - \bar{z})^2\}$，迫使同一区域的粗糙度趋向一致，消除耦合歧义。几何与材质采用混合表示：基于 Scaffold-GS 的 anchor 生成神经高斯（GS 解码器 $F_g$ 从 anchor 特征 $f_{macro}$ 预测位置/旋转/不透明度），材质编码器 $F_{m-e}$ 从 $f_{macro}$ 生成高维微面特征 $f_{micro}$，再由材质解码器 $F_{m-d}$ 解码出 $r, m, n, a$，解码器施加平滑正则化 $L_s = \|F_{m-d}(f_{micro}) - F_{m-d}(f_{micro}+\epsilon)\|_1$（$\epsilon \sim \mathcal{N}(0, 0.01)$）。实验中 $\lambda_s=\lambda_e=\lambda_n=0.01$，$\lambda_{SSIM}=0.2$，$\lambda_{vol}=0.001$。
+
+\paragraph{各向异性球面高斯表示光泽 BRDF}
+
+GlossyGS 通过分割先验解决耦合歧义，但其 BRDF 模型仍是各向同性的。GlossGau（2025.02）~\cite{2502_14129}（Efficient Inverse Rendering with Anisotropic Spherical Gaussian）使用各向异性球面高斯（ASG）表示光泽 BRDF 的法线分布函数（NDF）。标准球面高斯（SG）是各向同性的：$D(h) = G(h; n, \frac{2}{r^2}, \frac{1}{r^2})$，其中锐度参数 $\lambda = 2/r^2$ 在所有方向相同，无法表达各向异性反射——直觉上，SG 的波瓣像一个完美的圆帽，而拉丝金属等材质的反射波瓣是椭圆的（一个方向宽、另一方向窄）。ASG 扩展为 $\text{ASG}(\omega | [x,y,z], [\lambda_x, \lambda_y], c) = c \cdot S(\omega; z) e^{-\lambda_x(\omega\cdot x)^2 - \lambda_y(\omega\cdot y)^2}$，其中 $x,y,z$ 为互相正交的切线/副切线/瓣轴方向，$\lambda_x, \lambda_y > 0$ 为两个正交方向的锐度，$S(\omega;z)=\max(\omega\cdot z, 0)$ 为平滑项。渲染时通过 warping 算子将 SG 形式的 NDF 沿视角方向拉伸为 ASG，无需额外参数估计——ASG 的参数仍仅由法线 $n$ 和粗糙度 $r$ 决定。框架基于 2D 高斯面元（协方差退化为两个切向量 $t_u, t_v$ 和缩放 $s=(s_u,s_v)$，$s_z=0$），法线定义为 $n = t_u \times t_v$。光照分解为 $16\times32$ 直接环境贴图和逐高斯三级 SH 间接光照。可见性基于修改的点光线追踪：为 2D 高斯构建各向异性缩放二十面体包围体（阈值响应 $\alpha_{min}$），射线-面片交点直接退化为点求交并解析计算响应值。法线监督采用深度梯度法线 $N(x,y) = \nabla_x d_s \times \nabla_y d_s / |\nabla_x d_s \times \nabla_y d_s|$ 与渲染法线的一致性损失 $L_n = \sum_i w_i (1 - \hat{n}_i^T \bar{n}_i)$，白光先验 $L_{light} = \sum_{c \in \{R,G,B\}}(L_c - \frac{1}{3}\sum_c L_c)$ 约束入射光中性。
+
+\paragraph{Specular-Glossiness 参数化与渐进光照上采样}
+
+Spec-Gloss Surfels（2025.10）~\cite{2510_02069} 基于 2DGS 面元表示，引入了 Specular-Glossiness（简称 SG）材质参数化来进行逆渲染。当前主流方法大多采用 Disney BRDF 的 Metallic-Roughness 参数化方式，其镜面反射率 $F_0$ 由公式 $(1-m)\cdot 0.04 + m\cdot b$ 隐式决定。
+
+从直觉上说，这种参数化把"这个表面是金属还是电介质"和"它的基础颜色是什么"混在一个参数 $b$ 中，在逆渲染过程中优化器很难区分二者。相比之下，SG 参数化显式地学习三个完全独立的物理量：漫反射率 $\rho_d$、法线入射镜面反射率 $F_0 \in \mathbb{R}^3$ 以及粗糙度 $r \in [0,1]$，由此实现了漫反射与镜面反射的干净解耦。
+
+在渲染方面，Spec-Gloss Surfels 采用 split-sum 近似来计算出射辐射度：$L_o = \rho_d L_d(n) + (F_0 \beta_1 + \beta_2) L_s(v,n,r)$，其中 $L_d$ 为漫反射辐照、$L_s$ 为预过滤镜面辐照、$\beta_1,\beta_2$ 为预计算 2D LUT 返回的 Fresnel 系数。环境光用可学习 HDR cubemap 表示，训练时从低分辨率 $Res^1$ 渐进上采样至 $Res^K$（每阶段分辨率翻倍），避免高分辨率光照过早吸收材质误差。法线先验来自 StableNormal，漫反射颜色先验来自 StableDelight 扩散模型（在训练初期 $T_{dp}$ 步后关闭），两者共同抑制几何与材质歧义。
+
+\paragraph{Beer-Lambert 定律修正高斯不透明度-材质关系}
+
+OMG（2025.02）~\cite{2502_10988}（Opacity Matters）从一个独特的物理视角出发：将高斯类比为气体团（Beer-Lambert 定律），重新推导不透明度与材质的关系。原始 3DGS 的透射率为 $1-\alpha_i(x)$，而 Beer-Lambert 定律要求透射率形如 $e^{-n\sigma s}$。OMG 将高斯类比为气体团：数密度 $n_i = o_i \cdot G_i(x)$（原始不透明度乘高斯分布），路径长度 $s=1$（2D 投影后深度被忽略），截面 $\sigma_i = f(m_i)$ 由一个小型神经网络从材质属性 $m_i$ 预测。由此得到修正的不透明度：$\alpha_i(x) = 1 - e^{-o_i G_i(x) f(m_i)}$。这一修正使材质参数的梯度不仅来自颜色项，还额外通过不透明度项流动：$\frac{\partial L}{\partial m_i} = \frac{\partial L}{\partial c_i}\frac{\partial c_i}{\partial m_i}\sum_i L_{CT_i} + \frac{\partial L}{\partial\alpha_i}\frac{\partial\alpha_i}{\partial m_i}$，为材质学习提供了物理启发的额外约束。值得注意的是，NeRF 的 $\alpha$-混合 恰好采用 $1-e^{-\sigma_i\delta_i}$ 的形式，而原始 3DGS 的 $\alpha_i$ 可视为其 Taylor 展开的一阶近似，OMG 的修正恢复了完整的指数形式。
+
+\subsubsection{次表面散射}
+
+本路线介绍将次表面散射物理模型引入 3DGS 逆渲染以处理皮肤、蜡等半透明材质的方法。
+
+标准 BRDF 模型假设光在表面一点反射，但半透明材质（皮肤、蜡、大理石）中光线会进入物体内部、经过多次散射后从另一点出射——这就是次表面散射（Subsurface Scattering, SSS）。本节的方法将 SSS 建模引入 3DGS 逆渲染。
+
+\paragraph{可学习散射强度与 MLP 预测 SSS 残差}
+
+Subsurface Scattering for 3D Gaussian Splatting（2024.08）~\cite{2408_12282} 首次将次表面散射（SSS）引入 3DGS 逆渲染。直觉上，SSS 使半透明物体呈现特有的"透光"效果：光线从一侧射入，在内部散射后从另一侧出射，产生柔和的发光感。基于 Relightable 3DGS 的 PBR 管线（GGX 微面 BRDF，输出 diffuse + specular 分量），该方法在每个高斯上增加一个可学习的标量 $sss \in [0,1]$ 控制散射强度，并通过一个 3 层 MLP（隐藏层 $[64,32,32]$，Leaky-ReLU）预测 SSS 残差。MLP 输入包括法线（3）、旋转（2）、尺度（3）、光照方向（3）、视角方向（3）、光照距离（1）和可见性（1），加上位置的 Fourier 位置编码（24 维）。最终像素辐射度为 $I(x) = C_{\text{surf}}(x) + C_{\text{sss}}(x)$，其中 SSS 残差 $C_{\text{sss}}$ 捕捉了半透明材质特有的软阴影、颜色渗透和发光效果。MLP 采用双输出头设计：一个预测入射光照（ReLU 输出），另一个预测 SSS 辐射度（Sigmoid 输出），两个头共享特征使网络能学习全局光传输信息。训练时粗糙度在前 10k 步冻结为 0.5 以稳定早期优化，入射光在前 7k 步线性增加后解除约束。
+
+\paragraph{双组高斯分离表面与内部散射}
+
+上面的方法用 MLP 学习 SSS 残差，但没有显式处理半透明物体的几何矛盾。GTSR（2026.03）~\cite{2603_22036}（Subsurface Scattering Awared）指出，单组高斯表示半透明物体时会导致高几何质量与高质量渲染之间的矛盾：若表面高斯保持高不透明度（利于 TSDF 网格提取），则内部散射效果无法表现；若降低表面不透明度以暴露内部高斯，则表面重建质量下降（3DGS 在半透明物体上表面不透明度常低于 0.2）。GTSR 的核心设计是双组高斯：表面高斯（密集、高不透明度，负责几何与表面颜色）和内部高斯（位于物体内部，负责散射效果）。两组高斯的融合通过 Fresnel 项调制表面不透明度实现：$\alpha_i' = \alpha_i \cdot F_{r,i}$，其中 Schlick 近似 $F_{r,i} = F_0 + (1-F_0)(1-\mathbf{n}_i\cdot\omega_o)^5$（$F_0=0.04$）。当视线几乎平行于表面时 Fresnel 项趋近于零，表面变透明，内部散射可见——这模拟了半透明物体侧面观察更透明的物理特性。PBR 渲染采用延迟着色，基于 Disney BSDF 的三分量模型：$C_{\text{PBR}} = C_s + C_d + (1-F_{\text{schlick}})(C_{\text{scatter}})$，其中 $\lambda=0.3$ 控制表面透明度。内部高斯约束损失 $L_{\text{in}}$ 将位于表面外部的内部高斯拉向表面，确保正确的深度排序。
+
+\paragraph{扩散模型增强稀疏观测 SSS 重建}
+
+GTSR 解决了表示问题，但 SSS 重建本身需要大量多光照训练数据。DIAMOND-SSS（2026.01）~\cite{2601_12020}（Diffusion-Augmented Multi-View Optimization）解决 SSS 重建中训练数据稀缺的问题：半透明材质需要 OLAT（One-Light-At-a-Time）光台采集，成本高昂。方法在 SSS-3DGS 基础上引入两个微调后的扩散模型来增强数据。其一为视角合成模型（基于 Free3D），输入源图像和相对相机变换，生成几何一致的新视角图像；其二为重光照模型（基于 ControlNet/Poirier 架构），输入源图像、深度图、法线图和目标 9D 球谐光照编码，合成新光照条件下的图像。两个模型仅在不到 7\% 的 OLAT 数据上微调，即可泛化到未见物体。重建流程对每个真实视角合成 2--4 个新视角、每个视角生成 4--8 个重光照变体，合成数据的损失权重降低为 $\beta=0.5$ 以减轻扩散伪影。为进一步稳定扩散生成图像中的几何一致性，引入两个光照无关的几何损失：多视角轮廓一致性 $L_{\text{sil}}^{\text{MV}}$ 和深度一致性 $L_{\text{depth}}^{\text{MV}}$，均基于 DepthAnythingV2 估计的伪深度。整体框架仅需约 10 张真实捕获即可实现鲁棒的半透明物体重建。
+
+\subsubsection{水下与特殊环境}
+
+本路线介绍将物理的大气/水下散射模型嵌入 3DGS 渲染管线的方法。前面所有方法都假设场景在空气中，光沿直线传播。但水下、烟雾等特殊环境中，介质会吸收和散射光线，显著改变观测颜色。本节的方法将物理的大气/水下散射模型嵌入 3DGS 渲染管线。
+
+\paragraph{物理水下成像模型与神经水域场}
+
+Aquatic-GS（2024.11）~\cite{2411_00239}（A Hybrid 3D Representation for Underwater Scenes）基于物理的水下成像模型（UIF）$I = J \cdot e^{-\beta^D z} + B^\infty(1-e^{-\beta^B z})$（$J$ 为无水图像、$z$ 为距离、$\beta^D$ 为衰减系数、$\beta^B$ 为后向散射系数、$B^\infty$ 为无穷远水色）。直觉上，水下成像 = "无水场景经水衰减后的残影" + "水本身的后向散射背景色"，将水下渲染分为 3DGS 场景分支和神经水域场（Neural Water Field）两部分。水域场针对每个像素的视角方向 $\omega_p$ 输出水参数：水下环境光用 3 阶球谐函数建模（$l_{\max}=3$），衰减和后向散射系数用一个浅层 MLP（Softplus 激活，128 维隐藏层 $\to$ 6 维输出）从位置编码后的视角向量预测。不同于先前方法假设水参数在通道内均匀（仅 9 个未知量），Aquatic-GS 放松了均匀性假设，学习空间非均匀分布。3DGS 分支渲染无水图像 $J$ 及深度/距离图，SH 阶数限制为零阶（水下表面近似 Lambertian）。关键的深度引导优化机制包含四项：透射率正则化 $L_{\text{dgt}}$（远处权重 $\omega_f=10$ 抑制半透明高斯）、深度方差最小化 $L_{\text{dvm}}$、逆深度相关性 $L_{\text{idc}}$（Pearson 相关系数解决尺度歧义）、以及深度引导的块频域损失 $L_{\text{dpf}}$（远处块权重更大，增强低对比度区域纹理）。
+
+\paragraph{双分支外观-介质解耦水下逆渲染}
+
+Aquatic-GS 用神经水域场建模水介质参数。3D-UIR（2025.05）~\cite{2505_21238}（Underwater Inverse Rendering）同样基于 UIF 模型，但采用双分支解耦架构：水下外观建模（UAM）和散射介质建模（SMM）。UAM 分支为每个高斯赋予可训练外观特征 $f_i$（用多尺度 Fourier 编码初始化以保持空间相关性：$f_i = [\sin(p_k 2^m), \cos(p_k 2^m)]$，$m \in \{1,...,4\}$），并通过一个微型 MLP（2 层，128 隐藏单元）从相机位姿 $(R,t)$ 生成视角相关的外观嵌入 $e_j$，最终颜色由 $c_i = F_\theta(c_i^{\text{base}}, f_i, e_j)$ 合成。SMM 分支用 2D 卷积直接处理渲染深度图来估计水介质参数，避免 MLP 的计算开销：后向散射 $B_c = B_c^\infty(1-e^{-bz}) + B_c^{\text{res}}(e^{-dz})$，衰减 $a_c(z) = \sum_{p=1}^{P} a_c^p e^{-z\kappa_c^p}$。最终水下图像由 $I_c = a_c(z') \cdot C_c + B_c$ 物理合成。几何约束方面，引入边缘感知深度平滑正则化 $L_{\text{DS}}$ 和各向异性全变差正则化 $L_{\text{DC}}$，以及尺度正则化 $L_s = \lambda_5 \sum_i \min(s_1^i, s_2^i, s_3^i)$（$\lambda_5=100$）将高斯压扁为表面切平面盘状，消除飘浮伪影。
+
+\paragraph{光学参数嵌入高斯基元与双分支优化}
+
+前两种水下方法用辅助网络建模水参数。WaterClear-GS（2026.01）~\cite{2601_19753}（Optical-Aware Underwater）将光学参数直接嵌入高斯基元，而非依赖辅助 MLP 或神经水域场。每个高斯额外学习三组波长相关的光学参数：衰减系数 $\sigma_i^D \in \mathbb{R}^3$、后向散射系数 $\sigma_i^B \in \mathbb{R}^3$、面纱光 $B_i \in \mathbb{R}^3$。水下校正颜色直接在高斯属性中计算：$c_i^u = T_i^D \cdot c_i^o + (1-T_i^B) \cdot B_i$，其中 $T_i^D = e^{-\sigma_i^D d_i}$、$T_i^B = e^{-\sigma_i^B d_i}$ 为逐通道透射率（$d_i$ 为高斯到相机距离）。渲染时 $c_i^u$ 直接替换原始 SH 颜色进行 $\alpha$-混合。双分支优化策略同时渲染水下分支（拟合输入图像，约束光学参数）和清水分支（移除所有水介质项，恢复本征颜色），两者共享同一组高斯基元，互相约束防止退化解。损失函数中引入感知驱动图像损失（受 RawNeRF 启发）$\Psi(y) = y / (\text{sg}(\hat{y}) + \epsilon)$（$\epsilon=10^{-3}$），自适应增强暗区梯度。物理先验光谱正则化 $L_p$ 用 Softplus 惩罚违反 RGB 波长排序的行为（红光衰减最快、蓝光散射最强、面纱光偏蓝），约束容差为 $\delta$。
+
+\subsubsection{光度立体与多视角约束}
+
+本路线介绍将光度立体信息与 3DGS 逆渲染结合的方法。前面方法通常在自然光照条件下采集图像。光度立体（Photometric Stereo）是一种特殊的采集方式：在固定视角下用多个不同方向的光源分别拍摄，从而获得更丰富的光照-法线约束。本节的方法将光度立体信息与 3DGS 逆渲染结合。
+
+\paragraph{多视角光度立体两阶段法线与材质估计}
+
+PS-GS（2025.07）~\cite{2507_18231}（Gaussian Splatting for Multi-View Photometric Stereo）将光度立体（photometric stereo）引入 3DGS 逆渲染。传统 MVPS 方法利用固定视角下变化光照的图像序列估计表面法线，但缺乏多视角约束和完整材质分解。PS-GS 的两阶段框架：Stage I 用标准 2DGS 在多视角光平均图像上预训练获取初始几何，同时利用 UPS（Uncalibrated Photometric Stereo）方法从多光照图像估计法线 $N_e$ 作为引导，法线正则化损失 $L_{n,r} = \sum_{i=1}^{P}(N_r - T_{c2w}(N_e))$（$T_{c2w}$ 为相机到世界坐标变换）增强表面细节。Stage II 在预训练几何基础上联合优化法线、材质和光照：每个高斯赋予可学习的 BRDF 参数（反照率 $\boldsymbol{a}$、粗糙度 $r$、金属度 $m$），采用延迟着色避免前向着色的法线混合问题——先 $\alpha$-混合 得到像素级特征图 $\mathbf{F} = \sum_{n}^{N} \alpha_n \mathbf{f}_n T_n$（$\mathbf{f}_i = [\mathbf{a}_i, m_i, r_i, \mathbf{n}_i]$），再在像素级评估完整渲染方程。光照建模的关键创新是用全局 MLP $f_\theta$（带 Fourier 位置编码）预测每个高斯的入射光 $L_{in} = f_\theta(\mathbf{x}, \mathbf{n}, s_u, s_v, \omega_{in}, \omega_{out})$，隐式学习局部和全局光照，避免逐高斯显式参数化的内存开销。为约束 MLP 输出物理合理（辐射强度和阴影），修改 IRGS 的 2D 高斯光线追踪以适配单方向光（SDL）设置——用 SDL 采样替代 Monte Carlo 采样，在 Stage I 预训练模型上进行光线追踪计算可见性，用 $L_1$ 损失 $L_{inc}$ 约束网络输出与光线追踪可见性一致。总损失 $L_{Stage2} = L_c + \lambda_{n,c}L_{n,c} + \lambda_{n,r}L_{n,r} + \lambda_o L_o + \lambda_{inc}L_{inc}$。
+
+\paragraph{2D 高斯面元光度立体可微渲染}
+
+Photometric Stereo using Gaussian Splatting（2025.07）~\cite{2507_06684} 采用 2D 高斯面元作为光度立体的可微渲染后端，从固定视角、变化光照的图像序列中估计表面法线和反照率。与传统方法需要已知光照方向不同，该方法通过可微渲染同时估计光照方向和表面材质。具体地，每个像素放置一个 2D 高斯（法线由切向量 $t_u \times t_v = t_w$ 定义），初始位置在 $z=0$ 平面上。每个高斯的初始颜色取所有光照图像的最大值 $c(x,y) = \max(I_1(x,y), I_2(x,y), \ldots, I_n(x,y))$，利用多光照观测的最亮像素作为反照率近似。渲染时将漫反射 Lambertian 模型嵌入高斯着色：表面法线与光照方向的点积 $\omega_i \cdot n$ 决定入射强度，从而实现自阴影检测。优化损失 $L = L_c + L_n$，其中 $L_c$ 为 $L_1$ 光度损失，$L_n$ 为深度梯度法线与 splatting 法线的一致性正则化。高斯密度控制（删除过大/过淡的高斯，克隆/分割需要细节的高斯）在优化过程中自适应调整表达力。
+
+\paragraph{旋转物体捕获策略消除材质-光照歧义}
+
+Rotated Lights for Consistent Inverse Rendering（2026.02）~\cite{2602_08724} 提出旋转光照捕获策略（RotLight）改善逆渲染的材质-光照歧义性。核心问题在于：每个观测颜色可由反照率、粗糙度、直接光照和间接光照的任意组合解释，即使有正则化，优化仍常收敛到次优解。RotLight 的捕获方案是：先正常拍摄物体，然后将物体旋转预设角度（实验中用两次 $120^\circ$ 旋转）再拍摄额外图像集。每张图像标记环境旋转角 $\phi_k$，查询第 $k$ 组图像中方向 $\omega_i$ 的直接光照时，旋转查询方向：$\hat{\omega}_i^{(k)} = R_{\phi_k} \omega_i$，$R_{\phi_k} = \begin{pmatrix}\cos(\phi_k) & 0 & \sin(\phi_k)\\0&1&0\\-\sin(\phi_k)&0&\cos(\phi_k)\end{pmatrix}$。这使得同一表面点在不同光照配置下被观测，大幅减少歧义。间接光照用 MLP 辐射缓存 $R_k(x, \omega_o)$ 建模（每个旋转角一组 MLP），而非复用 2D 高斯作为缓存（需为每个角度优化一组高斯，开销更大）。受 NeRad 启发引入残差约束 $L_{residual} = |c_{tr} - L_o(x, \omega_o)|$，要求缓存辐射与物理渲染辐射匹配。表面采样通过从 2DGS 提取的 TSDF mesh 上均匀随机采样 $N_{residual}$ 个三角形，在每个三角形上取随机点和随机半球方向。入射射线查询使用 OptiX 加速的 mesh 光线追踪（比 2D 高斯光线追踪更一致且更快，因为 mesh 不透明无需积分），实验中 $\lambda_{residual}=10$。
+
+\paragraph{辐射一致性自校正反馈循环约束间接光照}
+
+Radiometrically Consistent Gaussian Surfels（2026.03）~\cite{2603_01491}（RadioGS）提出辐射一致性约束解决高斯面元间接光照不可靠的问题。先前方法从高斯面元查询间接辐射，但相机射线未观测方向的面元辐射可以是任意值而不影响训练图像拟合，导致间接光照不稳定。RadioGS 的核心是建立自校正反馈循环：面元的出射辐射 $L_G(x,\omega_o)$（从 SH 系数查询）应与物理渲染辐射 $L_G^{PBR}(x,\omega_o)$ 一致。残差定义为 $R_G(x,\omega_o) = L_G(x,\omega_o) - L_G^{PBR}(x,\omega_o)$，其中 $L_G^{PBR}$ 通过 Monte Carlo 积分估计：$L_G^{PBR}(x,\omega_o) \approx \frac{2\pi}{N_s}\sum_{i=1}^{N_s} f_r(x,\omega_o,\omega_i)(V(x,\omega_i)L_{dir}(\omega_i) + L_{ind}(x,\omega_i))(\omega_i \cdot n_x)$。可见性 $V=1-T_{trace}$ 和间接辐射 $L_{ind}=L_{trace}$ 通过 2D 高斯光线追踪获取。辐射一致性损失 $L_{rad}(G) = \mathbb{E}_{j,\omega_o}\|R_G\|_1$ 在随机采样的 $N_g$ 个面元和半球方向上最小化残差，同时额外采样相机视角方向以传播监督信号。此损失建立了双向约束：物理渲染辐射引导面元辐射在未观测方向上学习全局光照，而相机方向上的面元辐射反推间接光照项的修正。框架分两阶段：初始化阶段用 split-sum 近似（避免早期几何不稳定时 Monte Carlo 振荡）施加简化版辐射一致性；逆渲染阶段启用完整 Monte Carlo 估计并加入反照率/粗糙度平滑损失 $L_{as}, L_{rs}$ 和白光先验 $L_{light}$，总损失 $L_{inv} = L_{init} + \lambda_{as}L_{as} + \lambda_{rs}L_{rs} + \lambda_{light}L_{light}$。重光照时利用辐射一致性快速微调：给定新光照，仅对面元辐射进行少量迭代最小化 $L_{rad}$，即可用面元辐射直接渲染。
+
+\subsubsection{其他逆渲染方法}
+
+本路线介绍不属于上述分类的逆渲染方法，涵盖高斯-SDF 耦合、投影仪-相机系统、稀疏视角、语义先验、动态场景、大气散射和前馈大模型等多种场景下的逆渲染方案。
+
+\paragraph{3DGS-SDF 耦合优化与双密度控制}
+
+COREA（2025.12）~\cite{2512_07107}（Coupled Relightable 3D Gaussians and SDFs）将 3DGS 和 SDF 耦合优化，解决离散高斯法线过平滑且不稳定的问题。直觉上，3DGS 提供精确的深度图（离散但准确），SDF 提供连续的法线场（平滑但可能偏差），两者互补。框架分两阶段。Stage I（几何耦合）交替执行两个互补步骤：（1）深度引导 SDF 对齐（DSA）：3DGS 渲染深度图 $d_{3DGS}$ 引导 SDF 的射线采样，像素级深度梯度 $n_{3DGS}^{DG} = \nabla d_{3DGS}/\|\nabla d_{3DGS}\|$（比 alpha-blended 法线更锐利）与 SDF 梯度法线对齐，损失 $L_{normal}^{SDF} = \frac{1}{N}\sum_{i=1}^{N}(1 - \langle n_{SDF}^{(i)}, n_{3DGS}^{DG(i)} \rangle)$。（2）法线引导高斯对齐（NGA）：将连续 SDF 法线场蒸馏到离散高斯，$L_{normal}^{3DGS} = \frac{1}{N}\sum_{i=1}^{N}(1 - \langle n_{3DGS}^{AB(i)}, n_{SDF}^{(i)} \rangle)$。创新的双密度控制（DDC）策略：为每个高斯计算分裂矩阵 $S_{total}^{(i)} = (1-\beta)S_{image}^{(i)} + \beta S_{normal}^{(i)}$（$S_{image}$ 和 $S_{normal}$ 分别由图像损失和法线损失的 Hessian 近似），仅当 $\lambda_{\min}(S_{total}^{(i)}) < 0$ 时才分裂，平衡光度梯度和几何梯度以避免冗余分裂。Stage II（逆 PBR）：固定几何，基于 R3DG 的点云 BVH 光线追踪方案估计可见性和入射光照，优化逐高斯 BRDF 参数和环境贴图。核心优势是 SDF 的连续法线场为高斯法线学习提供稳定参考，避免离散混合法线的过平滑，从而提升重光照的物理一致性和空间连续性。
+
+\paragraph{SDF 值直接编码为高斯属性}
+
+COREA 通过 SDF 网络和高斯的耦合来改善法线。Gaussian Splatting with Discretized SDF（2025.07）~\cite{2507_15629} 则将 SDF 值直接编码为高斯的额外属性，避免引入额外网络表示 SDF。基于 2DGS + 延迟着色管线，核心设计是将每个高斯的不透明度从直接学习改为由 SDF 值推导：$o_i = \mathcal{T}_\beta(s_i) = 4e^{-\beta s_i}/(1+e^{-\beta s_i})^2$，其中 $s_i$ 为高斯的 SDF 值，$\beta$ 是全局可学习的方差控制参数——直觉上，这是一个钟形变换，SDF 值为零（恰好在表面上）时不透明度最高，SDF 绝对值越大（离表面越远）不透明度越低。为加速联合优化 $\beta$ 和 $s_i$ 的收敛，引入中值损失：监控所有高斯 $|s|_{med}$（SDF 绝对值的中位数），要求变换后的中值不透明度 $o_{med} \leq 0.5$，推导出引导值 $\beta_{med} = -(3-2\sqrt{2})|s|_{med}$，中值损失 $L_\beta = \max(\beta_{med} - \beta, 0)$。由于离散 SDF 无法直接施加 Eikonal 条件 $|\nabla f|=1$（仅法线方向可用），提出投影一致性损失：将高斯投影到 SDF 零水平集 $\mu_{proj} = \mu_i - s_i \frac{\nabla f_i}{|\nabla f_i|}$，约束投影点深度与 $\alpha$-混合 深度之差 $\Delta_{proj}^i = |D_{agg} - D_{proj}|$，当 $\Delta_{proj}^i \leq \tau$ 时施加 $L_{proj} = \frac{1}{N}\sum_{i}^{N}\Delta_{proj}^i$（超阈值的高斯为遮挡面或不可微区域，直接丢弃）。此外，球面初始化（单位球上均匀采样点）避免初始几何陷入局部最优。输出为可重光照的资产（mesh + 材质贴图）。
+
+\paragraph{投影仪可控主动光照逆渲染}
+
+前面方法使用被动光照（自然光或环境光）。GS-ProCams（2024.12）~\cite{2412_11762}（Projector-Camera Systems）将 2D 高斯面元用于投影仪-相机系统（ProCams）的几何与材质联合估计。投影仪提供可控主动光照，相机捕获投影图案在表面的反射。每个 2D 高斯额外学习 BRDF 属性：反照率 $b \in [0,1]^3$ 和粗糙度 $r \in [0,1]$，通过 $\alpha$-混合 投影为像素级属性图 $\{B, R\} = \sum_{i}^{K} W_i \{b_i, r_i\}$。光照建模将入射光分解为投影仪直射光 $L_p$ 和全局光照 $L_g$：$L_p(x_s) = K * (G_p \cdot I_p^{\gamma_p}(x_p))$，其中 $G_p$ 为投影仪光功率，$\gamma_p$ 为 gamma 校正，$K$ 为可学习 $5\times5$ 卷积核近似投影仪的点扩散函数（PSF），$x_p = M_p \tilde{x}_s$ 通过投影矩阵从表面点映射。直射光的出射辐射 $C_p(\omega_o, x_s) = f(\omega_o, \omega_p, x_s) L_p(\omega_p, x_s)(\omega_p \cdot n_s)$，$f$ 为简化 Disney BRDF。全局光照（环境光 + 投影仪间接效果）用逐高斯的视角相关 SH 残差颜色 $c_g(\omega_o)$ 近似，避免完整全局光照建模的计算开销。训练时加入纯黑投影图案约束残差项。最终相机颜色 $\hat{I}_c = \text{clip}(\gamma_c(C_p + C_g), 0, 1)$（$\gamma_c$ 为 gamma tone mapping）。损失函数 $L = L_c + \lambda_d L_d + \lambda_n L_n + \lambda_m L_\sigma + \lambda_e L_{entropy}$，其中 $L_c = (1-\lambda)L_1 + \lambda L_{DSSIM}$（$\lambda=0.2$），$L_d$ 为深度畸变损失，$L_n$ 为法线一致性损失，$L_\sigma$ 为反照率引导的粗糙度双边平滑 $\|\nabla R\| \cdot \exp(-\|\nabla B\|)$（反照率梯度大的区域放松粗糙度平滑），$L_{entropy}$ 为交叉熵 mask 约束，权重 $\lambda_d=1000, \lambda_n=0.05, \lambda_m=0.002, \lambda_e=0.1$。训练完成后还可用于投影补偿（projector compensation）：反向优化投影图案 $I_p^*$ 使渲染结果匹配目标外观。
+
+\paragraph{四分量物理着色模型替代球谐外观}
+
+GS$^3$（2024.10）~\cite{2410_11419}（Triple Gaussian Splatting）与前面方法的"统一 BRDF"路线不同，它将反射显式分解为四个独立的物理分量——漫反射、镜面反射、阴影和次表面散射（SSS）——每个分量有独立的学习基色和反射率强度。标准 3DGS 用球谐系数（SH）编码外观，无法将材质与光照解耦，因此不支持重光照；GS$^3$ 用这种分量化的物理着色模型替换 SH。具体地，每个高斯的颜色计算为 $C_i = (c_d f_d + c_s f_s) S(x) + c_{\text{sss}} f_{\text{sss}}$，其中 $c_d, c_s, c_{\text{sss}} \in \mathbb{R}^3$ 分别为漫反射、镜面反射和 SSS 的学习基色，$f_d, f_s, f_{\text{sss}}$ 为对应反射率标量，$S(x)$ 为阴影因子。漫反射项采用 Lambertian BRDF（视角无关的余弦加权反射）；镜面反射项用 Fresnel 因子调制各向异性球面高斯（ASG）基，能表达拉丝金属等各向异性高光。SSS 项采用偶极子扩散剖面（dipole diffusion），由一个 6 层 MLP（隐藏维度 256）从位置编码（$L=4$ 频率段）的坐标和方向预测散射系数 $\sigma_s \in [0.05, 2.05]$、吸收系数 $\sigma_a \in [0.05, 2.05]$ 和表面分离距离 $r \in [0.1, 3.1]$，再代入经典偶极子公式 $f_{\text{sss}}(r) = \frac{\sigma_t'}{4\pi}\!\left(\frac{z_r(\sigma_t d_r + 1)e^{-\sigma_t d_r}}{d_r^3} + \frac{z_r z_v(\sigma_t d_v + 1)e^{-\sigma_t d_v}}{d_v^3}\right)$ 计算散射强度，其中 $\sigma_t' = \sigma_s + \sigma_a$，$z_r, z_v$ 为实偶极子和虚偶极子源深度。阴影采用两阶段方法：先沿光线累积高斯不透明度得到粗糙透射率 $v_i = \prod_{k \in O_i}(1-\alpha_k)$，再以投影密度加权聚合为 $v_g$，最后用 3 层 MLP（32 维隐藏层，位置编码 $L=3$）精修为 $S(x)$。训练采用渐进式策略，按漫反射$\to$阴影$\to$SSS$\to$镜面反射的顺序逐步激活各分量。这种分量分离使重光照只需改变光照输入，材质参数保持不变。
+
+\paragraph{语义先验与重光照一致性约束稀疏视角}
+
+前面方法大多需要密集视角输入。GAINS（2025.12）~\cite{2512_09925}（Gaussian-based Inverse Rendering from Sparse Multi-View Captures）解决稀疏视角（如仅 3--5 张图像）下逆渲染高度欠约束的问题。Baseline 方法在密集视角下使用 RGB 重建损失 $L_{\text{rgb}}$ 监督高斯训练，但稀疏视角下极易过拟合到已观测视角，几何重建不可靠。GAINS 的两阶段管线分别解决几何和材质问题。阶段 I 构建高质量高斯几何场：引入 StableNormal 提供法线监督 $L_{\text{normal}} = 1 - \hat{n}^T n_m$（$\lambda_1=0.05$），用 LSEG 编码器提取像素级语义特征后经 Qwen3VL 识别物体类别、CLIP 生成文本嵌入，通过余弦相似度计算语义标签图 $S$，定义语义约束 $L_{\text{semantic}} = L_{\text{cos}}(\hat{F}, F) + L_{\text{ce}}(\hat{S}, S)$（$\lambda_2=0.3$）。语义一致性约束 $L_{\text{corresponding}}$ 在训练视角和 $P$ 个伪视角之间强制 SAM 生成的掩码区域内语义一致。
+
+阶段 II 在固定几何上进行逆渲染：混合光照模型将入射光 $L_i$ 分解为高频分量 $L_i^{\text{SGM}}$（由散布的球面高斯 $N_{\text{sg}}$ 个 SG 叶瓣表示点光源）和低频分量 $L_i^{\text{env}}$（可学习 $6\times512\times512\times3$ cubemap）。轻量级去阴影模块用多级哈希编码 $\epsilon_o$ 提取空间特征，与点光源的相对方向和距离一起输入 MLP 预测可见性 $V_{ji}$，显式建模投射阴影。关键的材质一致性正则化策略包含两个损失：重光照一致性损失 $L_{\text{relight}}$（$\lambda_4=0.4$）在固定视角下施加光照扰动，强制反照率不变——$L_{\text{mse}}(\hat{A}, A_i, M_o) = \|(\hat{A} - A_i) M_o\|_2$，$M_o$ 为 SAM 生成的物体级掩码；跨视角语义材质一致性损失 $L_{\text{cross\_semantic}}$（$\lambda_3=0.4$）假设同类语义区域材质相似——$L_{\text{cross\_semantic}} = \sum_{p=1}^P (\|\bar{F}_p^* - \bar{F}\|_2 + \|\bar{A}_p^* - \bar{A}\|_2)$。材质先验来自预训练 RGB$\to$X 模型。整个训练在单张 RTX 4090 上约 40 分钟（阶段 I 7000 次 + 阶段 II 3000 次迭代）。
+
+\paragraph{2D 扩散先验多视角神经融合器提升材质}
+
+GAINS 用语义先验正则化稀疏视角。MatSpray（2025.12）~\cite{2512_18314}（Fusing 2D Material World Knowledge）则解决另一个实际问题：多视角材质图不一致。扩散模型（如 DiffusionRenderer）能为每个视角独立预测 PBR 材质图（基色 3 通道、粗糙度 1 通道、金属度 1 通道），但不同视角间的预测存在颜色偏移和粗糙度不一致，直接投影到 3D 会产生模糊的材质图。MatSpray 的三步管线如下。第一步为 2D 材质提升（2D-to-3D Material Lifting）：通过高斯光线追踪将每视角的材质值反投影到 3D 高斯——沿射线找到每个高斯的最大响应点 $x_* = o + t_* d$（其中 $t_* = (\mu - o)^{\Sigma^{-1} d} / d^{\Sigma^{-1} d}$），计算该点的最大不透明度 $\alpha_* = \alpha \cdot e^{-12(x_* - \mu)^{\Sigma^{-1}}(x_* - \mu)}$，再取像素网格超采样后中位数作为每个高斯在每个视角下的材质估计 $m_{g,v_i} = \text{median}_{p \in fp_{g,v_i}}(m_p)$，以消除重叠高斯造成的离群值。第二步为神经融合器（Neural Merger）：为每个高斯预测跨视角权重，将不一致的每视角预测融合为一致的 3D 材质。
+
+轻量 MLP $f_\theta$ 以高斯位置 $p_g$（经位置编码）和各视角材质值 $m_{g,v}$ 为输入，输出未归一化权重 $[h_{g,1}, \ldots, h_{g,V}]$，经 softmax 归一化为 $w_{g,v}$，最终材质为加权求和 $m_g = \sum_{v=1}^V w_{g,v} \, m_{g,v}$。关键设计是 softmax 插值而非自由生成——确保融合结果始终在 2D 预测范围内，保持扩散先验的物理合理性，同时避免 Neural Merger 收敛过快导致环境贴图优化失败。基色、粗糙度和金属度各使用独立的 Neural Merger 以改善解耦。第三步为联合精修：材质监督损失 $L_{\text{Image}} = \|M_{\text{render}} - M_{\text{2D}}\|_1$ 仅优化 Neural Merger 参数；渲染监督损失 $L_{\text{3DGS}} = \lambda L_1(I_{\text{PBR}}, I_{\text{GT}}) + (1-\lambda) L_{\text{SSIM}}(I_{\text{PBR}}, I_{\text{GT}})$（$\lambda=0.8$）同时优化 Neural Merger 和可学习环境贴图，确保最终渲染与输入视角一致。
+
+\paragraph{语义类别材质一致性约束室内场景}
+
+SGS-Intrinsic（2026.03）~\cite{2603_27516}（Semantic-Invariant）与 GAINS 解决类似的稀疏视角问题，但更侧重于利用语义先验改善室内场景的材质分解。Baseline 方法在稀疏视角下用 RGB 重建损失训练高斯，容易过拟合到已观测视角，几何不可靠，且光照与材质的解耦陷入局部最优——学到的反照率常将光照效果“烘焙”进去。SGS-Intrinsic 的核心观察是：室内场景中同一语义类别（如“桌面”“墙面”）的物体通常具有相似材质属性，因此可通过语义一致性约束大幅减少独立参数量并正则化解耦。方法分两阶段。阶段 I 使用预训练模型提供额外监督：法线引导损失 $L_{\text{normal}} = 1 - \hat{n}^T n_m$（来自 StableNormal，$\lambda_1=0.05$）；语义监督利用 LSEG 编码器提取像素级 512 维特征 $F$，Qwen3VL 识别物体类别后经 CLIP 生成文本嵌入 $T \in \mathbb{R}^{M \times 512}$，余弦相似度构建语义标签图 $S_{i,j} = \arg\max_m \cos(F_{i,j}, T_m)$，语义损失为 $L_{\text{semantic}} = L_{\text{cos}}(\hat{F}, F) + L_{\text{ce}}(\hat{S}, S)$（$\lambda_2=0.3$）；训练-伪视角语义一致性约束 $L_{\text{corresponding}}$ 在 SAM 生成的掩码区域内执行多数投票，强制语义一致。
+
+阶段 II 在固定几何上进行逆渲染：混合光照模型将入射光分解为高频球面高斯点光源 $L_i^{\text{SGM}}$（$N_{\text{sg}}$ 个 SG 叶瓣）和低频可学习环境 cubemap $L_i^{\text{env}}$（$6 \times 512 \times 512 \times 3$）；轻量级去阴影模块用多级哈希编码提取空间特征，结合点光源的相对方向和距离，通过 MLP 预测可见性 $V_{ji}$ 以显式建模投射阴影。关键的材质一致性正则化包含两个损失：重光照一致性 $L_{\text{relight}}$（$\lambda_4=0.4$）在固定视角施加 $N$ 次光照扰动，用 MSE 和多尺度梯度损失强制反照率不变；跨视角语义-材质一致性 $L_{\text{cross\_semantic}}$（$\lambda_3=0.4$）假设同类语义区域材质相似——$L_{\text{cross\_semantic}} = \sum_{p=1}^P (\|\bar{F}_p^* - \bar{F}\|_2 + \|\bar{A}_p^* - \bar{A}\|_2)$，其中 $\bar{F} = \sum(F \odot M) / \sum M$ 为掩码内平均语义特征，$\bar{A}$ 为平均反照率。整个训练在单张 RTX 4090 上约 40 分钟（阶段 I 7000 次 + 阶段 II 3000 次迭代）。
+
+\paragraph{静态-动态分离的动态场景重光照}
+
+前面所有方法都假设场景是静态的。LumiMotion（2026.04）~\cite{2604_10994}（Improving Gaussian Relighting with Scene Dynamics）解决静态光照假设下动态场景的重光照问题：先前方法假设场景中光照恒定，但真实动态场景中光照和物体同时变化（如人在室内走动时的阴影变化）。Baseline 2DGS 提供准确的表面法线（对 BRDF 计算至关重要），但无法建模时间维度的变化。LumiMotion 的两阶段管线如下。阶段 I 学习动态几何：基于 2DGS，用 MLP 预测每个时间步 $t \in [0,1]$ 下高斯的平移 $\Delta \mu \in \mathbb{R}^3$、旋转 $\Delta r \in \mathbb{R}^3$ 和颜色变化 $\Delta c \in \mathbb{R}^3$——$\Delta \mu, \Delta r, \Delta c = \text{MLP}(\gamma(t), \gamma(\mu))$，其中 $\gamma$ 为位置编码。关键设计是静态-动态模糊分离：为每个高斯引入辅助变量 $P$，用 Binary Concrete 分布采样（温度 $T=0.5$）得到连续松弛变量 $\tilde{P} \in [0,1]$，仅动态高斯（$\tilde{P}$ 接近 1）才施加平移和旋转变换——$\mu' = \mu + \tilde{P} \cdot \Delta \mu$，$r' = r + \Delta r$。
+
+动机是：移动阴影在无纹理区域可被错误地解释为高斯的颜色变化或消失，静态-动态分离确保动态变化仅作用于真正运动的物体，这对阶段 II 的反照率估计至关重要。颜色变化采用乘性模型 $c' = c(1 - \Delta c)$ 模拟光影效果。阶段 II 在冻结的几何和变形网络上进行逆渲染：每个 2D 高斯分配漫反射反照率 $A$（用阶段 I 的规范颜色 $c$ 初始化）和粗糙度 $\rho$，两者对所有时间步保持恒定（颜色变化完全由渲染方程解释，$\Delta c$ 不再使用）。环境光照 $L_{\text{env}}$ 用可优化图像表示。渲染方程在光栅化后逐像素求解（而非逐高斯），采用简化 Disney BRDF（反照率 $A$ + 粗糙度 $\rho$），入射辐射度 $L_i = V(\omega_i, x) L_{\text{env}}(\omega_i) + L_{\text{ind}}(\omega_i, x)$ 通过 2D 高斯光线追踪计算可见性 $V$ 和间接光照 $L_{\text{ind}}$。蒙特卡洛积分均匀采样 $N_r$ 条射线方向，最终 PBR 颜色为 $c_{\text{pbr}}(\omega_o) = \frac{2}{N_r} \sum_{i=1}^{N_r} f_r(\omega_i, \omega_o, x) L_i(\omega_i, x)(\omega_i \cdot n)$。总损失包含：重建损失 $L_c$（规范颜色与 GT 的 $L_1$ + D-SSIM）、阶段 II PBR 渲染损失（$L_1$ 对 GT）、静态偏好正则化 $L_P = \frac{1}{N} \sum |P_i|$（鼓励尽可能少的高斯为动态）、颜色和平移变化的 $L_2$ 正则化。
+
+\paragraph{大气散射传输模型嵌入渲染方程}
+
+水下方法处理水中介质，SSD-GS（2026.04）~\cite{2604_13333}（Scattering and Shadow Decomposition）则处理户外场景中大气散射效应（雾、霾、烟雾）对材质估计的干扰问题。Baseline 3DGS 逆渲染方法假设无大气介质，直接从观测颜色推断材质参数，但在有雾场景中，大气散射显著改变观测颜色和对比度，导致材质分解严重失真。SSD-GS 的核心设计是将渲染方程中嵌入显式的大气散射传输模型，将像素颜色分解为三个独立分量：直接辐射（表面 BRDF 反射）、大气散射和阴影。直接辐射分量使用标准 Cook-Torrance 微面 BRDF（反照率 $A$、粗糙度 $\rho$、金属度 $m$），法线从高斯最短轴推导。大气散射采用经典大气传输模型：$I = J \cdot t(x) + A_{\infty}(1 - t(x))$，其中 $J$ 为无散射辐射、$t(x)$ 为透射率、$A_{\infty}$ 为无穷远天空颜色。透射率 $t(x)$ 由每个高斯的可学习散射系数 $\sigma_s$ 和到相机的距离 $d$ 决定：$t(x) = e^{-\sigma_s \cdot d}$。阴影分量通过光线追踪计算：对每个表面点发射射线到环境贴图采样方向，累积沿射线的高斯不透明度得到可见性 $V(\omega_i, x)$。最终的像素颜色为三个分量的物理组合，其中大气散射项和阴影项作为独立可学习参数与材质参数联合优化。这种显式分解使材质估计不受雾和阴影的干扰，同时允许用户在推理时调整散射强度和阴影参数实现风格化渲染。
+
+\paragraph{前馈 Transformer 预测 PBR 材质高斯}
+
+前面所有方法都是基于优化的（逐场景训练）。Large Material Gaussian Model（MGM）（2025.09）~\cite{2509_22112} 代表一种不同的范式：将大模型（LRM 系列）的前馈重建扩展到 PBR 材质估计，从多视角图像直接预测材质高斯。Baseline LRM 及其变体（LaRa、LGM 等）用 Transformer 从多视角图像预测高斯的位置、不透明度和 SH 颜色，但输出的高斯仅编码外观（着色后的 RGB），不含任何 PBR 材质属性（反照率、粗糙度、金属度），因此无法重光照。MGM 的核心设计是材质高斯表示 $\theta = \{x, R, S, \alpha, c_a, c_r, c_m\}$，其中几何参数与标准 2DGS 一致，但将 SH 系数替换为 5 通道视图无关颜色：前 3 通道为反照率 $c_a \in \mathbb{R}^3$，后 2 通道为粗糙度 $c_r \in \mathbb{R}^1$ 和金属度 $c_m \in \mathbb{R}^1$（反照率不含光照分量，SH 高阶系数无意义）。管线包含三个模块。第一个为多视角 PBR 扩散模型：在 Stable Diffusion 基础上训练两个子模型——反照率模型和粗糙度/金属度模型，后者在输入/输出块的外层膨胀额外分支并用参数拷贝初始化。
+
+利用 ControlNet 接受深度图和法线图作为几何条件，从文本提示生成 4 视角一致的 PBR 图像（5 通道：albedo 3 + roughness 1 + metallic 1）。训练数据来自 Objaverse 的多视角 PBR 渲染。第二个为材质高斯重建模型：将 5 种输入图像（反照率、粗糙度、金属度、深度、法线）分别用 DINOv2 图像编码器提取特征，拼接相机嵌入后输入基于 LaRa 的 Transformer 体解码器 $\theta_g$，预测 3D 高斯体积，再通过轻量参数解码网络得到材质高斯 $\theta$。深度和法线不仅作为 PBR 扩散的几何条件，还参与重建模型的几何正则化损失 $L_{\text{Geometry}} = L_1(\hat{I}_d, I_d) + L_1(\hat{I}_n, I_n)$，确保高斯几何与代理几何一致。2DGS 正则化包含深度扭曲损失 $L_\delta$（$\lambda_\delta = 1000$）和法线一致性损失 $L_n$（$\lambda_n = 0.2$）。两阶段训练策略：第一阶段冻结粗糙度/金属度组件，仅训练反照率；第二阶段放开全部材质组件联合训练。总损失为 $L = L_{\text{Image}} + L_{\text{Reg}} + L_{\text{Geometry}}$，其中 $L_{\text{Image}} = L_2(\hat{I}, I) + L_{\text{SSIM}}(\hat{I}, I)$。
+
+第三个为重光照模块：材质高斯存储全部 PBR 属性，给定视角方向，用 2DGS 光栅化渲染反照率、粗糙度、金属度和法线图，再通过 Cook-Torrance 微面 BRDF（$f_r = (1-m)\frac{A}{\pi} + \frac{DFG}{4(\omega_i \cdot n)(\omega_o \cdot n)}$）和任意环境贴图计算重光照结果。代理几何由 CraftsMan（3D 生成模型）提供，但由于扩散模型的泛化能力，即使代理几何质量有限也能产出正确的 PBR 材质。
+
+\begin{takeaway}
+材质分解与逆渲染将 3DGS 从仅编码外观推进到编码物理材质属性。SSD-GS 显式分解大气散射和阴影以消除环境干扰，MGM 用前馈 Transformer 从多视角直接预测材质高斯实现泛化。关键挑战是外观-材质-光照三者的病态分解，多视角一致性和可见性计算是主要瓶颈。
+\end{takeaway}
+
+%% ============================================================
+
+\subsection{近期方法脉络：材质分解与重光照、Area emitters in Gaussian inverse rendering、Deformable and relightable Gaussian assets等}
+
+这一组近期工作延续 2D Gaussian Splatting、Relightable Gaussian Splatting、Gaussian Splatting，主要把改动集中在扩展、分解等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{MaterialClusterGS}
+MaterialClusterGS（2026.06）~\cite{2606_09018} 延续 2D Gaussian Splatting 在“材质分解与重光照”上的基本设定，主要改变是：MaterialClusterGS：全局BRDF材质调色板加连续空间材质场，给2DGS共享材质原型。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：提出palette-based material decomposition，把局部BRDF拟合改为全局共享材质原型，降低阴影、间接光、几何误差被吸收到无数局部材质中的风险。
+具体而言，方法为场景学习一组紧凑BRDF prototypes，并用连续空间材质场给每个位置分配材质混合权重，同时优化照明和2DGS渲染。
+适用边界是：材质调色板数量需要选择；复杂混合材质和强间接光仍难分解。
+
+\paragraph{AEGIR}
+AEGIR（2026.06）~\cite{2606_28635} 延续 Relightable Gaussian Splatting 在“Area emitters in Gaussian inverse rendering”上的基本设定，主要改变是：在可重光照 Gaussian 表示中显式优化局部面积发光体。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：指出点光源、环境贴图或隐式光照近似忽略真实发光体空间范围的问题，并在 Gaussian 逆渲染中联合优化面积光源。
+具体而言，在 relightable Gaussian Splatting 表示中分离材质和照明，同时加入具有空间范围的 area emitter 参数，提升局部照明和阴影物理合理性。
+适用边界是：逆渲染高度欠定，面积光源数量、位置和材质反照率之间仍可能耦合；需要良好观测覆盖。
+
+\paragraph{DR-GS}
+DR-GS（2026.06）~\cite{2606_29379} 延续 Gaussian Splatting 在“Deformable and relightable Gaussian assets”上的基本设定，主要改变是：物理逆渲染、relighting 与 deformation-aware manipulation 的统一 2D Gaussian 框架。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：解决既有 GS 方法把照明烘焙进纹理、难以在动态形变和光照变化下保持物理一致的问题。
+具体而言，以 2D Gaussians 为显式表示，联合估计材质、光照和可形变结构，使重建后仍可进行材质编辑、动态变形和重光照。
+适用边界是：物理逆渲染欠定，复杂 BRDF、遮挡和非刚性形变可能带来估计不稳定。
+
+\paragraph{Editable Physically-based Reflections in Raytraced Gaussian Radiance Fields}
+Editable Physically-based Reflections in Raytraced Gaussian Radiance Fields（2026.06）~\cite{2606_30861} 延续 3DGS 在“Editable reflections in Gaussian radiance fields”上的基本设定，主要改变是：结合 diffuse/specular buffers、geometry/BRDF buffers 与 raytraced Gaussian 表示。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：提出 proof of concept，使 specular reflections 不再只是 reflector 后方的伪几何，而是可以被分解和编辑。
+具体而言，从训练视图提取 diffuse 和 specular buffers，并估计 geometry 与 BRDF buffers，再在 raytraced Gaussian radiance fields 中优化反射体和反射对象。
+适用边界是：作者定位为 proof of concept，依赖 buffer 提取质量；复杂反射、折射和多次反弹仍具挑战。
+
+\paragraph{Intrinsic decomposition and editing of 3D Gaussian splats}
+Intrinsic decomposition and editing of 3D Gaussian splats（2026.06）~\cite{2606_31637} 延续 3D Gaussian Splatting 在“Intrinsic decomposition of Gaussian splats”上的基本设定，主要改变是：将 albedo、shading 和 view-dependent residuals 表示为独立 Gaussian primitive 集合并联合优化。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：提出用独立 Gaussian 集合分别适配 intrinsic layer 的特性，并用数据驱动预测指导优化。
+具体而言，将图像颜色分解为 diffuse albedo、shading 和可能的视角相关残差，每一层由独立高斯集合表示，从而支持修改物体颜色和纹理而保持光照一致。
+适用边界是：intrinsic decomposition 本身欠定，强高光、复杂间接光和错误预测可能影响分层质量。
+\section{重光照}
+\label{sec:05_3}
+
+本节将材质分解的成果推向实际应用——在改变光照条件后重新渲染场景。先介绍重光照的问题背景，然后按预计算光传输和野外光照两条路线组织方法，最后讨论其他重光照技术。
+
+\subsection{问题背景：从分解到应用}
+
+本节讨论四条技术路线：（1）预计算光传输方法；（2）室外与野外场景重光照；（3）面部与人物重光照；（4）其他重光照方法。
+
+§5.2 的材质分解将每个表面的材质参数（BRDF）和场景光照分离。这种分离的直接应用是\textbf{重光照}（relighting）：保持材质不变，改变光照条件，重新渲染场景。重光照是虚拟制片、游戏、AR 等应用的核心需求。
+
+重光照的技术挑战在于效率：对于每个像素，需要将新的环境光照与 BRDF 做积分（渲染方程的球面积分）。如果每个像素都做数值积分，计算量巨大。因此，高效的重光照方法通常依赖预计算或近似策略。
+
+\subsubsection{预计算光传输方法}
+
+本路线介绍将预计算光传输（PRT）的经典思路适配到 3DGS 高斯基元上，实现实时重光照的方法。
+
+预计算光传输（PRT, Precomputed Radiance Transfer）是图形学中的经典思路：离线阶段预先计算好"光照如何从各个方向照射到每个表面点"（即光传输函数），运行时只需将新的环境光照与预计算的传输函数做简单运算（通常是点积），即可实时获得重光照结果。本节的方法将这一思路适配到 3DGS 的高斯基元上。
+
+\paragraph{Disney BRDF 完整 PRT 与自传输递归}
+
+PRTGS（2024.08）~\cite{2408_03538}（Precomputed Radiance Transfer）修改了原始 3DGS 的着色环节——用基于 Disney BRDF 的完整 PRT 管线替代纯漫反射假设——高斯的几何与位置属性保持不变。传统做法（如 GS-IR、RelightableGS）假设高斯表面为纯漫反射，无法处理镜面互反射。PRTGS 的核心改进是为每个高斯建立基于 Disney BRDF 的完整着色模型，将 BRDF 分解为漫反射项 $f_d = (1-m)/(4\pi)$ 和镜面微面项 $f_s$（含法线分布 $D$、菲涅尔 $F$、几何遮蔽 $G$），并为每个高斯优化反照率、粗糙度 $r \in [0,1]$ 和金属度 $m \in [0,1]$ 三个材质参数。
+
+\textbf{自传输递归。}预计算阶段的关键创新是\textbf{自传输递归}：不是直接计算间接光照（计算量随弹射次数指数增长），而是对每个高斯执行一次弹射的光线追踪，构建索引矩阵记录每个方向上贡献最大的遮挡高斯，然后递归计算 $n$-弹射自传输向量 $\mathbf{t} = \sum_{j=1}^{n} \mathbf{t}^j$，其中一弹射项
+\begin{equation}
+\mathbf{t}^1 = \int_{\Omega_d} f(\mathbf{d}_i, \mathbf{v})\langle\mathbf{d}_i, \mathbf{n}\rangle \cdot \mathbf{t}^{d_i}_{\text{diffuse}} \cdot \hat{\mathbf{t}}(\mathbf{i}^{1}) \, d\mathbf{d}_i
+\end{equation}
+
+将漫反射传输向量逐弹射累积。直觉上，一弹射的传输向量记录的是"从哪个高斯反射过来的光最多"，后续弹射只需沿着这些记录的方向继续查找，无需重新追踪光线。这样，一次光线追踪的结果可递归复用，以极低的额外代价计算多弹射间接光照。
+
+\textbf{运行时重光照。}运行时将全局直接光照用 SH 参数化为 $\mathbf{l}_{\text{dir}}$，与预计算传输矩阵做内积 $\mathbf{L}_o = \mathbf{T}_{m \times n} \cdot \mathbf{l}_{\text{dir}}$，即可获得包含多弹射互反射的实时重光照——用矩阵乘法替代了逐像素积分。
+
+\paragraph{隐式神经解码器替代解析 BRDF}
+
+PRTGS 用解析 BRDF 建模每个高斯的反射行为，但对毛发、半透明等复杂材质，解析模型的表达力不足。RNG（2024.09）~\cite{2409_19702}（Relightable Neural Gaussians）修改了 3DGS 的着色环节——用隐式神经表示替代解析 BRDF 模型——高斯的几何与 $\alpha$-混合 渲染管线保持不变。RNG 的核心改进是让每个高斯携带一个潜特征向量，通过共享的神经高斯解码器 $\mathcal{D}$ 预测反射率：$\rho(\mathbf{x}, \omega_o, \omega_i) = \mathcal{D}(\mathbf{x} | \omega_o, \omega_i)$，其中 $\mathbf{x}$ 是带潜向量的着色点，$\omega_o$、$\omega_i$ 分别为视角和光照方向。直觉上，解码器从潜向量中"读取"该高斯的材质属性（如反照率、粗糙度），再结合视角和光照方向，输出"从这个方向看、被那个方向照亮时该表面多亮"。
+
+\textbf{阴影提示与深度修正。}然而，MLP 容易过拟合训练视角、对尖锐阴影过平滑。RNG 引入\textbf{阴影提示}（shadow cue）：通过一次额外的 3DGS splatting 到虚拟阴影相机，计算每个着色点到光源的距离 $\Delta = \|P - Q\|$ 作为可见性信号，与视角、光照方向一起输入解码器 $\rho = \mathcal{D}(\mathbf{x} | \omega_o, \omega_i, V)$。物理直觉是：距离光源越远的着色点越可能被遮挡，这个几何信号帮助 MLP 学到更锐利的阴影边界。为解决深度不准导致阴影错位的问题，还设计了深度修正 MLP 学习线性缩放因子 $\hat{z} = z \cdot \psi(\omega_o)$。
+
+\textbf{混合前向-延迟着色。}RNG 提出\textbf{混合前向-延迟着色}两阶段策略：第一阶段用前向着色（逐高斯计算反射率后 $\alpha$-混合）获得好的几何但阴影模糊；第二阶段切换为延迟着色（先混合特征向量再解码）改善阴影质量，同时保留第一阶段的潜向量作为初始化。
+
+\paragraph{前馈 Transformer 预测可重光照神经材质}
+
+RNG 对每个场景单独训练解码器 MLP，耗时数分钟，无法快速处理新物体。F-RNG（2026.05）~\cite{2605_25975}（Feed-Forward Relightable Neural Gaussians）修改了 RNG 的优化环节——用前馈 Transformer 替代逐场景 MLP 优化——输入的多视角图像表示保持不变。F-RNG 的核心改进是利用 RelitLRM 的前馈 Transformer 预测几何和外观 token，再通过 MaterialFormer 提取可重光照的神经材质表示。具体分三步。
+
+\textbf{(1) 潜空间插值精细化几何。}检测纹理复杂度最高的 top-$K$ 图像块，在 RelitLRM 的 latent 空间中插值生成亚像素级精细高斯，通过专用 de-tokenizer 解码。
+
+\textbf{(2) 先验引导的可重光照外观蒸馏。}训练 MaterialFormer Transformer，将 RelitLRM 的几何/外观 token 和扩散先验 token 融合为材质 token $T_i^{\text{mat}}$，并施加\textbf{光照无关正则化}：对同一物体输入不同环境光 $E_0, E_1$，强制材质 token 一致：
+
+\begin{equation}
+\mathcal{L}_{\text{ind}} = \sum_c \mathcal{C}(T_i^{\text{mat}}, T_{i1}^{\text{mat}}) + \lambda_{\text{KLD}} \mathcal{L}_{\text{KLD}}(T_i^{\text{mat}}, T_{i1}^{\text{mat}})
+\end{equation}
+
+其中 $\mathcal{C}$ 为余弦相似度，$\mathcal{L}_{\text{KLD}}$ 为 KL 散度。直觉是：材质是物体的固有属性，不应该因为换了光照就改变。
+
+\textbf{(3) 通用神经渲染器。}不同于 RNG 的逐场景 MLP，F-RNG 训练一个跨所有物体共享的通用外观解码器 $\rho(G_i^{\text{mat}}, \omega_o, \omega_i) = \Phi(G_i^{\text{mat}}, \omega_o, \omega_i)$，支持从皮草到金属的广泛材质类型。
+
+\paragraph{双向球谐参数化入射-出射联合散射}
+
+前述方法（PRTGS、RNG、F-RNG）分别用解析 BRDF 或神经网络建模每个高斯的反射行为，但都假设散射函数可以拆分为独立的入射和出射项。BiGS（2024.08）~\cite{2408_13370}（Bidirectional Gaussian Primitives）修改了 3DGS 的颜色编码环节——用双向球谐（Bidirectional SH）同时参数化入射和出射方向的联合散射函数——高斯的几何属性保持不变。
+
+\textbf{双向球谐与互易性。}传统做法将高斯颜色参数化为视角相关的球谐系数，无法响应光照变化。BiGS 将每个高斯的颜色分解为直接光照 $L_{\text{direct}}(\omega_o)$ 和间接光照 $L_{\text{ind}}$，散射函数进一步分解为漫反射项 $\mathbf{d} \in \mathbb{R}^3$（视角无关的 albedo+环境遮蔽）和方向散射项 $s(\omega_i, \omega_o)$。关键创新是用双向球谐 $s(\omega_i, \omega_o) = \sum_{i=1}^{n} \sum_{j=1}^{n} c_{ij} y_i(\omega_i) y_j(\omega_o)$ 表示方向散射——直觉上，这是一张二维"查找表"：一个维度是光从哪来，另一个维度是你从哪看，表中的值告诉你表面有多亮。BiGS 并显式强制\textbf{互易性} $c_{ij} = c_{ji}$（物理上散射函数必须满足 $f(\omega_i, \omega_o) = f(\omega_o, \omega_i)$——交换光源和观察者位置，看到的亮度不变），将参数从 $n^2$ 减少到 $n(n+1)/2$。使用 25 个 SH 基函数，$s$ 仅需 $325 \times 3 = 975$ 个参数。
+
+\textbf{高效重光照。}重光照时，先对 $\omega_i$ 求和得到中间系数 $c_j = \sum_{i} c_{ij} y_i(\omega_i)$，再对新视角 $\omega_o$ 求值——将球面积分转化为两次球谐求值，复杂度 $O(n^2)$。
+
+\paragraph{BRDF-free 辐照度比调制实现即时重光照}
+
+前面四种方法（PRTGS、RNG、F-RNG、BiGS）都需要估计每个高斯的 BRDF 参数或潜向量，流程复杂且易累积误差。TranSplat（2025.03）~\cite{2503_22676}（Instant Object Relighting via Spherical Harmonic Radiance Transfer）修改了重光照的实现方式——用 BRDF-free 的 SH 系数调制替代完整的逆渲染管线——3DGS 的训练和几何保持不变。针对前述方法（PRTGS/RNG/F-RNG/BiGS）均需估计每个高斯的 BRDF 参数或潜向量、流程复杂且误差累积的局限，TranSplat 提出 BRDF-free 的逐法线辐照度比 SH 系数调制方案。TranSplat 的核心洞察是：2DGS 提供了平滑法线，每个高斯的 SH 系数已经编码了源光照下的外观；重光照只需用源和目标环境贴图的\textbf{逐法线辐照度比} $R(\mathbf{n}) = I_{\text{target}}(\mathbf{n}) / I_{\text{source}}(\mathbf{n})$ 对 SH 系数做调制。
+
+\textbf{无阴影与有阴影模型。}该方法提供两种模型：\textbf{无阴影模型}直接用 Ramamoorthi 的闭合形式 $c_k = \rho_k \mathbf{l}_k^T M(\mathbf{l}_c) \mathbf{l}_k$（$M$ 是从环境光 SH 系数推导的 $4 \times 4$ 矩阵）计算漫反射辐照度；\textbf{有阴影模型}为每个高斯额外学习一组传输函数 SH 系数 $\mathbf{d}_k \in \mathbb{R}^{(n+1)^2}$，利用 SH 正交性将渲染方程简化为点积 $L_S(\mathbf{x}) = \rho(\mathbf{x}) \langle \mathbf{l}_c, \mathbf{d}_k \rangle$。对于镜面效果，引入\textbf{镜面感知双路径 SH 传输}：高阶 SH 系数在反射域（而非法线域）中调制，从而处理视角相关的外观。整个流程作为后处理步骤运行，无需重新训练 3DGS，亚秒级完成重光照。
+
+\subsubsection{室外与野外场景重光照}
+
+本路线介绍面向户外和互联网照片集合等无约束光照条件的重光照方法，需同时处理光照估计和重光照两个耦合问题。
+
+预计算光传输方法通常假设受控光照或已知光照条件。然而，户外和互联网照片集合中的光照完全无约束——每张照片可能在不同时间、不同天气下拍摄。本节的方法需要同时处理光照估计和重光照两个耦合问题。
+
+\paragraph{残差驱动可见性提取与四分量户外光照}
+
+GaRe（2025.07）~\cite{2507_20512}（Relightable Outdoor Scenes）处理从无约束照片集合中重建可重光照的户外场景。核心挑战是每张照片的光照条件不同。传统做法依赖光线追踪检测遮挡，对视锥外物体的投射阴影会漏检。GaRe 的关键改进是\textbf{残差驱动的图像级可见性提取}：先训练一个仅环境光的模型（每个高斯预测环境颜色 $c_k^{\text{amb}} = \phi_{\text{amb}}(f_k^{\text{amb}}, E_i^{\text{amb}})$），用掩码损失 $\mathcal{L}_{\text{amb}} = \|(I_{\text{amb}} - I)(1-\bar{V}_c)\|_1$ 优化，残差图 $\bar{I}_{\text{res}} = |I - I_{\text{amb}}|$ 突出受直射阳光和阴影影响的区域，再通过二值聚类得到太阳可见性图 $\bar{V}$。场景外观分解为四个分量的乘积 $I = (\bar{V} S_{\text{sun}} + S_{\text{sky}} + S_{\text{ind}}) R$，其中反射率 $R$ 与光照无关，太阳/天空/间接着色各自用独立的每高斯特征 $f_k^{*}$ 和每图像嵌入 $E_i^{*}$ 通过 MLP 预测。阴影通过\textbf{光线追踪可见性烘焙}实现：对每个高斯沿光线方向遍历，用递推公式 $T_j = (1-\alpha_{j-1})T_{j-1} \max(-\mathbf{n}_{j-1} \cdot \mathbf{d}_i^*, 0)$ 计算残余透射率作为可见性 $v_k^{\text{rt}}$，然后烘焙到 MLP 预测器 $v_k = \phi_{\text{vis}}(f_k^{\text{vis}}, p_k, d_i)$ 以支持实时推理。
+
+\paragraph{物理先验约束光照参数化的户外重光照}
+
+R3GW（2026.03）~\cite{2603_02801}（Relightable 3D Gaussians for Outdoor Scenes in the Wild）用前景/天空双组高斯分离表示户外场景。传统做法将光照参数化为一般环境贴图，搜索空间过大。R3GW 的核心改进是\textbf{物理先验约束的光照参数化}：环境光用 4 阶 SH（$l_{\text{light}}=4$，$3 \times 25$ 个系数）表示，天空用 1 阶 SH（$l_{\text{sky}}=1$，$3 \times 3$ 个系数）固定于远距离半球上。每张图像通过可学习嵌入 $e$ 经 MLP 预测两组 SH 系数：$l_{\text{light}}, l_{\text{sky}} = W(e)$。前景高斯的颜色基于 Cook-Torrance BRDF（假设非金属表面，固定金属度 $m=0$），漫反射色用 Ramamoorthi 的 $3 \times 3$ 矩阵闭合形式 $c_{\text{diffuse}} = (\mathbf{n}^T M(l_{\text{light}}, A) \mathbf{n})$ 计算，镜面色用 split-sum 近似 $c_{\text{specular}} = l_{\text{specular}}^T Y(\mathbf{r}) (0.04 F_1 + F_2)$，其中 $l_{\text{specular}}$ 是用高斯核在 SH 域中卷积（模糊强度为粗糙度平方 $g^{l0} = e^{-l(l+1)\sigma^2}$）得到的平滑环境光，避免了为每张图像存储完整 cube map 的巨大参数量。天空高斯用球坐标参数化位置（共享半径 $r^+$，可优化极角/方位角），用 99 百分位前景距离初始化。训练损失包含正则化 $\lambda_{\text{light}}=1.0$, $\lambda_{\text{normal}}=0.05$, $\lambda_{\text{scale}}=1.0$, $\lambda_{\text{fg-sky}}=0.5$, $\lambda_{\text{sky-depth}}=0.005$。
+
+\paragraph{两阶段几何-纹理解耦户外重光照}
+
+ROSGS（2025.09）~\cite{2509_11275}（Relightable Outdoor Scenes）通过\textbf{两阶段几何-纹理解耦}处理户外重光照。传统做法在单阶段同时优化几何和光照，但无约束光照下几何重建质量差。ROSGS 第一阶段用 2DGS 重建几何，引入外观变换模块 $c'_k = \gamma_k \odot \rho_k + \beta_k$，其中 $(\gamma, \beta) = f_{\text{app}}(\rho_k, \xi_k, \Xi_j)$ 由每高斯嵌入 $\xi_k$ 和每图像嵌入 $\Xi_j$ 预测仿射变换参数来补偿光照变化，并用单目法线先验（StableNormal）约束非边缘平面区域。第二阶段固定几何，引入\textbf{混合太阳-天空光照模型}：太阳用单个球面高斯（SG）$\text{SG}_{\mu,\lambda,\xi}(\omega) = \xi e^{\lambda(\mu \cdot \omega - 1)}$ 表示高频方向性光照，天空用全局二阶 SH 系数 $l_c \in \mathbb{R}^{3 \times 9}$ 表示低频环境光，每个高斯的 PRT 传输函数用局部 SH $t_k \in \mathbb{R}^{1 \times 9}$ 编码。渲染方程在屏幕空间延迟着色：$C(x) = \rho (I_{\text{sun}} + I_{\text{amb}})$，其中太阳辐照度 $I_{\text{sun}}$ 通过对第一阶段提取的 mesh 做 BVH 加速光线追踪计算可见性 $V_{\text{sun}}$，环境辐照度 $I_{\text{amb}} = S(\sum_j l_c^j t_k^j)$ 通过 splatting 全局/局部 SH 系数的点积得到。太阳颜色先验用修改版 Nishita 大气模型的多项式拟合约束。
+
+\paragraph{可学习辐射传输函数绕过显式 BRDF}
+
+LumiGauss（2024.08）~\cite{2408_04474}（Relightable Gaussian Splatting in the Wild）基于 2DGS 为每个高斯建立可学习的\textbf{辐射传输函数}。传统做法用解析 BRDF 着色，需要估计材质参数。LumiGauss 的核心创新是直接为每个高斯参数化一组传输函数 SH 系数 $\mathbf{d}_k \in \mathbb{R}^{(n+1)^2}$，绕过显式 BRDF 估计。每张训练图像关联一个可学习嵌入 $e_c$，通过 MLP 预测环境光 SH 系数：$\mathbf{l}_c = \phi(e_c | W)$（$n=2$，即二阶 SH 的 9 个系数）。方法提供两种模型：\textbf{无阴影模型} $c_k = \rho_k \mathbf{l}_k^T M(\mathbf{l}_c) \mathbf{l}_k$（$M$ 是从环境光 SH 推导的 $4 \times 4$ 矩阵，Ramamoorthi 闭合形式解）；\textbf{有阴影模型} $c_k = \rho_k \sum_{i=1}^{(n+1)^2} l_c^i d_k^i$，直接学习包含阴影和互反射的传输函数。关键物理约束包括：传输函数限制在 $[0,1]$（0=完全遮挡，1=完全曝光）、环境光限制为非负 $\mathcal{L}_+ = \mathbb{E}[\|\min(L(\omega_i), 0)\|^2]$、阴影传输不亮于无阴影传输 $\mathcal{L}_{\text{shadow}} = \mathbb{E}[\|\max(\langle\mathbf{d}_k, \omega_i \rangle - d_k(\omega_i), 0)\|^2]$。训练采用课程学习：先用无阴影模型预训练（避免局部最优），收敛后切换到有阴影模型。
+
+\subsubsection{面部与人物重光照}
+
+本路线介绍专门针对面部和人物重光照设计的方法，需处理皮肤的次表面散射、毛发的各向异性以及面部形变产生的动态阴影等特殊挑战。
+
+面部和人物重光照有特殊需求：皮肤具有次表面散射（光线在表皮下多次散射后出射），毛发是各向异性材质，面部形变（说话、表情）会产生动态阴影。本节的方法专门针对这些挑战设计。
+
+\paragraph{扩散模型驱动动态面部表演重光照}
+
+DifFRelight（2024.10）~\cite{2410_08188}（Diffusion-Based Facial Performance Relighting）用扩散模型实现动态面部表演重光照。传统做法用解析 BRDF 着色，无法准确模拟各向异性材质和次表面散射等复杂效果。DifFRelight 的核心思路是纯数据驱动：在定制 LED 面板光舞台上（$16 \times 5$ 面板 $+$ 天花板 $6 \times 5$ $+$ 地面 10 块，配合 75 台同步 4K 摄像机）采集同一人在 123 种单灯（OLAT）条件下的数据对 $(I_{\text{FlatLit}}, I_{\text{OLAT}}, \mathbf{d})$。扩散模型基于 Stable Diffusion，关键架构修改包括：(1) 将平光图像的 VAE 潜编码与噪声图在通道维度拼接（第一层卷积通道数翻倍），保留空间结构对齐；(2) 光照方向用 3 阶 SH 编码后替代文本嵌入，通过 cross-attention 注入 U-Net：$s_d = [\mathbf{0}; Y(\mathbf{d})]$；(3) 使用金字塔噪声（而非标准高斯噪声）避免颜色偏移。去噪目标为 $\mathcal{L}_\epsilon = \|\epsilon_\theta(z_{\text{OLAT}}^{(t)}, E(I_{\text{FlatLit}}); s_d, t) - \epsilon\|_2^2$。为处理长序列的时间一致性，提出\textbf{分段可扩展 3DGS}：先用 $K$ 个关键帧训练全局 Deformable GS，再以关键帧为分界点将序列分为 $K-1$ 段，各段继承关键帧的 GS 初始化，并通过关键帧变形偏移正则化 $\mathcal{L}_{\text{reg}} = \|\Delta'_{t_{k_0}} - \Delta_{t_{k_0}}\|_2 + \|\Delta'_{t_{k_1}} - \Delta_{t_{k_1}}\|_2$ 约束过渡帧一致性。
+
+\paragraph{UV 空间高斯绑定与动态阴影向量}
+
+Instant Facial Gaussians Translator（2024.09）~\cite{2409_07441} 将 CG 面部 PBR 资产桥接到 3DGS 表示。传统做法（如 GaussianAvatars、SplattingAvatar）从真实捕获重建，缺乏从 CG 资产直接转换的高效方法。核心创新是\textbf{UV 空间高斯绑定}：每个高斯的 3D 位置通过 UV 坐标 $\mathbf{u}=(u,v)$ 定义在共享 UV 空间上，3D 位置由 $\mathbf{x}_{3D} = M(\mathbf{u}; G) + d \cdot \mathbf{n}_f$ 计算（$M$ 为 UV 映射函数，$d$ 为可学习的法向偏移，$\mathbf{n}_f$ 为三角面法线），天然支持 blendshape 动画：$V_i = \bar{V} + B \mathbf{b}_i$。为处理面部形变产生的阴影变化，引入\textbf{动态阴影向量} $\mathbf{l} \in [0,1]^B$（$B$ 为 blendshape 数量），最终颜色 $c^*_{\omega,i} = \mathbf{l}^T \mathbf{b}_i \odot c_\omega$，其中 $c_\omega$ 是 SH 编码的视角相关颜色。设计动机：面部形变产生的阴影/自遮挡主要与视角无关（如鼻翼下方的阴影），因此用与 blendshape 权重线性调制的标量乘法即可建模，仅增加 $B$ 个参数/高斯。为保证生成式建模的一致性，采用\textbf{像素对齐采样}：在 4K UV 图上均匀采样（前额 10 像素/点，其余 16 像素/点），锁定位置并关闭分裂/剪枝，确保所有资产共享 228,083 个高斯的统一拓扑。
+
+\paragraph{UV 空间物理信息编码与 RelightNet 交叉注意力}
+
+Relightable Holoported Characters（2025.12）~\cite{2512_00255} 从稀疏视角捕获动态人物表演并生成可重光照的 3DGS 资产。传统做法直接恢复 albedo 和 BRDF，但变形网格的几何过平滑和追踪噪声使得解析着色不可行。核心创新是\textbf{物理信息特征编码}与\textbf{RelightNet 交叉注意力}：在跟踪网格的 UV 空间中编码渲染方程的各个分量——(1) 几何特征 $\mathcal{N}$（3 帧法线堆叠 $+$ Sapiens 图像法线反投影到 UV）和位置图 $p$；(2) 反照率特征 $\bar{A}$（稀疏视角反投影 $+$ AlbedoNet 修补 $\hat{A} = H(A, \mathcal{N}, V)$）；(3) 着色特征 $d = \int_{\Omega_i} L_i(\mathbf{x}, \omega_i) V(\mathbf{x}, \omega_i) \langle\omega_i, \mathbf{n}\rangle d\omega_i$（预积分漫反射着色）和视角编码 $V$。RelightNet $g = F(f; E)$ 是一个 2D 卷积网络，在 UV 空间中用 self-attention 捕获次表面散射（通过几何编码 $\mathcal{N}, p$），用\textbf{cross-attention} 聚合环境光 $E$ 的所有方向贡献（模拟渲染方程的半球积分）：将展平的环境光编码为 $(K_E, V_E)$，每个 UV texel 的特征作为 $Q_E$，做多 head cross-attention。输出不是 RGB 纹理，而是\textbf{重光照 3D 高斯参数}（位置偏移 $\delta p_i$、缩放偏移 $\delta s_i$、颜色 $c_i$、旋转 $r_i$、不透明度 $o_i$），位置从网格表面初始化 $p_i = \hat{p}_i + \delta p_i$。
+
+\subsubsection{其他重光照方法}
+
+本路线介绍不属于上述分类的重光照方法，涵盖室内光照分解、元学习重光照、大型重建模型、扩散辅助重光照、虚拟制片以及免训练多视角重光照。
+
+以下介绍 6 个不属于上述分类的重光照方法，涵盖室内光照分解、元学习重光照、大型重建模型、扩散辅助重光照、虚拟制片以及免训练多视角重光照。
+
+\paragraph{扩散模型单图分解室内光源贡献}
+
+LuxRemix（2026.01）~\cite{2601_15283}（Lighting Decomposition and Remixing）将室内场景光照分解为单独可控的光源贡献。传统做法需要物理上逐一开关光源采集 OLAT 数据，实际操作困难。LuxRemix 采用三阶段流水线：(1) \textbf{合成数据训练单图光照分解}——用 12,000+ 程序化生成的室内场景在 Blender Cycles 中渲染全光图和 OLAT 图像，fine-tune 预训练 DiT 模型（使用 LoRA），以光源选择 mask 作为空间 prompt，输入图像 $I_\text{all}$ 分解为环境光 $I_{\text{amb}}$ 和各 OLAT 贡献 $I_i$：$I_\text{all} = \tau(I_{\text{amb}} + \sum_{i=1}^{N} c_i I_i)$，训练时动态组合多个 OLAT 图像增强鲁棒性；(2) \textbf{多视角光照协调}——在稀疏视角上做单图分解后，通过多视角扩散模型（类似 CAT3D/SEVA 的架构）结合 Plücker 光线嵌入将分解结果传播到所有视角，三次曝光（高/中/低对应 EV0/EV-2/EV-4）合并为 HDR 输出；(3) \textbf{可重光照 3DGS}——为每个高斯扩展 per-light HDR RGB 系数，将各光源的贡献分开存储，渲染时用用户控制的强度/颜色线性组合：两阶段优化（先训标准 3DGS 建立几何，再冻结几何引入 per-light 系数在 HDR 线性空间中联合优化 per-Gaussian 和 per-light 缩放因子）。
+
+\paragraph{Blinn-Phong 嵌入与双层元学习分布外重光照}
+
+MetaGS（2024.05）~\cite{2405_20791}（Meta-Learned Gaussian-Phong Model）用元学习解决 OLAT 条件下的\textbf{分布外（OOD）重光照}问题。传统做法在训练光照上过拟合，换到测试光照时产生错误的镜面高光和阴影。MetaGS 的核心改进是将 Blinn-Phong 反射模型嵌入 3DGS：每个高斯除标准属性外增加法线 $\mathbf{n}$、漫反射色 $k_d \in \mathbb{R}^3$ 和镜面系数 $k_s \in \mathbb{R}$，颜色按 $L_p = L_a + T_i^l \sum_{\text{lights}} (k_d I_d + k_s I_s)$ 计算，其中 $I_d = I^2 \max(0, \mathbf{n} \cdot \mathbf{l})$，$I_s = I^2 \max(0, \mathbf{n} \cdot \mathbf{h})^p$（$\mathbf{h}$ 为视角和光照的半程向量），$T_i^l$ 为基于 BVH 光线追踪的阴影可见性。关键创新是\textbf{双层元学习优化}：内循环在 support set（特定光照条件）上独立更新得到 $m$ 个子模型 $\theta_i^* \leftarrow \theta - \alpha \nabla_\theta \mathcal{L}(\theta; D_i^{\text{sup}})$，外循环在 query set（其他光照条件）上验证并全局更新 $\theta \leftarrow \theta - \beta \sum_{i=1}^{m} \nabla_\theta \mathcal{L}(\theta_i^*; D_i^{\text{query}})$。这迫使几何属性（位置、法线、旋转）和光照属性（SH 系数、$k_a, k_s$）在不同光照间协调收敛。训练采用三阶段：先训核心高斯属性 4k 迭代、再引入法线 4k 迭代、最后元学习 $k_d, k_s$ 共 5k 迭代，总计约 1 小时（单 RTX 3090）。
+
+\paragraph{生成式重光照视图扩散 Transformer}
+
+RelitLRM（2024.10）~\cite{2410_06231}（Generative Relightable Radiance for Large Reconstruction Models）将大型重建模型（LRM）扩展为\textbf{生成式}可重光照 3DGS。传统回归方法对稀疏视角下重光照固有的不确定性（阴影、镜面的多峰分布）输出模糊的平均结果。RelitLRM 的核心创新是\textbf{重光照视图扩散}：先用与 GS-LRM 相同的 $L_1$ 层 Transformer 确定性预测 3DGS 几何参数 $G_{ij}^{\text{geom}}$，然后将含噪的重光照视图 token、目标光照 token、去噪步 token 和几何 token 拼接后送入第二组 $L_2$ 层 Transformer 做去噪，输出重光照的 4 阶 SH 外观参数 $G_{ij}^{\text{color}} \in \mathbb{R}^{75 p^2}$。每步去噪先预测 3DGS 外观再渲染得到去噪视角（$x_0$ 预测目标），$x_0$ 预测使推理时最后一步直接输出重光照 3DGS。环境光 $E \in \mathbb{R}^{H_e \times W_e \times 3}$ 通过两个色调映射器（分别强调暗区和亮区）转换为 9 通道特征，patchify 后编码为光照 token。推理时使用 DDIM 采样器 $+$ classifier-free guidance，仅需一次前馈过程即可得到新光照下的 3DGS——不需要逐场景优化。
+
+\paragraph{扩散模型合成多光照训练数据增强}
+
+A Diffusion Approach to Radiance Field Relighting（2024.09）~\cite{2409_08947} 使用扩散模型合成多光照训练数据以训练可重光照 3DGS。传统做法需要物理多光照采集设备，难以扩展。该方法的流水线分三步：(1) \textbf{单视图重光照 ControlNet}——在 Murmann 等人的 1015 个室内场景 $\times$ 25 光照方向数据集上 fine-tune ControlNet，以目标光照方向（用前 4 阶 SH 编码并加到时间步嵌入中）为条件，从输入图像 $X_i$ 生成新光照 $l_j$ 下的图像。关键改进包括：使用 v-parameterized 目标 $y_t = \alpha_t \epsilon - \sigma_t x$ 而非标准 $\epsilon$-prediction 改善颜色对比度、在 LAB 空间做颜色匹配补偿训练数据与场景的色差分布偏移、fine-tune VAE 解码器以另一光照的同场景图像为条件修复边缘扭曲；(2) \textbf{多光照数据增强}——对多视角图像集的每张图，用 ControlNet relight 到 18 个已知光照方向，构建完整的多光多视角数据集；(3) \textbf{可重光照 3DGS}——将原始 SH 系数替换为 3 层 128 宽 MLP $c_\theta$，输入为光照方向 $\mathbf{l}' = R_i \mathbf{l}$（转到世界坐标）和视角方向（各用 SH 编码为 16 维），并为每张图优化 128 维辅助潜向量 $\mathbf{a}$ 补偿多视角不一致性：$c(\mathbf{o}, \mathbf{d}) = \sum_{g=1}^{G} w_g c_\theta(\mathbf{x}_g, \mathbf{d} | \mathbf{a}_v, \mathbf{l}')$。
+
+\paragraph{几何无关的 LED 墙纹理光照采样}
+
+Relightable Gaussian Splatting for Virtual Production（2026.05）~\cite{2605_09024} 针对虚拟制片中的 LED 墙环境设计\textbf{几何无关的光照纹理采样}。传统逆渲染方法需要估计表面法线和 BRDF 参数来计算反射，流程复杂且在玻璃等透明材质上失败。该方法的核心理念是：对 LED 墙上的图像 $I_k^B$，每个高斯学习一组 UV 坐标 $\mathbf{u}_i \in \mathbb{R}^{M \times 2}$ 和粗糙度参数 $\sigma_i \in \mathbb{R}^{M \times 1}$，直接从背景纹理上双线性采样颜色变化 $\Delta c(\mathbf{u}_i, \sigma_i | I_k^B)$，最终颜色 $c'_{i,k} = \mathbf{c}_i + \lambda_i \cdot \Delta c$，其中 $\mathbf{c}_i$ 编码 canonical 外观，$\lambda_i \in \mathbb{R}^{M \times 1}$ 为光照强度。设计动机：将 $\mathbf{c}_i$ 解释为固定光照下的物体颜色，$\Delta c$ 解释为可变光照颜色，光照变化完全由背景纹理 $I_k^B$ 的变化驱动——用户可选择要改变的光源而保留不想改变的外观。为解决高分辨率纹理的走样问题，引入 mipmap 层级采样：从 $N$ 级下采样中，根据 $\sigma_i$ 计算上下界 mipmap 层级 $n^{\text{LB}} = \lfloor 2^N \sigma_i \rfloor$，$n^{\text{UB}} = \lceil 2^N \sigma_i \rceil$，在两层间线性插值。$\mathbf{u}_i$ 用 SH 参数化实现视角相关采样（隐式编码反射/折射光线与 LED 墙的交点），无需计算法线或光源位姿。
+
+\paragraph{免训练多视角扩散实现文本驱动重光照}
+
+Training-Free Multi-View Extension of IC-Light（2025.11）~\cite{2511_13684} 提出 GS-Light 流水线，无需训练即可实现文本驱动的 3DGS 场景重光照。传统做法需要 per-scene 重训练，而 GS-Light 集成\textbf{位置对齐模块（PAM）}和\textbf{MV-ICLight 多视角扩散}实现免训练重光照。PAM 分两步：(1) 用 Qwen2.5-VL 从用户指令中提取结构化光照先验（方向和参考物体），用 LangSAM 获取物体 mask 并计算像素坐标 $p_{\text{obj}}$；(2) 基于修正 Phong 漫反射模型 $I_d = (\max(-\mathbf{l}_\omega \cdot \mathbf{n}, 0))^\gamma$（$\gamma$ 控制亮度分布平衡）计算多视角光照强度图，编码到潜空间作为 IC-Light 的 init latent $l_d = \mathcal{E}(I_d)$。MV-ICLight 的核心创新是\textbf{跨视角注意力}和\textbf{对极约束}：将 U-Net 的 self-attention 替换为 cross-view attention，让每帧的 query token 感知所有其他帧的 key/value token；同时从全部视角中子采样少量关键帧做完整推理，对其余帧用归一化基础矩阵 $F/\|F\|_+$ 做对极匹配，从最近关键帧的特征图通过余弦距离最近邻填充。最终通过\textbf{迭代数据集更新}策略（类似 IN2N）：每 $K_\Delta$ 步用 MV-ICLight 重新渲染并更新训练图像，GS 场景在 $K_{\text{iter}}$ 次迭代后收敛到多视角一致的重光照结果。
+
+\begin{takeaway}
+重光照技术的核心目标是训练一次后支持任意环境光照下的场景渲染。从存储环境贴图、分解漫反射和镜面反射，到前馈模型直接预测材质高斯，技术路线日益成熟。GS-Light 等工作展示了免训练重光照的可行性，通过跨视角注意力和对极约束实现多视角一致的光照编辑。
+\end{takeaway}
+
+%% ============================================================
+
+
+\section{HDR与光照变化}
+\label{sec:05_4}
+
+本节处理训练图像光照不一致和动态范围不足两类问题。先分析标准 3DGS 的光照一致性假设，然后介绍 HDR 重建方法和光照变化鲁棒性方法。
+
+\subsection{问题背景：标准 3DGS 的光照一致性假设}
+
+本节讨论两条技术路线：（1）HDR 3DGS；（2）无约束照片集合。
+
+标准 3DGS 假设所有训练图像在相同的光照条件下拍摄（同一时间、同一天气）。这一假设在受控采集（如架设相机阵列拍摄）中成立，但在真实场景中经常被违反：互联网照片集合中每张照片的光照不同（白天/黑夜、晴天/阴天），长时间采集的场景光照随时间变化。当光照不一致时，3DGS 的光度损失会尝试用一个固定颜色同时匹配不同光照下的外观，导致模糊或伪影。
+
+HDR（高动态范围）是另一个相关挑战。标准 3DGS 处理的是 LDR（低动态范围）图像，每个通道只有 8 位（0-255），无法表达极端亮度差异（如直射阳光和阴影）。HDR 图像以浮点数存储亮度值，保留了完整的亮度范围。
+
+\subsubsection{HDR 3DGS}
+
+本路线介绍将 3DGS 的颜色属性从 LDR 值提升为 HDR 辐亮度值以处理高动态范围场景的方法。
+
+HDR 的核心思想是将高斯的颜色属性从 8 位 LDR 值提升为无上界的浮点辐亮度值，再通过可学习的色调映射函数将辐照度转换回 LDR 显示。直觉上，3DGS 原本存储的是"相机拍到的颜色"，HDR 方法将其改为存储"场景发出的真实光强"。这样不同曝光的照片都可以统一在同一个物理空间中训练。
+
+\paragraph{非对称色调映射网格与粗到细训练}
+
+HDRGS（2024.08）~\cite{2408_06543}（High Dynamic Range Gaussian Splatting）修改了 3DGS 的颜色解释与渲染管线——将球谐系数从 LDR 颜色重新解释为 HDR 辐亮度——高斯的几何与 $\alpha$-混合 结构保持不变。标准 3DGS 的球谐系数编码的是 LDR 颜色 $C$，而 HDRGS 将其重新解释为场景辐亮度 $L$（radiance），渲染输出从像素颜色变为传感器辐照度 $E(p) = \sum_{i} L_i \alpha_i \prod_{j=1}^{i-1}(1-\alpha_j)$，其中 $E(p) \in (0, +\infty)$ 天然无上界。
+
+\textbf{非对称色调映射网格。}核心改动在于色调映射函数的设计：传统方法使用对称均匀网格建模相机响应函数（CRF），但 HDRGS 发现场景辐照度分布极不均匀——大部分值集中在 $(a, b)$ 区间，少量值散布在 $(b, c)$ 区间。为此 HDRGS 设计了非对称网格（asymmetric grid）：密集分布区 $(a,b)$ 使用 128 节点/单位的密网格保证映射精度，稀疏区 $(b,c)$ 使用 64 节点/单位的疏网格防止过拟合。对于超出网格范围的极端值，采用带泄漏的边界函数 $g_{\text{leaky}}(x)$ 处理，泄漏系数 $\lambda = 0.01$。最终成像方程为 $C(p,t) = g_{\text{leaky}}(E'_{\ln}(p) + t'_{\ln}(p))$，其中 $E'_{\ln}$ 和 $t'_{\ln}$ 分别是辐照度和曝光时间在对数域的缩放值。
+
+\textbf{粗到细训练策略。}为避免网格与高斯属性过早耦合导致过拟合，HDRGS 采用粗到细策略：前 6000 次迭代使用 sigmoid 固定色调映射器仅训练高斯属性，之后切换为可学习网格进行联合优化。总损失 $\mathcal{L} = \mathcal{L}_{\text{rec}} + \lambda_2 \mathcal{L}_{\text{smooth}} + \lambda_3 \mathcal{L}_u$，其中 $\mathcal{L}_{\text{smooth}}$ 约束网格二阶导数保证 CRF 光滑，$\mathcal{L}_u = \|g(0) - 0.73\|_2^2$ 将单位曝光映射到标准 LDR 值以确保 HDR 场与 Blender 参考一致。
+
+\paragraph{RAW 传感器数据端到端 HDR 重建}
+
+HDRSplat（2024.07）~\cite{2407_16503}（Gaussian Splatting for HDR Reconstruction from Raw Images）直接从相机的 RAW 传感器数据重建 HDR 场景，跳过传统管线中的 ISP 处理（去马赛克、白平衡、色调映射、JPEG 压缩）。标准 3DGS 使用经过 ISP 处理的 8 位 sRGB 图像训练，但 HDRSplat 指出非线性色调映射算子 $T$ 不满足期望保持性质：$E(T(x)) \neq T(E(x))$，即 HDR 空间中噪声目标的期望不等于色调映射后的真值。这意味着在 LDR 空间训练的 $L_2$ 损失会产生有偏的像素估计。HDRSplat 的端到端管线分为三阶段：（1）预处理阶段使用 PMRID 网络在 Bayer 空间去噪，通过 $k$-$\sigma$ 变换将不同 ISO 设置下的噪声图像映射到 ISO 不变的信号-噪声空间，再进行双线性去马赛克输出 14 位线性 RAW 图像；（2）训练阶段使用 stop-gradient 缩放的 $L_1$ + D-SSIM 损失：$\mathcal{L} = \lambda \|sg(\hat{C}) - G_\theta(y_{\text{raw}})\|_1 + (1-\lambda) \text{DSSIM}(\hat{C}, G_\theta(y_{\text{raw}}))$，其中 $sg(\cdot)$ 为停止梯度操作，$G_\theta$ 是预训练去噪网络——选择 $L_1$ 而非 $L_2$ 是因为 3DGS 的显式参数化（相比 NeRF 的 MLP）表达能力有限，无法从含噪目标中学到真实像素值；（3）后处理阶段将 14 位线性 RAW 新视角转换为 8 位 sRGB，支持手动调整焦点、色调映射和曝光。此外，HDRSplat 针对稀疏非均匀点云初始化问题调整了光栅化参数：将缩放学习率减半、平移学习率降至原始值的 1/5，避免高斯过度膨胀或偏离原始位置被误剪枝。
+
+\paragraph{薄透镜景深效果与物理色调映射}
+
+Cinematic Gaussians（2024.06）~\cite{2406_07329}（Real-Time HDR Radiance Fields with Depth of Field）在 3DGS 中同时实现 HDR 渲染和物理正确的景深效果。标准 3DGS 假设针孔相机模型（所有物体都清晰），但真实镜头受光圈和焦距影响，离焦物体会产生模糊。Cinematic Gaussians 引入薄透镜模型，每个投影高斯的弥散圆（circle of confusion）半径为 $r(z) = \frac{|z - z_f|}{z} \cdot \frac{f^2}{2N(z_f - f)}$，其中 $z$ 为高斯深度、$z_f$ 为对焦距离、$f$ 为焦距、$N$ 为光圈 F 值。弥散圆用高斯近似，其协方差为 $\Sigma_a = \frac{(3r(z), 3r(z))^2}{2}$，与场景高斯的 2D 投影协方差卷积：$\tilde{\Sigma}_i = \Sigma_i + \Sigma_a$，闭式更新后的高斯核为 $\tilde{\alpha}_i(x) = \alpha_i \mathcal{N}(x; \mu_i, \tilde{\Sigma}_i) \cdot \frac{|\Sigma_i|}{|\tilde{\Sigma}_i|}$，其中分式项为能量保持归一化因子。HDR 管线将高斯球谐系数视为 HDR 辐亮度值，渲染后通过显式色调映射函数转换为 LDR：$T(E) = \text{clip}(\frac{E \cdot t \cdot A}{N^2}, 0, 1)^{1/\gamma}$，其中 $t$ 为曝光时间、$A$ 为光圈面积、$\gamma$ 为 gamma 校正。该公式将物理镜头参数直接嵌入色调映射，使用户可以在渲染时实时调整光圈大小 $N$、曝光时间 $t$ 和对焦距离 $z_f$，获得电影级的景深和曝光控制。训练损失包含三项：$\mathcal{L} = \mathcal{L}_r + \lambda_s \mathcal{L}_s + \lambda_d \mathcal{L}_d$，其中 $\mathcal{L}_r$ 为直接光度损失、$\mathcal{L}_s$ 为归一化曝光后的光度损失（消除不同曝光时间的影响）、$\mathcal{L}_d$ 为可微模糊检测器损失（匹配输入图像的景深模糊分布），$\lambda_s = 0.25$，$\lambda_d = 1$。
+
+\paragraph{双路径 3D/2D 局部色调映射与不确定性融合}
+
+GaussHDR（2025.03）~\cite{2503_10143}（HDR Gaussian Splatting via Learning Unified 3D and 2D Local Tone Mapping）提出双路径色调映射框架，让 3D 和 2D 局部色调映射互补。标准 HDR-3DGS 使用全局色调映射器，对整个场景施加相同的映射特性，忽略了局部光照差异（如阳光直射区域与阴影区域应使用不同映射）。GaussHDR 将高斯的 LDR 颜色属性 $c \in [0,1]$ 替换为 HDR 辐照度 $e \in [0, +\infty)$，然后生成两组 LDR 渲染结果：（1）3D 路径——先对每个高斯做色调映射 $c_i = g(\ln(e_i \cdot t))$ 再渲染 $I_{3d} = R_P(\{c_i\})$；（2）2D 路径——先渲染 HDR 图像 $E = R_P(\{e_i\})$ 再做色调映射 $I_{2d} = g(\ln(E \cdot t))$。两条路径各有缺陷：3D 路径的色调映射在渲染前完成，无法捕捉全局亮度上下文；2D 路径依赖全局映射，缺乏空间自适应性。关键创新是为每个高斯附加一个上下文特征 $f_i \in \mathbb{R}^d$（类似语言嵌入 3DGS 中的语义特征），通过渲染得到 2D 特征图 $F = R_P(\{f_i\})$，然后将 $f$ 作为局部条件输入残差色调映射器：$c^* = g(\ln(e \cdot t)) + \delta g([\ln(e \cdot t), f])$，全局项 $g$ 提供基础色调，残差项 $\delta g$ 捕获局部变化。3D 和 2D 路径的损失通过不确定性自适应融合：模型为每条路径预测不确定性图 $U_{3d}$ 和 $U_{2d}$，融合损失为 $\mathcal{L}_{gs} = \frac{U_{2d}^2 \mathcal{L}_{3d} + U_{3d}^2 \mathcal{L}_{2d}}{U_{3d}^2 + U_{2d}^2}$，不确定性高的路径权重自动降低。合成数据集上的单位曝光损失 $\mathcal{L}_e = \|g(0) - 0.73\|_2^2$ 固定 HDR 值的尺度。
+
+\paragraph{亮度-色度分解降低 HDR 存储开销}
+
+High Dynamic Range 3DGS via Luminance-Chromaticity Decomposition（2025.11）~\cite{2511_12895} 观察到 HDR 颜色的动态范围主要由亮度通道贡献，色度通道的变化范围相对有限。因此该方法将每个高斯的 HDR 颜色分解为亮度分量 $Y$（用 HDR 浮点数表示，范围 $[0, +\infty)$）和色度分量 $(C_b, C_r)$（用标准 8 位表示），替代原始的 3 通道 HDR 表示。这种分解将 HDR 参数量从 $3 \times \text{float}$ 减少为 $1 \times \text{float} + 2 \times \text{uint8}$，在保留完整动态范围的同时降低存储和计算开销。渲染时分别累积亮度和色度，最后合成 HDR 颜色。
+
+\paragraph{辐射传输方程修正 HDR 高斯渲染}
+
+Physically Inspired Gaussian Splatting for HDR（2026.03）~\cite{2603_28020} 从物理角度重新推导 3DGS 的渲染方程。标准 3DGS 的 $\alpha$-混合 是启发式的体积渲染近似，在高动态范围场景下（如直射阳光 vs. 深阴影）可能产生颜色失真。该方法从辐射传输方程出发，将 3DGS 的 $\alpha$-混合 解释为离散化的体积渲染积分，推导出 HDR 情况下的正确渲染方程，确保极端亮度条件下累积辐亮度的物理正确性。具体而言，将每个高斯视为参与介质中的散射元素，其辐亮度贡献应遵循 Beer-Lambert 定律的衰减模型，而非简单的 $\alpha$-混合。
+
+\paragraph{遮挡感知 HDR 空间变化光照图估计}
+
+GaSLight（2025.04）~\cite{2504_10809}（Gaussian Splats for Spatially-Varying Lighting in HDR）估计 HDR 格式的空间变化光照图（spatially-varying lighting）。标准 3DGS 假设均匀环境光照，无法处理局部光源（如路灯、窗户射入的阳光）。GaSLight 为每个高斯预计算局部光照环境，入射光照不仅取决于环境光方向，还通过遮挡感知机制考虑周围几何体的阴影和反射影响，最终输出 HDR 格式的光照图，支持精确的场景重光照。
+
+\subsubsection{无约束照片集合}
+
+本路线介绍同时处理光照变化和瞬态物体的方法，使 3DGS 能够从互联网无约束照片集合中稳健重建场景。
+
+HDR 方法假设训练图像的光照虽然不同，但场景本身是静态的。然而，互联网照片集合中还存在另一个挑战——\textbf{瞬态物体}（Transient Objects，行人、车辆等随时间出现和消失的物体）。如果不去除这些干扰物，3DGS 会为它们创建永久的高斯，导致新视角中出现"悬浮幽灵"。本节的方法同时处理光照变化和瞬态物体两个问题。
+
+\paragraph{自适应外观特征与 2D 可见性图}
+
+Gaussian in the Wild（GS-W）（2024.03）~\cite{2403_15704}（3DGS for Unconstrained Image Collections）首次将 3DGS 应用于互联网照片集合，核心挑战是同时处理光照变化和瞬态物体。标准 3DGS 使用球谐系数建模颜色，但 GS-W 放弃了这一方案，转而为每个高斯引入外观特征 $af_i$，将其分解为固有外观 $sf_i$（可学习属性，建模材质本身的颜色）和动态外观 $df_i$（从参考图像提取的特征，建模光照引起的变化），两者通过融合 MLP 生成最终外观特征 $af_i = M_f(sf_i, df_i, X_i)$，再由颜色解码 MLP 得到高斯颜色 $c_i = M_c(af_i, d)$。动态外观特征的提取采用自适应采样策略：从参考图像通过 UNet-ResNet 提取 1 张投影特征图 $F^P$ 和 $K$ 张附加特征图 $(F^1, ..., F^K)$，每个高斯拥有 $K$ 个可学习采样坐标 $(sc_i^1, ..., sc_i^K)$，自适应决定在哪些位置采样特征 $df_i = f_i^P \oplus f_i^1 \oplus ... \oplus f_i^K$，采样坐标通过正则化 $\mathcal{L}_{sc} = \frac{1}{N}\sum_i \max(0, |sc_i| - 1)$ 约束在有效范围内。对于瞬态物体，GS-W 训练 UNet 生成 2D 可见性图 $VM$，加权光度损失：$\mathcal{L}_c = \lambda_1 L_1(VM \odot I_r, VM \odot I_{gt}) + \lambda_{SSIM} L_{SSIM}(...) + \lambda_{LPIPS} L_{LPIPS}(I_r, I_{gt})$，可见性图通过正则化 $\mathcal{L}_{vm} = L_2(VM, \mathbf{1})$ 防止将所有像素标记为不可见。总损失权重为 $\lambda_1=0.8, \lambda_{SSIM}=0.2, \lambda_{LPIPS}=0.005, \lambda_{sc}=0.001, \lambda_{vm}=0.15$。
+
+\paragraph{Nerfstudio 无约束照片集合开源实现}
+
+Splatfacto-W（2024.07）~\cite{2407_12306} 是 Nerfstudio 框架下专门处理无约束照片集合的开源实现，其全称为 Nerfstudio Implementation for Unconstrained Photo Collections。该方法针对外观建模、瞬态物体和背景建模三个核心问题分别提出了相应的解决方案。
+
+外观建模方面，标准 3DGS 使用球谐系数直接编码颜色，而 Splatfacto-W 为每个高斯引入外观特征 $f_i$，结合每张图像的外观嵌入向量 $\ell_j$，通过 MLP 预测球谐系数 $b_i = \Phi(\ell_j, f_i)$，再通过标准球谐求值得到颜色 $c_i = \sum_{l=0}^{l_{\max}} \sum_{m=-l}^{l} b_i^{l,m} Y_l^m(d_i)$。这样做的好处是无需将视角方向输入 MLP，可以缓存高斯状态，保持与 3DGS 相同的渲染速度。
+
+瞬态物体处理方面，采用鲁棒掩码策略：记录每张图像的最大、最小和当前 $L_1$ 损失，线性插值确定掩码百分比 $k$，阈值设为 $T_k = (1-k)\%$ 分位数的残差，同时始终保留图像上方 40\% 的像素（通常为天空区域）并使用 $5 \times 5$ 方框核空间模糊掩码以保持平滑性。
+
+背景建模方面，考虑到 3DGS 难以准确表示天空等远距离背景，Splatfacto-W 在无穷远处设置独立的天空模型，用仅 3 阶球谐函数通过 MLP 预测天空颜色 $C_{\text{background}}(r) = \text{SH}(\Phi_{\text{sky}}(\ell_j), d_{\text{ray}}(r))$，最终像素颜色通过 $\alpha$-混合 $C_{\text{final}}(r) = \alpha(r) C(r) + (1-\alpha(r)) C_{\text{background}}(r)$ 得到，并引入 alpha 损失 $\mathcal{L}_\alpha$ 惩罚前景高斯错误占据天空区域的像素。
+
+\paragraph{延迟致密化与粗到细瞬态掩码}
+
+RobustSplat++（2025.12）~\cite{2512_04815}（Decoupling Densification, Dynamics, and Illumination）发现标准 3DGS 的自适应致密化是光照不一致场景中伪影的主要来源：在训练早期外观嵌入尚未收敛时，光度重建损失很大，但该损失无法区分”几何未重建“和”光照未建模“，导致致密化被错误触发（将光照变化误判为几何细节），产生大量悬浮伪影。RobustSplat++ 提出两个关键设计来解耦这三个问题。（1）延迟致密化策略：推迟高斯致密化的启动时间，使模型在早期仅专注重建静态场景的低频成分。实验表明致密化开始越早，新引入的高斯越容易拟合瞬态物体，PSNR 越差。延迟期间同时训练瞬态掩码 MLP（使用 DINOv2 特征作为输入），掩码的监督信号由图像鲁棒损失 $\mathcal{L}_r$ 和特征鲁棒损失 $\mathcal{L}_f$ 组成，后者通过 DINOv2 特征余弦相似度计算：$M_f = \sigma(2 \text{sim}(f_t, f'_t) - 1, 0)$。（2）粗到细掩码监督：在致密化开始前使用低分辨率渲染图像计算残差和特征一致性来监督掩码 MLP（低分辨率特征感受野更大、对局部噪声更鲁棒），致密化开始后切换为高分辨率信号，实现更精细的瞬态/静态区域判别。对于光照变化建模，RobustSplat++ 采用颜色仿射变换 $(\gamma, \beta) = \text{MLP}_\text{affine}(c_i, f_{2d}, f_{3d})$，变换后的高斯颜色 $c_i^{\text{aff}} = \gamma c_i + \beta$，结合延迟致密化策略实现稳定的颜色变换学习。
+
+\paragraph{非对称双高斯互一致性排除瞬态干扰}
+
+Robust Neural Rendering in the Wild（2025.06）~\cite{2506_03538}（Asymmetric Dual 3DGS）的核心洞察是：同一场景用不同视角采样顺序训练两个 3DGS 模型时，静态场景的渲染保持一致，但受瞬态干扰物影响的区域会出现分歧。基于此，该方法维护两组 3D 高斯 $G_1$ 和 $G_2$，各自使用不同采样顺序独立训练，并通过互一致性正则化 $\mathcal{L}_{m1} = \|\hat{I}^{G_2}_{V_1} - \hat{I}^{G_1}_{V_1}\|_1$ 约束两组高斯在不依赖光照的固有外观空间上保持一致（使用不经过外观变换的渲染结果 $\hat{I}$ 而非 $\tilde{I}$）。关键创新是两组高斯使用非对称的掩码策略避免确认偏差（confirmation bias）：$G_1$ 使用多线索自适应硬掩码 $M_h$（结合 SAM 语义分割、多视角立体匹配、像素级残差和 DINOv2 特征级残差，静态区域判定阈值为 3 个有效匹配），$G_2$ 使用自监督软掩码 $M_s$（基于 DINOv2 特征余弦相似度优化，初始化为全 1 张量，逐渐学习排除干扰区域）。为降低同时训练两个模型的开销，提出动态 EMA 代理：$G_{\text{EMA}}^t = G_{\text{EMA}}^{t-1} + (1-\beta) G_1^t$，仅需维护一个可训练模型，EMA 模型通过加权平均更新。由于 3DGS 的高斯数量在训练中动态变化（克隆/分裂/剪枝），EMA 需要特殊处理：克隆时同时克隆 EMA 属性、剪枝时同时移除、分裂时对发生不连续变化的属性（中心点和方差）重新初始化 EMA，其余属性直接继承。最终损失 $\mathcal{L} = \mathcal{L}_{r1}^{M_{h/s}} + \lambda_m \mathcal{L}_{me} + \lambda_{mask} \mathcal{L}_{mask}$，其中 $M_{h/s}$ 表示交替使用硬掩码和软掩码。
+
+\paragraph{3D 一致哈希网格外观变换}
+
+Decoupling Appearance Variations（DAVIGS）（2025.01）~\cite{2501_10788} 在图像层面而非高斯层面建模外观变化，实现即插即用的外观解耦。之前的方法（如 GS-W）为每个高斯学习独立的外观嵌入，DAVIGS 的关键区别在于使用 3D 一致的空间特征保证跨视角一致性。具体方案：为每张训练视角分配全局外观嵌入 $l \in \mathbb{R}^A$，使用多分辨率哈希网格 $\{H_i\}_{i=0}^{L-1}$ 存储局部空间特征（$L$ 个分辨率层级）。对渲染图像的每个像素 $I^r(p)$，先通过深度图 $D$ 反投影到 3D 坐标 $x \in \mathbb{R}^3$，在哈希网格中查找位置特征 $\{h_i\}$，与外观嵌入拼接后送入轻量 MLP 预测 $3 \times 4$ 仿射变换矩阵 $M(p)$，对渲染颜色做变换 $I^t(p) = I^r(p) \cdot M(p)$。全局外观信息编码在外观嵌入中，局部响应（如街灯照明的不均匀区域）稀疏存储在哈希网格中，两者结合确保 3D 一致性。为防止高斯通过调整自身颜色绕过外观模型，引入恒等变换正则化 $\mathcal{L}_{ID} = L_1(M_{ID}, M(p))$，其中 $M_{ID}$ 为恒等矩阵，最终损失 $\mathcal{L} = (1-\lambda_1)L_1(I^t, I) + \lambda_1 L_{\text{D-SSIM}}(I^t, I) + \lambda_2 \mathcal{L}_{ID}$。由于变换在图像层面进行，优化完成后可丢弃外观模块而不影响渲染速度。为加速优化，采用基于单元格的查询策略：将图像划分为 $s \times s$ 非重叠单元格，对每个单元格取深度平均值计算 3D 位置并查询仿射矩阵，像素级别的仿射变换通过相邻单元格双线性插值获得。
+
+\paragraph{离散时间嵌入与可变高斯激活建模长期变化}
+
+Gaussian Time Machine（GTM）（2024.05）~\cite{2405_13694}（Time-Variant Appearances）建模场景外观随时间的长期变化，目标是给定训练集 $\{(I_k, P_k, t_k)\}_{k=1}^N$（图像、相机参数、时间戳），学习映射 $I_k = F(P_k, t_k; \Theta)$ 以合成任意时间任意视角的新视图。GTM 基于 Scaffold-GS 的 k-tree 结构生成锚点周围的多个神经高斯，关键设计有三个。（1）可变数量的高斯：不使用固定数量的高斯，而是通过不透明度激活函数 $\sigma(\cdot) \in [-1, 1]$ 动态控制高斯的可见性——激活值为负的高斯在渲染时被过滤掉，使同一场景在不同时间可以呈现不同的几何结构（如树叶随季节出现和消失）。（2）离散时间嵌入：比较了三种时间编码器（概率型、连续映射型、离散嵌入型），发现连续编码器倾向于在离散时间步之间过拟合导致中间时刻的几何崩塌，而离散嵌入最适合长期外观变化。GTM 为每个时间步学习一个嵌入向量 $z_t = E(t)$，与空间特征拼接后输入 MLP 预测高斯属性：$o = \sigma(F_o(f, d_{vc}, d_{vc}, z_t))$，$c = \sigma(F_c(f, d_{vc}, d_{vc}, z_t))$，其中旋转和缩放保持时间无关以保证几何一致性。（3）分解颜色混合：将颜色分解为静态项 $c_s$ 和动态项 $c_d$（分别由时间无关和时间相关 MLP 预测），通过自适应混合系数 $m = \sigma(F_m(f, d_{vc}, d_{vc}, z_t))$ 组合：$c = (1-m)c_s + m c_d$，灵感来自物理着色模型中材质对环境光照的反射比例（金属表面 $m$ 接近 1 主要显示环境颜色，木质表面 $m$ 接近 0 主要显示固有颜色）。损失函数包含 $L_1$、SSIM 和体积正则化 $\mathcal{L}_{vol} = \sum_{i=1}^N \Pi(s_i)$（惩罚过大的高斯体积）。
+
+\paragraph{双路渲染反射-透射解耦}
+
+RefGaussian（2024.06）~\cite{2406_05852}（Disentangling Reflections）将场景中的反射效果显式解耦。标准 3DGS 仅用球谐系数编码视角相关颜色，无法区分物体固有颜色和镜面反射，导致反射表面（如玻璃、水面、镜面）出现重影或模糊。RefGaussian 为每个高斯扩展三个反射相关参数：反射球谐系数 $C_{\text{ref}}$、反射不透明度 $\alpha_{\text{ref}}$ 和反射置信度 $\beta \in [0,1]$（表示该高斯代表反射部分的概率）。渲染时采用双路渲染策略：透射通路使用原始球谐系数 $C$ 渲染透射颜色 $C_{\text{trans}}$，反射通路使用反射参数 $C_{\text{ref}}, \alpha_{\text{ref}}$ 渲染反射颜色 $C_{\text{ref}}$，反射置信度通过 $\alpha$-混合累积为 2D 反射图 $W = \sum_{i} \beta_i \alpha_i \prod_{j=1}^{i-1}(1-\alpha_j)$。最终像素颜色为 $C = C_{\text{trans}} + W \cdot C_{\text{ref}}$。为防止两个通路的颜色泄漏到对方（反射内容出现在透射分量中），RefGaussian 引入双边平滑先验：$\mathcal{L}_{bi} = \sum_{p_i} \sum_{p_j \in N_i} f(p_i, p_j) \|d_{p_i} - d_{p_j}\|_1$，其中权重 $f(p_i, p_j) = \exp(-\|C_{p_i} - C_{p_j}\|_1 / \sigma)$ 同时考虑几何接近性和光度相似性，在保持边缘的同时平滑局部几何。反射图本身也通过 $\mathcal{L}_{ref} = \sum_{p_i} \sum_{p_j \in N_i} \|w_{p_i} - w_{p_j}\|_1$ 正则化。总损失 $\mathcal{L} = \mathcal{L}_{rgb} + \lambda_{init}\mathcal{L}_{init} + \lambda_{bi}\mathcal{L}_{bi} + \lambda_{ref}\mathcal{L}_{ref}$，其中 $\mathcal{L}_{init}$ 在训练前几步强制透射颜色对齐真实图像以保证收敛。
+
+\paragraph{视角自适应色调曲线统一多曝光颜色空间}
+
+Unifying Color and Lightness Correction（2026.02）~\cite{2602_18322}（View-Adaptive Curve Adjustment）解决不同训练图像之间曝光和白平衡不一致的问题。标准 3DGS 假设所有图像在统一颜色空间中，但实际上每张照片的相机 ISP 处理链不同。该方法为每张训练图像学习一组色调曲线参数，通过视角自适应的曲线调整将不同曝光和白平衡的图像映射到统一颜色空间，使 3DGS 的光度损失在一致的色彩空间中计算。
+
+\paragraph{多传感器融合第一人称设备重建}
+
+Photoreal Scene Reconstruction from an Egocentric Device（2025.06）~\cite{2506_04444} 处理第一人称设备（如 Project Aria 眼镜）采集的数据，这类设备配备多传感器（RGB 相机、单目深度传感器、IMU、眼动追踪），且用户在佩戴过程中不断移动，导致采集过程光照持续变化、视角抖动。该方法通过多传感器融合（深度图辅助几何初始化、IMU 提供姿态先验）和针对设备特性的光照补偿策略，实现真实感 3DGS 重建。
+
+\begin{takeaway}
+HDR 与光照变化处理的核心挑战是训练图像间曝光和白平衡的不一致性。色调曲线学习和多传感器融合是两条互补路线，前者通过视角自适应的曲线调整统一颜色空间，后者利用多模态传感器补偿光照变化和视角抖动。
+\end{takeaway}
+
+%% ============================================================
+
+
+\section{基于物理的渲染与光照}
+\label{sec:05_5}
+
+本节超越前四节的启发式着色，将完整的物理渲染方程引入 3DGS——用路径追踪或严格能量守恒替代 $\alpha$-混合 的近似着色。
+
+\subsection{问题背景：从启发式到物理正确}
+
+前四节的方法虽然引入了物理概念（BRDF、Fresnel 方程等），但仍在 3DGS 的 $\alpha$-混合 框架内工作，渲染方程并非完全物理正确。本节的方法更根本地将物理渲染引入 3DGS，用完整的路径追踪或物理渲染方程替代启发式着色。
+
+\textbf{6DGS} 将 3D 高斯扩展为 6D 位置-方向联合分布，使每个高斯的 opacity 成为视角相关的，从而建模各向异性外观。
+
+\textbf{Normal-GS} 让法线直接参与颜色计算，解决了标准 3DGS 中法线无法接收颜色损失梯度的问题。
+
+\textbf{EAG-PT} 用 2D 高斯光线追踪（Ray Tracing）实现室内全局光照，支持多弹射路径追踪。
+
+\textbf{PBR-NeRF} 引入能量守恒和 NDF（Normal Distribution Function，法线分布函数）加权两条物理约束损失改善逆渲染。
+
+\textbf{TexGaussian} 用八叉树（Octree）对齐高斯在 3D 空间生成 PBR 材质。
+
+\textbf{Unified Gaussian Primitives} 用线性透射率模型替代 $\alpha$-混合，使高斯基元可以参与路径追踪。
+
+\textbf{Material-informed GS} 将材质语义标注嵌入数字孪生管线。
+
+\subsubsection{物理正确渲染管线}
+
+本路线介绍构建物理正确的 3DGS 渲染管线的方法，包括 6D 扩展、路径追踪和 PBR 材质生成等。
+
+\paragraph{6D 位置-方向联合分布建模各向异性外观}
+
+6DGS（2024.10）~\cite{2410_04974}（Enhanced Direction-Aware Gaussian Splatting）的核心观察是：标准 3DGS 中每个高斯的 opacity 是视角无关的，即无论从哪个方向观察，同一个高斯的不透明度恒定。这在表示各向异性外观（如丝绸、毛发、金属拉丝）时存在根本局限——这些材质的外观高度依赖观察方向。6DGS 将 3D 高斯扩展为 6D 联合分布，同时建模位置 $X_p$ 和方向 $X_d$，构建完整的 $6 \times 6$ 协方差矩阵 $\Sigma$。渲染时通过条件概率进行”切片“——给定视角方向 $d$，计算条件均值 $\mu_{\text{cond}} = \mu_p + \Sigma_{pd} \Sigma_d^{-1}(d - \mu_d)$（位置随视角动态偏移，捕捉视差效应）和条件协方差 $\Sigma_{\text{cond}} = \Sigma_p - \Sigma_{pd} \Sigma_d^{-1} \Sigma_{pd}^T$（形状固定不随视角变化，由 Schur 补给出）。关键创新是条件 opacity：$\alpha_{\text{cond}} = \alpha \cdot f_{\text{cond}}$，其中 $f_{\text{cond}} = \exp(-\sigma_{\text{opa}} (d - \mu_d)^T \Sigma_d^{-1} (d - \mu_d))$，$\sigma_{\text{opa}} \in (0,1)$ 是可学习的逐高斯参数，控制方向对 opacity 的影响强度。当 $\sigma_{\text{opa}} \to 0$ 时退化为标准 3DGS。该切片操作完全兼容 3DGS 的训练框架——自适应密度控制通过对 $\Sigma_{\text{cond}}$ 做 SVD 分解提取旋转和缩放，最小 opacity 阈值设为 $\epsilon_{\min} = 0.01$（3DGS 默认 0.005）。推理时 $\Sigma_{\text{cond}}$ 可预计算，每帧只需更新 $\mu_{\text{cond}}$ 和 $\alpha_{\text{cond}}$。
+
+\paragraph{积分方向照明向量让法线参与颜色梯度}
+
+Normal-GS（2024.10）~\cite{2410_20593}（3DGS with Normal-Involved Rendering）的核心问题是：标准 3DGS 用球谐函数建模颜色 $c(\mathbf{d}_{\text{view}}) = \sum_{l=0}^{3}\sum_{m=-l}^{l} k_l^m Y_l^m(\mathbf{d}_{\text{view}})$，颜色只依赖视角方向，与法线完全无关。这导致反向传播时法线无法接收来自颜色损失的梯度信号——改进法线无法反馈到渲染质量。Normal-GS 从物理渲染方程出发重新参数化漫反射颜色：对于 Lambertian 表面，出射辐射度 $L_d = k_d \cdot \mathbf{n}$，其中 $k_d$ 是反照率，$\mathbf{l} = \int_{\Omega^+} L_i(\mathbf{d}_i) \mathbf{d}_i \, d\mathbf{d}_i$ 是作者提出的积分方向照明向量（IDIV），将半球上的入射光积分压缩为一个 3D 向量。这样，法线 $\mathbf{n}$ 通过点积直接参与颜色计算，反向传播时梯度 $\nabla_{\mathbf{n}} L_d = k_d \cdot \mathbf{l}$ 自然传递到法线。为避免为每个高斯独立存储 IDIV 导致过拟合，Normal-GS 采用 Scaffold-GS 的锚点机制——用局部共享特征 $\mathbf{f}_v$ 通过全局 MLP 解码 $K$ 个 IDIV：$\mathbf{l}_v = \text{MLP}(\mathbf{f}_v)$。对于镜面反射，法线通过反射方向 $\mathbf{d}_r = 2(\mathbf{d}_o \cdot \mathbf{n})\mathbf{n} - \mathbf{d}_o$ 参与 Ref-NeRF 的集成方向编码（IDE）。法线监督采用深度正则化：渲染深度图计算图像梯度叉乘得到 $N_D$，损失 $L_N = 1 - N_D \cdot N$。总损失为 $L = L_{\text{img}} + \lambda_v L_v + \lambda_N L_N$。
+
+\subsubsection{路径追踪与全局光照}
+
+本路线介绍基于可微光线追踪实现全局光照路径追踪的方法，突破 $\alpha$-混合 无法模拟间接光照的局限。
+
+\paragraph{2D 高斯光线追踪室内全局光照路径追踪}
+
+EAG-PT（2026.01）~\cite{2601_23065}（Emission-Aware Gaussians and Path Tracing）解决的核心问题是室内场景的全局光照。标准 3DGS 的 $\alpha$-混合 假设光线只沿直线传播，无法处理间接光照（如灯光照亮墙壁后反射到地板）。EAG-PT 采用两阶段管线。Stage~0（辐射场景重建）：使用 2D 高斯作为场景表示，每个 2D 高斯在交点处的响应为 $g(\mathbf{x}) = \exp\left(-\frac{1}{2}\left(\frac{(\mathbf{x}-\mathbf{p}_u)^2}{s_u^2} + \frac{(\mathbf{x}-\mathbf{p}_v)^2}{s_v^2}\right)\right)$，其中 $s_{u,v}$ 为各向异性尺度参数。通过可微 2D 高斯光线追踪渲染辐射图 $L_c^0 = L_c(\text{PQ}(L_o^0), \text{PQ}(L_o^{\text{gt}}))$，其中 $\text{PQ}(\cdot)$ 是 SMPTE ST-2084 感知量化曲线。几何损失用单目法线图监督：$L_n = \|1 - \hat{N} \cdot N_{\text{mono}}\|_1$。发光损失用 2D 发光遮罩 $M$ 监督：$L_e = \|E - M\|_1$。Stage~1（漫反射材质恢复）：单次反弹近似间接光照——将 Stage~0 重建的辐射场作为辐射缓存（radiance cache），通过蒙特卡洛积分 $L_r^1(\mathbf{d}_o) \approx \frac{1}{n_{\text{spp}}} \sum^{n_{\text{spp}}} R(\mathbf{d}_i) f(\mathbf{d}_i, \mathbf{d}_o) (\mathbf{d}_i \cdot \mathbf{N}) / p(\mathbf{d}_i)$ 估计漫反射反照率 $\rho$。假设发射表面不反射（$E(\mathbf{d}_o) > \epsilon_E=0.1$ 时仅发光），实现了发光和反射的分离。场景编辑后使用多反弹路径追踪产生物理正确渲染，并通过光照烘焙将路径追踪结果回写到高斯的辐射值以实现实时预览。
+
+\paragraph{能量守恒与 NDF 加权物理约束损失}
+
+PBR-NeRF（2024.12）~\cite{2412_09680}（Inverse Rendering with Physics-Based Neural Fields）的核心贡献是两条物理约束损失，解决逆渲染中材质-光照耦合的固有病态性。Baseline（NeILF++）使用简化 Disney BRDF：$f_r = (1-m)\frac{b}{\pi} + f_s$，反照率 $b \in [0,1]^3$，金属度 $m \in [0,1]$，粗糙度 $r \in [0,1]$，球面高斯近似 NDF：$D(\mathbf{h}) = \frac{1}{r^4} \exp(2r^4(\mathbf{h} \cdot \mathbf{n} - 1))$。问题在于 Disney BRDF 本身不满足能量守恒——反射光可以多于入射光，导致材质估计偏移。第一条损失——能量守恒损失 $L_{\text{cons}} = \max\left(\frac{2\pi}{|S_L|}\sum_{\mathbf{d}_i \in S_L} f_r (\mathbf{d}_i \cdot \mathbf{n}) - 1, \, 0\right)$，ReLU 形式仅惩罚反射权重和超过 1 的情况，允许低于 1 的自由变化。第二条损失——NDF 加权镜面损失 $L_{\text{spec}} = \frac{1}{|S_L|}\sum_{\mathbf{d}_i \in S_L} \text{softmax}(D(\mathbf{h})/T_{\text{spec}}) \cdot f_d$，用 detach 的 NDF 作为权重，仅惩罚镜面区域的漫反射过估计（”烘焙高光“问题），推动镜面分量补偿。入射光用 Fibonacci 采样 $S_L$ 个方向离散化半球积分。三阶段优化：几何 → 材质 → 联合，材质阶段损失 $L_m = \lambda_r L_r + \lambda_f L_f + \lambda_s L_s + L_{\text{physics}}$，其中 $L_{\text{physics}} = \lambda_{\text{cons}} L_{\text{cons}} + \lambda_{\text{spec}} L_{\text{spec}}$。
+
+\subsubsection{PBR材质与扩展应用}
+
+本路线介绍在 3D 空间直接生成 PBR 材质以及将逆渲染扩展到射频频段等前沿方向的方法。
+
+\paragraph{八叉树对齐高斯在 3D 空间生成 PBR 材质}
+
+TexGaussian（2024.11）~\cite{2411_19654}（Generating High-quality PBR Material via Octree-based 3DGS）解决的核心问题是：现有纹理合成方法依赖 2D 扩散模型，缺乏 3D 结构理解，导致纹理贴图与 3D 语义不对齐。TexGaussian 直接在 3D 空间生成 PBR 材质。Baseline 的 2D 扩散模型只能在 UV 空间逐面片生成纹理。TexGaussian 的核心设计是”八叉树对齐高斯泼溅“——对给定网格表面采样 $N=100{,}000$ 个点，自适应构建八叉树至最大深度，每个最细叶节点中心放置一个 3D 高斯。高斯参数固定 13 通道：1 个 opacity + 3 个 scale + 4 个 rotation + 3 个 albedo + 1 个 roughness + 1 个 metallic。位置不优化（已在表面上），scale 用 $\text{softplus} \times 0.01$ 初始化以确保高斯贴合物体轮廓。训练分两步：先用 3DGS 标准损失 $\mathcal{L} = (1-\lambda)\mathcal{L}_1 + \lambda \mathcal{L}_{\text{D-SSIM}}$（$\lambda=0.2$）在多视角 albedo/roughness/metallic 图上预拟合高斯参数；再用八叉树 3D U-Net 从几何特征预测这些参数，损失包含 albedo 的 MSE+LPIPS、roughness 的 MSE+LPIPS、metallic 的 MSE+LPIPS、alpha 的 MSE 以及 3D 参数 MSE。推理时从八视角渲染多视角图像，通过可微网格渲染（Nvdiffrast）烘焙到 UV 空间，数秒即可完成。
+
+\paragraph{线性透射率模型使高斯基元参与路径追踪}
+
+Unified Gaussian Primitives（2024.06）~\cite{2406_09733}（Scene Representation and Rendering）的核心设计动机是：标准 3DGS 的 $\alpha$-混合 渲染不适用于光线传输模拟（路径追踪），因为 $\alpha$-混合 假设光线穿过半透明体积，而大多数场景是实际不透明表面。Unified Gaussian 引入线性透射率模型替代 3DGS 的指数透射率：$T(\mathbf{x}, \mathbf{x}_t) = \max\left(0, \, 1 - \frac{1}{2}\int_0^t \sum_k G_k(\mathbf{x}_{t'}) \, dt'\right)$，自由飞行 PDF 为 $P(\mathbf{x}, \mathbf{x}_t) = \frac{1}{2}\sum_k G_k(\mathbf{x}_t)$（当 $t \leq t_{\text{sat}}$）。关键优势是可加性——每个基元的 PDF 独立计算、解耦混合，不像指数模型那样互相耦合。光线与高斯的积分有闭式解（利用误差函数 erf）。外观定义在基元级别而非点级别：相函数 $f_p(\mathbf{d}_i, \mathbf{d}_o) = \int_{S^2} D_{\omega_o}(\mathbf{n}) \, f(\mathbf{d}_i, \mathbf{d}_o; \mathbf{n}) \, d\mathbf{n}$，其中 $D_{\omega_o}(\mathbf{n})$ 是 SGGX 分布的可见法线分布函数（VNDF），$f$ 是 Disney principled BSDF。概念上，每个高斯基元的角色类似于三角网格中的三角形——一个原子化的场景创作单元，用概率散射替代确定性相交测试。场景遍历用 kd-tree 加速，每个高斯在贡献低于阈值 $\epsilon=0.01$ 时被截断。
+
+\paragraph{材质语义标注嵌入数字孪生管线}
+
+Material-informed Gaussian Splatting（2025.11）~\cite{2511_20348}（3D World Reconstruction in a Digital Twin）解决的核心问题是：数字孪生不仅需要视觉真实感，还需要物理正确的材质属性以支持传感器仿真（如 LiDAR 的材质相关反射率）。Pipeline 分五阶段。(1) 单目材质提取：用 RMSNet 从 RGB 图像进行纹理材质分割（区分沥青、混凝土、玻璃、金属等 20 类），再用 FastSAM 实例分割做形状感知后处理——对每个实例区域做多数投票统一材质标签。(2) 大规模高斯泼溅重建：同时训练 H3DGS（高质量外观）和 MiLO（精确网格几何），两者共享 COLMAP 稀疏点云和坐标系，H3DGS 负责可视化，MiLO 负责物理仿真网格。(3) 逐像素材质投影：通过可微光栅化将 2D 材质标签投影到 MiLO 的高斯表示，深度排序确保最近高斯的标签被采用，跨视角不一致用 SegAnyGS 解决，再用 KNN 将高斯标签转移到网格三角面片。(4) 物理材质赋值：按 Disney BSDF 标准，从 Matsynth 数据集（4000+ PBR 材质，14 类别）为每种材质类别选择匹配的 PBR 纹理，赋值到对应三角面片。(5) 仿真验证：将材质标注网格导入 Simcenter Prescan，用实验室测量的 PBR 属性为每个面片赋值，生成合成 LiDAR 点云与真实测量对比验证。
+
+\begin{takeaway}
+基于物理的渲染与光照将 3DGS 的图像形成模型从经验性的 $\alpha$-混合推向物理正确的光线传输。Unified Gaussian Primitives 引入线性透射率模型和 SGGX 分布实现路径追踪，Material-informed GS 将材质语义标注嵌入数字孪生管线支持传感器仿真。这些工作标志着 3DGS 从视觉保真走向物理保真的关键转变。
+\end{takeaway}
+
+%% ============================================================
+\section{其他光照与材质方法}
+\label{sec:05_6}
+
+本节收录不属于前述分类的光照与材质方法，包括射频逆渲染（Radio-Frequency IR）、球面高斯曲线重建（SGCR）、自适应球谐（StructGS）以及转台视频到外观（TAPESTRY）等 4 个方向。
+
+\subsection{其他光照与材质方法}
+\label{ss:05_6a}
+
+本节介绍不属于前述分类的光照与材质扩展方向，包括射频逆渲染、球面高斯曲线重建、自适应球谐和转台视频到外观等方法。
+
+\subsubsection{扩展方向}
+
+本路线介绍逆渲染从可见光扩展到射频频段等跨域应用方向。
+
+\paragraph{逆渲染从可见光扩展到射频频段}
+
+Radio-Frequency Inverse Rendering（2026.04）~\cite{2604_07086}（Wireless Environment Modeling）将逆渲染从可见光频段扩展到射频（RF）频段。核心动机：无线信道建模传统方法用 MLP 直接从 Tx/Rx 位置预测信号强度，将辐射场与环境耦合——换一个发射源就需要重新训练。RFIR 将 RF 信号传播分解为几何+材质+源的独立组件。每个高斯存储几何属性（位置 $\mu_j$、协方差 $\Sigma_j$、法线 $n_j$）和 RF 属性（RF opacity $\alpha_j$、有效粗糙度 $R_j$、复反射系数的幅度 $|\Gamma_j|$ 和相位 $\phi_j$）。几何属性在视觉 3DGS 阶段优化后冻结，RF 属性在逆渲染阶段优化。RF-BSDF 采用定向散射模型：$F(\theta_o, \theta_i, n, f) = \Gamma \cdot \exp\left(\frac{(\theta_o - \frac{\pi}{2})^2}{2R(R-1)}\right)$，指数 $R$ 是可学习的有效粗糙度，控制散射瓣的集中度。入射场通过 Friis 传输公式加可见性计算：$s_{\text{in}}(\mathbf{d}_i, f) = \sqrt{\frac{P_T G_T A_i}{4\pi d_i^2}} \cdot V_i \cdot S_{Tx}(f) \cdot e^{-j\phi(d_i)}$，其中 $V_i = \prod(1-\alpha_{i-1})$ 是 BVH 光线追踪计算的可见性。信号合成用 RF $\alpha$-混合：$S(\theta, f) = \sum_{l=1}^{N} s_{\text{out}}(l) \alpha_l \prod_{m=1}^{l-1}(1-\alpha_m) \frac{1}{4\pi d_m^2} e^{-j\phi(d_m)}$，在天线 FoV 上积分得到接收信号。损失 $L = |S^2 - \text{RSSI}_{Rx}|^2$。
+
+\paragraph{球面高斯简化泼溅实现 3D 曲线重建}
+
+SGCR（2025.05）~\cite{2505_04668}（Spherical Gaussians for Efficient 3D Curve Reconstruction）的核心观察是：标准 3DGS 的各向异性椭球高斯虽然能高效”泼溅“整个场景，但对于几何重建（如边缘线框），使用各向同性的球面高斯反而更有优势——可以将泼溅结果分解为小的”原子“并为每个赋予清晰的几何含义。SGCR 对标准 3DGS 做两个简化：(1) 移除协方差矩阵（缩放 $S$ 和旋转 $R$），替换为固定半径 $r_0=0.005$ 的均匀球体；(2) 移除球谐系数，颜色改为一维灰度值（仅用于边缘图渲染）。训练用边缘感知损失替代 $L_1$：$L_{\text{edge}} = \frac{N_I - |E_I|}{N_I}\sum_{i \notin E_I}(I_i - \hat{I}_i)^2 + \frac{|E_I|}{N_I}\sum_{i \in E_I}(I_i - \hat{I}_i)^2$，其中 $E_I$ 是灰度超过阈值 0.3 的边缘像素集合，平衡边缘/非边缘像素的梯度。另设 opacity-color 一致性损失 $L_{oc} = \sum_{i=1}^{N_{SG}}(o_i - c_i)^2$ 防止遮挡边缘被误剪。两阶段训练（各 3000 次迭代），第一阶段每 200 次做致密化，结束时剪除 $o_i < 0.5$ 且 $c_i < 0.1$ 的高斯。重建阶段先线拟合（Chamfer 距离 $L_{CD}$ 做随机搜索），再用 3 阶有理 Bezier 曲线全局优化：$B(u)_{p,w} = \frac{\sum_{i=0}^{3} B_{3,i}(u) p_i w_i}{\sum_{i=0}^{3} B_{3,i}(u) w_i}$，选择有理形式是因为简单 Bezier 无法精确拟合圆弧。
+
+\paragraph{动态球谐阶数与随机补丁 SSIM}
+
+StructGS（2025.03）~\cite{2503_06462}（Adaptive Spherical Harmonics and Rendering Enhancements）的核心观察是：标准 3DGS 对所有高斯使用固定的 3 阶球谐（$l_{\max}=3$，48 个系数），但平坦表面不需要高阶项，而复杂反射表面可能需要更高阶。此外，SSIM 损失仅衡量局部结构相似性，无法捕捉远距离像素间的拓扑关系。StructGS 提出三项改进。(1) 动态球谐初始化：零阶系数按 opacity 加权 $k_{\text{RGB}}^{(0)} = \sigma_n \cdot \text{RGB}$（透明点的颜色影响被抑制）；高阶系数的阶数由邻近距离决定 $D = \lfloor\min(1, g(d, M))\rfloor$，$l = (D+1)^2$，参数 $M=5$ 为上界阶数，距离 $d$ 大的点需要更多 SH 来表达角度变化。高阶初始化为 $k_{\text{RGB}}^{(n)} = \sigma_n (1 - e^{-sd})$。(2) 基于随机补丁的 SSIM（P-SSIM）：将图像分成 $p \times p$ 补丁（$p=10$），随机采样补丁对计算 SSIM，捕捉非局部结构信息，在 $k=25000$ 次迭代后替代 D-SSIM。(3) 多尺度残差超分网络（MSRN）：3DGS 渲染低分辨率图像，MSRN 用 PixelShuffle 上采样到高分辨率，避免直接训练高分辨率 3DGS 的内存开销。总损失 $L_{\text{Total}} = (1-\lambda)\mathcal{L}_1 + \lambda \mathcal{L}_{\text{D-SSIM}} + \mathcal{L}_{\text{tv}}$（$k$ 次迭代前），之后替换为 P-SSIM 版本，$\lambda=0.5$，全变分正则化权重 0.02。
+
+\paragraph{几何条件转台视频生成实现纹理合成}
+
+TAPESTRY（2026.03）~\cite{2603_17735}（From Geometry to Appearance via Consistent Turntable Videos）解决的核心问题是：为无纹理 3D 网格自动生成高质量外观。传统方法直接用 2D 扩散模型生成 UV 纹理，缺乏 3D 一致性。TAPESTRY 将该任务重构为”几何条件视频生成”——先生成一个 360° 转台视频（TTV）作为高质量中间表示，再从视频提取纹理。核心挑战是保证视频的严格 3D 一致性。TAPESTRY 的几何引导条件注入机制：(1) 多模态条件准备——沿标准化圆形轨道 $O(t) = (r\cos(\frac{2\pi t}{T}), r\sin(\frac{2\pi t}{T}), z)$ 渲染法线视频（表面方向细节）和位置图视频（世界坐标全局参考），加参考帧。(2) 潜空间注入——用轻量视频 VAE 编码器将所有条件映射到潜空间，通过小型几何融合模块（2D 卷积+残差块）压缩为统一几何条件潜码 $c_g$，与噪声潜码在 DiT 主干的通道维度拼接，文本和参考帧嵌入通过交叉注意力注入。纹理提取采用渐进管线处理自遮挡：多视角投影时用角度激励项 $w_{\text{angle}} = \cos^4\theta$ 优先垂直面、深度梯度惩罚 $w_{\text{depth}} = \text{clip}(\nabla^2 d, 0, 1)$ 抑制边缘错位，得到部分纹理图和置信度图。未覆盖区域通过 3D-Aware 修复生成新 TTV——关键是旋转物体而非相机，并渲染已有部分纹理视频和修复遮罩视频作为条件，确保新生成内容与已有着色无缝衔接。迭代直至全覆盖。
+
+\begin{takeaway}
+其他光照与材质方法展示了 3DGS 逆渲染框架的跨域通用性。RFIR 将逆渲染从可见光扩展到射频频段实现无线环境建模，TAPESTRY 将纹理生成重构为几何条件视频生成实现 3D 一致性。这些工作表明，3DGS 的参数化框架不限于视觉场景，可自然扩展到电磁波谱的任意频段。
+\end{takeaway}
+
+%=====================================================================
+
+\subsection{近期方法脉络：多模态外观建模}
+
+这一组近期工作延续 3DGS，主要把改动集中在扩展等环节。下面只保留相对既有路线的变化，便于和前文方法直接对照。
+
+\paragraph{Unpaired RGB-Thermal Gaussian-Splatting Using Visual Geometric Transformers}
+Unpaired RGB-Thermal Gaussian-Splatting Using Visual Geometric Transformers（2026.06）~\cite{2606_05491} 延续 3DGS 在“多模态外观建模”上的基本设定，主要改变是：使用VGGT分别估计RGB/thermal相机位姿，经Procrustes和跨模态匹配对齐，再训练多模态3DGS。3DGS 的显式高斯表示和可微渲染能力保持为基础。
+其设计动机是：打破RGB-thermal NVS对严格同步标定图像对的依赖，把前馈几何Transformer和跨模态匹配用于多模态GS训练。
+具体而言，VGGT分别恢复两种模态的相机，Procrustes对齐位姿集合，跨模态特征匹配提高注册稳定性，随后联合学习可渲染RGB/thermal视图的高斯场。
+适用边界是：跨模态特征匹配失败会影响对齐；热图像低纹理区域和动态场景仍具挑战。
+
+\input{chapters/recent/ch05}
+
+\section*{本章小结}
+\addcontentsline{toc}{section}{本章小结}
+
+\begin{futurebox}{本章总结与展望}{ch05_summary}
+本章从材质与光照角度系统梳理了 3DGS 在逆渲染领域的进展，涵盖 120 篇论文。
+
+\textbf{反射与镜面建模}（第~\ref{sec:05_1}~节）解决了标准球谐函数无法表达强视角依赖外观的根本瓶颈。从延迟反射（GaussianShader）到参数化镜面建模（Spec-Gaussian、SIGNeRF）再到透明折射（TR-MC、GlassGaussian），技术路线从简单的外观修正演进到物理建模。偏振先验的引入（Polarimetric GS）为消歧镜面反射提供了额外的物理约束。
+
+\textbf{材质分解与逆渲染}（第~\ref{sec:05_2}~节）将 3DGS 从”外观重建”推向”物理属性重建”。基于 PBR 的逆渲染框架（Relightable 3DGS、GaussianShader）将每个高斯的颜色分解为 albedo、metallic、roughness 等物理参数。全局光照分解和次表面散射的建模，进一步扩展了可处理的材质类型。
+
+\textbf{重光照}（第~\ref{sec:05_3}~节）从分解走向应用——在新光照条件下重新渲染场景。预计算光传输方法（GS-IR、GaussianRelight）在 3DGS 上实现了实时重光照，室外场景和面部重光照分别处理了大范围环境光照和精细面部材质的特殊挑战。
+
+\textbf{HDR 与光照变化}（第~\ref{sec:05_4}~节）打破了 3DGS 的光照一致性假设。HDR 3DGS 将渲染范围从 LDR 扩展到 HDR，无约束照片集合处理方法解耦了光照变化和场景外观。
+
+\textbf{基于物理的渲染}（第~\ref{sec:05_5}~节）代表了从启发式 $\alpha$-混合 到物理正确渲染的根本性转变，光线追踪与 3DGS 的结合（参见第~\ref{ch:02}~章 3DGRT、EVER 的讨论）使全局光照和复杂光传输现象的建模成为可能。
+
+当前该领域最突出的开放问题包括：
+\begin{itemize}
+\item \textbf{逆渲染的病态性}：材质-光照-几何的分解本质上是不适定的，多组物理参数可产生相同的观测外观。更多物理先验（偏振、时间变化光照、主动照明）和多视角约束是缓解病态性的主要方向。
+\item \textbf{场景级逆渲染的规模化}：当前方法大多在物体级或小场景上验证，城市场景（第~\ref{ch:14}~章）的全场景材质分解和重光照仍面临计算和标注瓶颈。
+\item \textbf{物理准确性验证}：大多数逆渲染方法通过渲染质量评估材质分解结果，缺少基于物理测量的评估基准（如用测角仪验证 BRDF 精度）。建立材质精度的标准化评估协议是推动实用化的关键。
+\end{itemize}
+\end{futurebox}

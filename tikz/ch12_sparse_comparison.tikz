@@ -1,0 +1,30 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10,
+    text width=3.2cm, align=center, font=\small, minimum height=1cm},
+  sbox/.style={rectangle, rounded corners=3pt, draw=#1!60, fill=#1!5,
+    font=\scriptsize, text width=2.4cm, align=center, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=6pt]}, thick, techgray},
+  darr/.style={-{Stealth[length=6pt]}, thick, techgray, dashed},
+  >=Stealth
+]
+
+  \node[box=techblue] (l0) at (9.5, 10.6) {输入少(2-3张)};
+  \node[box=techblue] (l1) at (7.2, 8.1) {几何歧义};
+  \node[box=techblue] (l2) at (5.9, 5.6) {遮挡严重};
+  \node[box=techgreen] (r0) at (12.5, 8.1) {输入多(50-100张)};
+  \node[box=techgreen] (r1) at (12.6, 5.6) {几何明确};
+  \node[box=techgreen] (r2) at (12.8, 3.1) {充分覆盖};
+  \node[sbox=techblue] (ls0) at (1.7, 3.1) {正则化约束};
+  \node[sbox=techblue] (ls1) at (5.6, 3.1) {扩散先验};
+  \node[sbox=techblue] (ls2) at (9.2, 3.1) {深度估计};
+  \node[sbox=techgreen] (rs0) at (12.8, 0.6) {标准3DGS};
+  \draw[arr] (l0) -- (l1);
+  \draw[arr] (l0) -- (r0);
+  \draw[arr] (l1) -- (l2);
+  \draw[arr] (l2) -- (ls0);
+  \draw[arr] (l2) -- (ls1);
+  \draw[arr] (l2) -- (ls2);
+  \draw[arr] (r0) -- (r1);
+  \draw[arr] (r1) -- (r2);
+  \draw[arr] (r2) -- (rs0);
+\end{tikzpicture}

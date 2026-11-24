@@ -1,0 +1,29 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=3.0cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (12.0, 5.6) {3DGS 技术全景与趋势};
+  \node[route=techblue] (b0) at (5.8, 3.1) {研究全景回顾};
+  \node[method=techblue] (b0_l0) at (1.7, 0.6) {表示与渲染\\{\tiny Mip-Splatting, 2DGS, 3DGS-MCMC}};
+  \node[method=techblue] (b0_l1) at (5.8, 0.6) {效率与泛化\\{\tiny Scaffold-GS, LightGaussian, DUSt3R}};
+  \node[route=techgreen] (b1) at (12.0, 3.1) {技术趋势};
+  \node[method=techgreen] (b1_l0) at (9.9, 0.6) {大模型融合\\{\tiny LRM, GS-LRM, VGGT}};
+  \node[method=techgreen] (b1_l1) at (14.0, 0.6) {规模与建图\\{\tiny CityGaussian, SplaTAM}};
+  \node[route=techpurple] (b2) at (17.9, 3.1) {开放问题};
+  \node[method=techpurple] (b2_l0) at (17.9, 0.6) {长尾场景\\{\tiny 稀疏视角, 极端光照}};
+  \node[method=techpurple] (b2_l1) at (21.5, 0.6) {可信可靠\\{\tiny 水印鲁棒性, 隐私保护}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+\end{tikzpicture}

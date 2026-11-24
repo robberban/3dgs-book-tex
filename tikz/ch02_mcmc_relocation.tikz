@@ -1,0 +1,40 @@
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10, text width=3cm, align=center, font=\small, minimum height=0.75cm},
+  widebox/.style={rectangle, rounded corners=4pt, draw=#1, fill=#1!10, text width=3.5cm, align=center, font=\small, minimum height=0.75cm},
+  diam/.style={diamond, draw=#1, fill=#1!8, font=\scriptsize, text width=1.8cm, align=center, aspect=2},
+  biglabel/.style={font=\bfseries\small, #1},
+  arr/.style={-{Stealth[length=5pt]}, thick, #1},
+  >=Stealth
+]
+  \node[biglabel=techblue] at (-0.6, 17.1) {原始 ADC};
+  \node[biglabel=techgreen] at (-0.6, 9.6) {3DGS-MCMC};
+  \draw[thick, techgray, dashed] (-0.6, 11.9) -- (9.2, 11.9);
+  \node[box=techblue] (grad) at (2.0, 15.6) {位置梯度 $> \tau$?};
+  \node[box=techblue] (opac) at (7.2, 15.6) {不透明度 $< \epsilon$?};
+  \node[box=techblue] (clone) at (1.4, 13.1) {Clone\\复制高斯};
+  \node[box=techblue] (split) at (4.3, 13.1) {Split\\二分高斯};
+  \node[box=techblue] (prune) at (7.2, 13.1) {Prune\\删除低不透明度};
+  \node[box=techblue] (adc_out) at (4.3, 10.6) {更新后高斯集合};
+  \node[box=techgreen, draw=techorange, fill=techorange!10] (sgld) at (4.3, 8.1) {\textbf{SGLD 更新}\\$+ \eta_{\mathrm{noise}} \epsilon_\theta$};
+  \node[box=techgreen] (active) at (5.8, 5.6) {活跃高斯\\$\alpha_i > 0.005$};
+  \node[box=techgreen, draw=techorange, fill=techorange!10] (dead) at (2.8, 5.6) {\textbf{死亡高斯}\\$\alpha_i < 0.005$};
+  \node[box=techgreen, draw=techorange, fill=techorange!10] (reloc) at (2.8, 3.1) {\textbf{重定位}\\死亡$\to$活跃位置};
+  \node[box=techgreen] (reg) at (6.3, 3.1) {L1 正则化};
+  \node[box=techgreen] (mcmc_out) at (4.5, 0.6) {更新后高斯集合};
+  \draw[arr=techblue] (grad) -- (clone);
+  \draw[arr=techblue] (grad) -- (split);
+  \draw[arr=techblue] (opac) -- (prune);
+  \draw[arr=techblue] (clone) -- (adc_out);
+  \draw[arr=techblue] (split) -- (adc_out);
+  \draw[arr=techblue] (prune) -- (adc_out);
+  \draw[arr=techorange] (sgld) -- (active);
+  \draw[arr=techorange] (sgld) -- (dead);
+  \draw[arr=techorange] (active) -- (reloc);
+  \draw[arr=techgreen] (active) -- (reg);
+  \draw[arr=techorange] (dead) -- (reloc);
+  \draw[arr=techorange] (reloc) -- (mcmc_out);
+  \draw[arr=techgreen] (reg) -- (mcmc_out);
+  \node[draw=techgray, fill=techbg, rounded corners, font=\scriptsize, text width=9cm, align=center] at (4.4, -1.9) {
+    Clone/Split/Prune 三个启发式操作被统一为\textbf{SGLD 更新 + 重定位}，从 MCMC 理论获得收敛保证。
+  };
+\end{tikzpicture}

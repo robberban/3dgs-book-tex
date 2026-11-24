@@ -1,0 +1,61 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=2.8cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (33.2, 5.6) {SLAM与稠密建图方法分类};
+  \node[route=techblue] (b0) at (6.9, 3.1) {RGB-D SLAM};
+  \node[method=techblue] (b0_l0) at (1.5, 0.6) {基础系统\\{\tiny SplaTAM, Photo-SLAM, CG-SLAM}};
+  \node[method=techblue] (b0_l1) at (5.1, 0.6) {鲁棒加速\\{\tiny S$^3$LAM, 2DGS-SLAM, G2S-ICP}};
+  \node[method=techblue] (b0_l2) at (8.7, 0.6) {恶劣环境\\{\tiny MipSLAM, EGG-Fusion}};
+  \node[route=techgreen] (b1) at (15.9, 3.1) {单目/RGB SLAM};
+  \node[method=techgreen] (b1_l0) at (12.3, 0.6) {经典优化\\{\tiny MonoGS, SplaTAM-RGB}};
+  \node[method=techgreen] (b1_l1) at (15.9, 0.6) {前馈范式\\{\tiny Depth-SLAM, FeedForward-GS}};
+  \node[route=techorange] (b2) at (23.5, 3.1) {多模态SLAM};
+  \node[method=techorange] (b2_l0) at (19.6, 0.6) {IMU融合\\{\tiny GS-IMU, Inertial-GS}};
+  \node[method=techorange] (b2_l1) at (23.5, 0.6) {LiDAR融合\\{\tiny LiDAR-GS, LIV-GS}};
+  \node[route=techpurple] (b3) at (31.3, 3.1) {视觉定位};
+  \node[method=techpurple] (b3_l0) at (27.4, 0.6) {渲染驱动\\{\tiny Render-Pose, Pose-GS}};
+  \node[method=techpurple] (b3_l1) at (31.3, 0.6) {特征场定位\\{\tiny FeatureField-GS, GeomGS}};
+  \node[route=techblue] (b4) at (35.1, 3.1) {语义SLAM};
+  \node[method=techblue] (b4_l0) at (35.1, 0.6) {开放词汇\\{\tiny Semantic-GS, LangSplat-SLAM}};
+  \node[method=techblue] (b4_l1) at (38.8, 0.6) {实时建图\\{\tiny SplatBridge, Online-SemGS}};
+  \node[route=techgreen] (b5) at (42.4, 3.1) {动态场景SLAM};
+  \node[method=techgreen] (b5_l0) at (42.4, 0.6) {运动分割\\{\tiny Dynamic-GS, MotionSeg-SLAM}};
+  \node[method=techgreen] (b5_l1) at (46.0, 0.6) {动态物体\\{\tiny DynSLAM-GS, Obj-GS-SLAM}};
+  \node[route=techorange] (b6) at (49.6, 3.1) {系统优化};
+  \node[method=techorange] (b6_l0) at (49.6, 0.6) {工程优化\\{\tiny GS-ICP-SLAM, Fast-GS-SLAM}};
+  \node[method=techorange] (b6_l1) at (53.5, 0.6) {CUDA加速\\{\tiny CUDA-GS, RealTime-SLAM}};
+  \node[route=techpurple] (b7) at (57.4, 3.1) {大规模建图};
+  \node[method=techpurple] (b7_l0) at (57.4, 0.6) {多智能体\\{\tiny MultiAgent-GS, Swarm-GS}};
+  \node[method=techpurple] (b7_l1) at (60.7, 0.6) {分布式\\{\tiny DistGS-SLAM, CloudGS}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (root) -- (b4);
+  \draw[arr] (root) -- (b5);
+  \draw[arr] (root) -- (b6);
+  \draw[arr] (root) -- (b7);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+  \draw[arr] (b4) -- (b4_l0);
+  \draw[arr] (b4) -- (b4_l1);
+  \draw[arr] (b5) -- (b5_l0);
+  \draw[arr] (b5) -- (b5_l1);
+  \draw[arr] (b6) -- (b6_l0);
+  \draw[arr] (b6) -- (b6_l1);
+  \draw[arr] (b7) -- (b7_l0);
+  \draw[arr] (b7) -- (b7_l1);
+\end{tikzpicture}

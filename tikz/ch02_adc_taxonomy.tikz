@@ -1,0 +1,51 @@
+\begin{tikzpicture}[
+  route/.style={rectangle, rounded corners=5pt, draw=#1, fill=#1!10,
+    text width=3cm, minimum height=0.9cm, align=center, font=\small},
+  method/.style={rectangle, rounded corners=3pt, draw=#1, fill=#1!6,
+    font=\scriptsize, text width=2.8cm, align=center, minimum height=0.6cm},
+  arr/.style={-{Stealth[length=4pt]}, techgray!60},
+  >=Stealth
+]
+
+  \node[route=techgray, text width=4cm, font=\small\bfseries] (root) at (54.3, 5.6) {ADC 改进方法};
+  \node[route=techblue] (b0) at (17.4, 3.1) {判据改进};
+  \node[method=techblue] (b0_l0) at (3.5, 0.6) {梯度绝对值求和/梯度方向感知\\{\tiny AbsGS, GDAGS, DC4GS}};
+  \node[method=techblue] (b0_l1) at (10.5, 0.6) {逐像素误差替代梯度\\{\tiny Revising Densification}};
+  \node[method=techblue] (b0_l2) at (17.4, 0.6) {难例高斯挖掘/基元冻结修复\\{\tiny HGS, ReAct-GS}};
+  \node[method=techblue] (b0_l3) at (24.1, 0.6) {方差引导/边缘感知\\{\tiny Metamon-GS, Deng et al.}};
+  \node[route=techgreen] (b1) at (37.2, 3.1) {操作改进};
+  \node[method=techgreen] (b1_l0) at (30.9, 0.6) {残差分裂/长轴分裂/密度保持\\{\tiny ResGS, EDC, BOGausS}};
+  \node[method=techgreen] (b1_l1) at (37.2, 0.6) {局部化点管理\\{\tiny LPM}};
+  \node[route=techorange] (b2) at (50.3, 3.1) {概率框架};
+  \node[method=techorange] (b2_l0) at (42.7, 0.6) {SGLD采样替代启发式\\{\tiny 3DGS-MCMC}};
+  \node[method=techorange] (b2_l1) at (50.3, 0.6) {Metropolis-Hastings全局探索\\{\tiny Kim et al.}};
+  \node[route=techpurple] (b3) at (58.3, 3.1) {正则化};
+  \node[method=techpurple] (b3_l0) at (58.3, 0.6) {原子化增殖/结构感知分布\\{\tiny AtomGS, Mini-Splatting2}};
+  \node[method=techpurple] (b3_l1) at (65.0, 0.6) {频率感知/率失真优化\\{\tiny Zeng et al., BOGausS}};
+  \node[route=techgray] (b4) at (70.2, 3.1) {初始化引导};
+  \node[method=techgray] (b4_l0) at (70.2, 0.6) {消除致密化\\{\tiny EDGS}};
+  \node[method=techgray] (b4_l1) at (74.3, 0.6) {跨场景泛化\\{\tiny GS-Net, GP-GS}};
+  \node[route=techorange] (b5) at (79.9, 3.1) {可学习策略};
+  \node[method=techorange] (b5_l0) at (79.9, 0.6) {神经网络预测致密化操作\\{\tiny LeGS, ConeGS}};
+  \node[method=techorange] (b5_l1) at (85.9, 0.6) {哈希概率金字塔\\{\tiny Zhang et al.}};
+  \draw[arr] (root) -- (b0);
+  \draw[arr] (root) -- (b1);
+  \draw[arr] (root) -- (b2);
+  \draw[arr] (root) -- (b3);
+  \draw[arr] (root) -- (b4);
+  \draw[arr] (root) -- (b5);
+  \draw[arr] (b0) -- (b0_l0);
+  \draw[arr] (b0) -- (b0_l1);
+  \draw[arr] (b0) -- (b0_l2);
+  \draw[arr] (b0) -- (b0_l3);
+  \draw[arr] (b1) -- (b1_l0);
+  \draw[arr] (b1) -- (b1_l1);
+  \draw[arr] (b2) -- (b2_l0);
+  \draw[arr] (b2) -- (b2_l1);
+  \draw[arr] (b3) -- (b3_l0);
+  \draw[arr] (b3) -- (b3_l1);
+  \draw[arr] (b4) -- (b4_l0);
+  \draw[arr] (b4) -- (b4_l1);
+  \draw[arr] (b5) -- (b5_l0);
+  \draw[arr] (b5) -- (b5_l1);
+\end{tikzpicture}

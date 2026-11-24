@@ -1,7 +1,7 @@
 \chapter*{代码待跟进表}
 \addcontentsline{toc}{chapter}{代码待跟进表}
 
-下表列出已经出现公开链接、但当前数据库尚未确认其完整训练与推理代码的方法。它们不作为“已有完整代码”写入方法正文，而是作为后续持续更新时优先复核的对象；完整列表见项目内 \texttt{planning/code\_watchlist.tsv}。
+下表列出已经出现公开链接、但当前数据库尚未确认其完整训练与推理代码的方法。它们不作为“已有完整代码”写入方法正文，而是作为后续持续更新时优先复核的对象。
 
 \begin{table}[htbp]
 \centering
@@ -27,3 +27,19 @@
 \bottomrule
 \end{tabularx}
 \end{table}
+
+\section*{本次暂缓纳入的论文}
+
+\paragraph{2604.01207} \href{https://arxiv.org/html/2604.01207}{论文原文}。数据库链接指向 GaussTrace；作者的 TRACE 仓库暂未提供推断和训练实现。 \href{https://github.com/little612pea/Trace}{核对过的仓库}。
+
+\paragraph{2604.15862} \href{https://arxiv.org/html/2604.15862}{论文原文}。现有仓库明确实现的是前作 Splats in Splats，未查到 Splats in Splats++ 的完整公开实现。 \href{https://github.com/insightlab-CG-3DV/splats-in-splats}{核对过的仓库}。
+
+\paragraph{2607.20628} \href{https://arxiv.org/abs/2607.20628}{论文原文}。作者仓库提供推断入口和权重，尚未提供可确认的训练及蒸馏流程；原有入选仅依赖完整代码。 \href{https://github.com/openimaginglab/RealVDeblur}{核对过的仓库}。
+
+\paragraph{2609.13262} \href{https://arxiv.org/html/2609.13262v1}{论文原文}。项目页仓库主要含网页文件，作者的代码库自标为未完成，目前提供上游基线。 \href{https://github.com/vulab-ai/filling-the-unseen-code}{核对过的仓库}。
+
+\paragraph{2609.23049} \href{https://arxiv.org/abs/2609.23049}{论文原文}。Saqoosha/VDGS 对应 VelociDrone，不能支持本篇航拍重建论文的代码入选。原文企业署名不在该库本次企业规则名单内。 \href{https://github.com/saqoosha/vdgs}{核对过的仓库}。
+
+\paragraph{2609.36693} \href{https://arxiv.org/abs/2609.36693}{论文原文}。官方仓库有训练脚本和权重文档，但训练命令引用的 src 实现未随仓库提供。 \href{https://github.com/aesplat/AESplat}{核对过的仓库}。
+
+\paragraph{2610.00822} \href{https://arxiv.org/html/2610.00822v1}{论文原文}。数据库的 TraceGraph 和 GaussTrace 链接均对应其他工作，未查到本文的完整实现。 \href{https://github.com/researchcv/tracegraph}{核对过的仓库}。

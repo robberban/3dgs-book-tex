@@ -7,11 +7,15 @@
 | 版本 | 收录范围 | 编译入口 |
 | --- | --- | --- |
 | 《3D Gaussian Splatting 技术综述》全版 | 22 章，含 2026 年 11 月选定的 400 篇论文增补 | [main.tex](main.tex) |
-| 《可信 3D Gaussian Splatting 方法综述》 | 21 章，沿用 2026 年 7 月校订版，围绕有可核验外部线索的方法组织 | [reliable-edition/main.tex](reliable-edition/main.tex) |
+| 《可信 3D Gaussian Splatting 方法综述》 | 21 章，2026 年 11 月增补 101 篇，正文共 1189 篇 | [reliable-edition/main.tex](reliable-edition/main.tex) |
 
 ## 全版的 2026 年 11 月增补
 
 本次增补 400 篇 arXiv 论文，所选论文的首次提交日期范围为 2026 年 8 月 1 日至 11 月 19 日。新增正文已逐篇对照原文核对方法、实验条件和适用范围。各章的「近期研究」小节可单独阅读，文中编号可跳到参考文献，本版新增条目的 arXiv 链接可用于打开原论文。
+
+## 可信版的 2026 年 11 月增补
+
+复核原书未覆盖的 108 项入选记录后，101 篇带有符合原书条件的外部证据，现已按技术主题入章。有 7 篇的代码链接与论文不符或尚未提供完整实现，留在代码待跟进表。作者署名与公开代码用于说明入选理由，实验结论按论文报告的协议解读。
 
 ## 源码结构
 
@@ -40,4 +44,4 @@
 
 4. 编译完成后，在同一目录打开 `main.pdf`。全书较长，首次编译请等四条命令依次结束。
 
-编译只需要仓库中的源码和图件。需要直接阅读可信版时，可到 [GitHub Releases](https://github.com/robberban/3dgs-book-tex/releases/tag/reliable-2026-07) 下载原版 PDF。论文数据库、核验记录和本地编译产物保留在本地。
+编译只需要仓库中的源码和图件。需要直接阅读可信版时，可到 [GitHub Releases](https://github.com/robberban/3dgs-book-tex/releases/tag/reliable-2026-11) 下载 2026 年 11 月增补版 PDF。论文数据库、核验记录和本地编译产物保留在本地。

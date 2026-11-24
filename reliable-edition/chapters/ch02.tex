@@ -1,0 +1,987 @@
+\chapter{渲染算法与质量优化}
+
+% CODEx_AUTHORED_CHAPTER: draft
+\paragraph*{本章阅读锚点}
+原始3DGS的基本闭环是：从SfM点云初始化高斯，用可微splatting渲染训练视角，通过位置梯度触发克隆、分裂和剪枝，再用按深度排序的alpha blending得到实时图像。本章所有方法都可以按“改哪个环节”来读：抗锯齿方法改投影尺度和滤波；密度控制方法改高斯何时长、何时删、长在哪里；优化器方法改ADAM和训练日程；排序和渲染管线方法改tile、排序、混合与GPU内核；光追方法改splatting为ray tracing或混合渲染；跨域方法把颜色通道换成水下、热红外、射频、事件或多光谱信号；应用方法则把这些能力接入VR、XR、工业、果园、房产、体数据或光场显示。读这一章时不要把方法看成互斥替代，而应把它们看成原始3DGS流水线上的可插拔修正。
+
+\section{抗锯齿与多尺度渲染}
+
+抗锯齿路线的锚点是Mip-Splatting：它指出3DGS在缩放和远近变化时会把训练视角中不可采样的高频带到测试视角。后续方法围绕三件事增量展开：在3D空间限制高斯频率，在2D投影后按像素足迹滤波，以及在不同LOD或尺度下选择不同基元。
+
+% METHOD: 2311.16493
+\paragraph{Mip-Splatting（2023）\cite{2311_16493}}
+Mip-Splatting 把尺度伪影分为表示端和成像端两个采样问题。标准 3DGS 可以把 Gaussian 优化得比训练图像在该位置所能分辨的尺度还小，放大时便暴露未被训练视图约束的高频结构；而屏幕端固定 dilation 又不能代表缩小后一个像素的面积积分。论文不引入多层网络，而是在每个 Gaussian 的三维协方差和投影后的二维响应上各加一个高斯滤波步骤。
+
+训练中，方法对每个 Gaussian $k$ 从可见训练相机估计最大可用采样率：像素间隔反投影到深度 $d$ 处由焦距和深度决定，选择可见视图中最高的采样率作为该 primitive 的上界。随后以一个尺度随该上界变化的三维低通 Gaussian 与原 Gaussian 卷积；由于高斯卷积仍是高斯，实作只需把滤波协方差加到原协方差。该滤波协方差每隔若干迭代重估，训练结束后保留在表示中，因此限制的是可表达的三维频率，而不只是某个测试视角的模糊程度。
+
+渲染端，Mip-Splatting 用二维 Mip filter 替代原始的固定屏幕 dilation：在投影协方差上加入覆盖单个像素的二维滤波协方差，以高斯近似相机传感器的 box integration，再按原来的 tile rasterization 和 alpha compositing 合成。前者主要抑制放大时的高频伪影，后者主要处理缩小时的 aliasing；两者必须连同训练使用。它不同于后面的 SA-GS 测试时补偿，也不同于 Multi-Scale 3DGS 的离散 LOD：这里仍是一套 Gaussian，但其最小可表示尺度被训练采样率显式约束。
+
+% METHOD: 2311.17089
+\paragraph{Multi-Scale 3D Gaussian Splatting（2023）\cite{2311_17089}}
+Multi-Scale 3DGS 认为仅在渲染时删去屏幕上过小的 Gaussian 会留下空洞，因为原始表示没有为低频外观准备替代物。它因此把场景写成显式的多层 Gaussian 集合：细层保存高频细节，粗层用聚合后的大 Gaussian 承担低分辨率下本应保留的低频颜色和形状。层级选择的依据不是相机距离本身，而是每个投影 Gaussian 的 pixel coverage。
+
+pixel coverage 定义为二维 Gaussian 在低 opacity 等值线处的较短轴长度，以像素计；小于约两个像素意味着相对于当前栅格化采样率包含过高频率。所有 SfM 初始化和常规 densification 产生的 Gaussian 先属于最细层。经过预热后，对每个更粗的目标尺度，方法将已有较细层在相应下采样分辨率下渲染，挑出覆盖率过小的 Gaussian；再按三维 voxel 分箱，将同一 voxel 内的位置、尺度、opacity 与颜色做平均池化，并依据组内平均覆盖率扩大新 Gaussian 的尺度。由此插入的 Gaussian 属于该粗层，而不是删除原细层。
+
+随后模型同时接受原始和下采样训练图像。每个 Gaussian 记录在其创建尺度观察到的最小、最大 coverage，并以衰减更新范围；测试时只渲染 coverage 落入该相对范围的 Gaussian，同时保留规则避免在最粗或最细尺度把唯一可用的一层错误过滤。于是高分辨率保留更多细层 primitive，低分辨率用较少的粗层 primitive 替代被过滤的细节。与 Mip-Splatting 的连续滤波不同，它付出额外表示和训练/选择逻辑来获得显式 LOD；聚合是近似平均，不能保证恢复被合并的细节。
+
+% METHOD: 2403.19615
+\paragraph{SA-GS（2024）\cite{2403_19615}}
+SA-GS 将缩放伪影拆成两个问题：锯齿本身，以及训练与测试时二维 Gaussian 尺度不一致。标准 3DGS 在训练中以固定低通核扩张投影 Gaussian，避免小于一个像素时数值不稳；固定膨胀量却把模型的屏幕尺度绑在训练分辨率和相机设置上。只在测试阶段做超采样或积分并不能修复这个失配。SA-GS 因此保持训练、densification 和原损失完全不变，作为已有模型的测试时 renderer 插件。
+
+对每个投影二维 Gaussian，方法先计算训练与当前渲染之间的尺度比 $r$：其中一项来自分辨率比，另一项来自当前相机与最近定向训练相机的距离/焦距比。渲染时把原固定膨胀协方差改为随 $r^2$ 缩放的膨胀项，使不同设置下的投影分布与训练时的屏幕尺度一致。只有这一尺度自适应滤波完成后，才处理剩余的采样锯齿。
+
+在降低渲染频率时，SA-GS 可为每个像素建立 $S\times S$ 子像素，各自执行 alpha blending 后取平均；论文实验取 $S=3$。它还给出积分版本：在二维 Gaussian 主轴坐标系中，将像素四角投影为两个一维区间，以 Gaussian CDF 的端点差相乘得到像素面积响应，并以面积补偿近似处理旋转像素。两条路径都在测试时替换 opacity 计算，而不要求重训。其局限是缩小时积分/超采样会增加时间和共享内存开销，旋转像素积分也只是有误差界的近似；放大时则无需该额外采样。
+
+% METHOD: 2408.06286
+\paragraph{Mipmap-GS：将缩放信息写入可变形 Gaussian（2024.08）}
+Mipmap-GS~\cite{2408_06286}针对单尺度 3DGS 在放大/缩小时 primitive 覆盖与像素覆盖失配造成的锯齿和细节退化。它先在基本尺度渲染 Gaussian，再构造类似 mipmap 的目标尺度伪真值：缩小时用双线性下采样，放大时用 SwinIR 等超分辨模型生成扩展像素的参考。不同于仅在渲染端滤波，该方法从 base Gaussian 产生与缩放因子相关的 Gaussian，使颜色、形状、大小及位置分布都可随尺度调整。
+
+训练以尺度伪真值监督这些 scale-adaptive primitives，并加入 scale-consistency guidance，将多尺度信息注入同一表示；同时配合 active pruning 清除在目标尺度上无贡献的 primitive。推理时给定 zoom factor 后使用对应形变的 Gaussian 执行常规 splatting。伪真值尤其在放大方向继承了超分辨教师的先验，因而它改善的是尺度适配，并不保证产生的高频细节都具有观测证据。
+
+
+% METHOD: 2504.12811
+\paragraph{AAA-Gaussians：面向三维评估的抗锯齿、边界与 culling（2025）\cite{2504_12811}}
+AAA-Gaussians~\cite{2504_12811}组合了 screen-space plane 的三维高斯评估、hierarchical sorting 与三个渲染器改动，目标是同时消除尺度变化时的 aliasing、视锥边缘 pop-in，以及过粗 culling 带来的排序/性能问题。它不以二维投影协方差近似每条像素射线，而把像素射线表示为两张 screen-space plane 的交线，在高斯归一化空间计算该线到原点的距离，从而取得该射线上最大贡献。
+
+对于抗锯齿，方法记录训练相机中见到的最高采样频率。测试时根据当前视图频率决定是否对三维高斯作自适应 dilation；与直接按高斯体积变化缩放振幅不同，它只以垂直视线方向的尺度变化归一化。原因是三维评估只取沿射线的最大贡献而不完整积分，若把沿射线方向也纳入 volume normalization，强各向异性基元会被错误地变得过透明。
+
+其次，perspective-correct bounding 不再把高斯简单映射为易漏掉边缘贡献的屏幕椭圆，而对三维 support 推导视角相关 bounds。最后，tile culling 用每个 tile 的四个平面组成 frustum 来判断 Gaussian overlap；实现时只测试最靠近均值的两平面及三条边，减少计算。与只按高斯均值或 screen-space $z$ bounds 剔除不同，该测试保留实际仍会贡献的边缘基元。论文也明确这种边界路径仍紧贴 pinhole 相机，且在训练分布内常规图像指标未必显著提高；收益主要体现在不同焦距、距离或分辨率时的稳定性。
+
+% METHOD: 2506.11252
+\paragraph{AA-2DGS：平面 Gaussian 的世界空间平滑与对象空间 Mip filter（2025）\cite{2506_11252}}
+AA-2DGS~\cite{2506_11252}面向 2DGS 的平面 Gaussian disk。原 2DGS 为缓和倾斜视角的退化，以 local-splat 与 screen-space 高斯的 $\max$ 作 clamping；论文指出这既在不同坐标域比较，又有梯度不连续和 warp divergence，且不能在缩放时提供真正的采样预滤波。方法用两个连续滤波器取代这一启发式。
+
+world-space flat smoothing 先从所有训练相机计算每个 disk 的最大采样频率 $\hat\nu_k=\max_n f_n/d_n$。它不将 Mip-Splatting 的三维各向同性核直接加到平面基元，而将该核投到高斯切平面：本地 $uv$ covariance 由 $\operatorname{diag}(s_u^2,s_v^2)$ 变为 $\operatorname{diag}(s_u^2,s_v^2)+\sigma_{\mathrm{smooth},k}^2I_2$，并按尺度积比缩小 opacity 以守恒能量。该固定的训练视图频率界限制可学习表示在放大时产生未被训练采样支持的高频。
+
+minification 则由 object-space Mip filter 处理。它对像素到 ray--splat intersection 本地坐标的映射求 per-pixel Jacobian $J$；把屏幕 Gaussian Mip 核经仿射映射写回 splat 的 $uv$ 域，得到本地 covariance $I+\sigma JJ^T$，直接在 ray--splat 交点求 Gaussian。这让 2DGS 可在其本来进行评估的本地空间应用 EWA/Mip 预滤波，而不是近似投影中心。训练沿用 2DGS 密度控制和图像损失，采样率每 100 iter 更新；代价是自定义 CUDA 前后向的额外渲染开销，极端放大时任何带限过滤仍可能过平滑。
+
+% METHOD: 2507.00554
+\paragraph{LOD-GS：以采样率驱动的 GMM 预测每个 Gaussian 的滤波程度（2025）\cite{2507_00554}}
+LOD-GS~\cite{2507_00554}针对 fixed 3D smoothing filter 在不同 camera distance、focal length 与分辨率下会过滤部分纹理、又不足滤除其他纹理的问题。它把每个 Gaussian 的当前采样率 $\nu=f/d$ 作为输入，不再在训练后冻结从所有视图取最大值的统一滤波尺度。
+
+具体地说，学习一个小型 Gaussian-mixture basis module $\mathcal F(\nu)=\sum_iw_i\exp(-(\nu-\mu_i)^2/(2\sigma_i^2))$，输出随采样率变化的三维 covariance 增量；每个 Gaussian 的滤波 covariance 是 $\Sigma_k+\mathcal F_s(\nu)$。同一模块还预测 opacity residual $\mathcal F_\alpha(\nu)$，因此 scale 扩张时能同步校正能量而不依赖 Mip-Splatting 的固定平滑超参。对一张相机图像到全部 Gaussian 的 $f/d$ 可在线以 $O(K)$ 计算，所以训练与测试都能随当前视图变化。
+
+二维阶段，LOD-GS 在 alpha blending 前施加带 determinant normalization 的 EWA filter：投影 covariance 扩张时缩放贡献，避免只加 $sI$ 而 opacity 不变造成的 dilation。图像损失端到端反传到原高斯与 GMM basis。它以多尺度图像训练为目标，把不同 LOD 烘进一个 radiance field；成本是需要学习的滤波函数与额外参数，且实现中假设采样率 $f/d$ 足以表征所需过滤，不能保证处理任意相机模型或动态遮挡。
+
+% METHOD: 2511.15102
+\paragraph{Gaussian Blending（2025）\cite{2511_15102}}
+Gaussian Blending指出，即便对单个 splat 做了像素面积积分，传统的标量 alpha 合成仍会错误处理像素内部的遮挡。普通 3DGS 先把每个高斯在整个像素内的影响压成一个 alpha 标量，再计算 $T_i=\prod_{j<i}(1-\alpha_j)$；这样前景只覆盖像素局部时，也会以平均 alpha 过度消耗整个像素的透射率，造成缩小时膨胀、放大时侵蚀等边缘伪影。
+
+论文从物理正确的量出发：在像素区域 $p$ 内，颜色应积分 $\sum_i T_i(x)\alpha_i(x)c_i$，其中透射率 $T_i(x)=\prod_{j<i}(1-\alpha_j(x))$ 随像素位置变化。难点是不同 Gaussian 的乘积与积分不能按传统逐 splat 独立处理。方法将像素内的 alpha 及由前景高斯造成的透射率变化视为空间函数，并利用二维 Gaussian 在主轴坐标中的可分性，把所需的像素面积量近似为两个一维解析积分的组合。它围绕零阶、一阶和二阶矩维护这种空间变化，而非只保留一个平均 alpha；由这些矩估计后续 splat 所见的局部透射率和颜色贡献。
+
+因此渲染路径仍是深度排序的前向 splat，但每个高斯更新的是空间 alpha--transmittance 的近似统计量，再给出积分后的像素颜色。该设计可与标准 Gaussian 参数和学习过程配合，重点替换的是 rasterizer 中的合成规则而非场的表示或致密化。相对于 supersampling，它试图用解析近似取得像素内遮挡的主要效应而不进行多次渲染；其近似精度仍受有限矩和 Gaussian 可分近似约束，在复杂的重叠或高频遮挡下并不等同于逐子像素的精确积分。
+
+% METHOD: 2404.06109
+\paragraph{Revising Densification（2024）\cite{2404_06109}}
+这项工作逐项重审 3DGS 的 Adaptive Density Control (ADC)。原 ADC 用跨视图平均的位置梯度决定 split/clone，但位置梯度反映的是移动 primitive 后误差的局部变化，不是当前误差的绝对大小；一片由少量大 Gaussian 覆盖的高频区域可以严重欠拟合却梯度很小。论文也指出固定梯度阈值对损失、超参数和模型改动敏感，且无 primitive 数量预算。
+
+它以辅助的逐像素误差驱动生长。对每个训练视图先计算结构相似性形式的像素误差，再按 Gaussian 对该像素的实际 compositing 权重把误差分配给各 primitive，得到每个 Gaussian 的每视图误差；两次 ADC 之间取其跨视图最大值作为 densification score。实现上给每个 Gaussian 增加一个不参与更新的标量 $e_k$，额外渲染这张标量图，并以 detach 后的像素误差与该图的点积构造辅助损失。这样，只有 $e_k$ 的梯度等于所需的归因误差，原有颜色、位置、协方差及主损失的梯度不被这项辅助损失改写。score 决定候选后仍沿用尺寸判据选择 clone 或 split。
+
+论文还修正 clone 的 opacity：直接复制 opacity 会使两个同位置 primitive 后方的透射率从 $1-\alpha$ 变为 $(1-\alpha)^2$。因此克隆的两个 primitive 使用使中心像素透射率匹配的较低 opacity $1-\sqrt{1-\alpha}$；split 因子对象位置和尺度已改变，仍保持原规则。最后，系统设置全局 primitive 上限与每次 ADC 的新增预算，候选超额时按 score 取前列。这是训练时的资源控制和误差归因改造，渲染器不变；预算与误差度量的选择仍会改变最终质量/容量取舍。
+
+% METHOD: 2404.09591
+\paragraph{3DGS as Markov Chain Monte Carlo（2024）\cite{2404_09591}}
+该工作把优化 Gaussian 集合解释为从“重建质量高的集合概率更大”的分布采样。若把图像重建损失看成负对数密度，标准梯度下降就是没有随机项的 Langevin 更新；作者据此保留原有 differentiable rasterization 和图像损失，但把对位置的 Adam 梯度更新改为 SGLD 形式：梯度项将集合推向高概率区域，协方差形状相关的各向异性噪声提供探索。噪声只加在位置上，并随 opacity 降低而增强，以避免对已由图像约束的高 opacity Gaussian 做无意义随机游走。
+
+原 3DGS 的 clone、split、prune 等启发式被统一为采样状态之间的离散转移。具体的 relocalization 回收低 opacity 的“dead” Gaussian，把它们移到一个 live Gaussian 的位置，并联动设置若干 Gaussian 的 opacity/尺度，使转移前后对渲染的影响尽量相等；这与直接复制一个高 opacity splat 不同。论文用重定位取代不断增添新 primitive 的 clone 逻辑，同时保留能够改变集合状态的操作，并从保持采样链的概率解释来推导其参数调整。它还给 opacity 加 $L_1$ 正则，使不被图像误差支持的 primitive 更容易变为可回收状态。
+
+因此，这不是简单地“在所有参数上加噪声”，也不是宣称不再有任何密度控制：其核心是位置 SGLD、opacity-aware exploration、relocalization 和稀疏正则共同替换易膨胀的克隆/剪枝组合。探索强度、opacity 门控和重定位近似都会影响收敛；概率解释并不消除有限迭代、初始化与 renderer 近似带来的实践依赖。
+
+% METHOD: 2404.10484
+\paragraph{AbsGS（2024）\cite{2404_10484}}
+AbsGS 精确定位了原 ADC 的一个统计失真。对一个投影范围很大的 Gaussian，原方法将其覆盖像素对二维中心的子梯度先带符号相加，再取每视图的梯度模长并跨视图平均。高频区域中，不同像素可能要求中心向相反方向移动；这些方向在同一 $x$ 或 $y$ 分量上相消，使一个实际上欠表达细节的大 Gaussian 看起来梯度很小，因而无法 split。
+
+方法将每个像素对子梯度的 $x,y$ 分量先分别取绝对值，再在 Gaussian 覆盖区域内累积，得到不受方向抵消影响的 homodirectional view-space positional gradient；然后像原 ADC 一样跨参与视图汇总，并以该统计量和原有尺度判据决定 split 或 clone。换言之，它不是简单降低阈值，也不是把一个整体梯度向量取绝对值，而是在像素级求和之前丢弃正负方向。
+
+Gaussian 参数化、photometric loss、渲染、split/clone 与 prune 日程均沿用 3DGS，改变只发生在 densification score 的计算位置。因而它与 Pixel-GS 互补：Pixel-GS 按参与像素数和深度重加权视图梯度，AbsGS 避免同一视图内部的子梯度冲突。该判据更易选择应分裂的大 Gaussian，但阈值仍控制质量、内存和训练时间的取舍。
+
+% METHOD: 2409.11307
+\paragraph{GS-Net（2024）\cite{2409_11307}}
+GS-Net 把 3DGS 的 SfM 点云启发式初始化替换为跨场景可学习的 dense ellipsoid predictor。训练数据以 MVS dense point cloud 送入 3DGS 得到较密 ellipsoid array 作为监督；输入是 sparse SfM 点的位置和 RGB，输出为每个输入点扩展出的多个 Gaussian 属性，包括位置、尺度、四元数旋转、opacity 与颜色。
+
+编码器先从六维点坐标/颜色提取点特征，再聚合三个最近邻的特征，形成局部几何特征；全连接 decoder 将该特征解码为 14 维 ellipsoid 属性。位置和颜色预测为相对 offset，尺度经 sigmoid 约束，四元数归一化，opacity 使用激活约束；训练以属性 MSE 对齐 dense ellipsoid target。预测集合随后进入普通 3DGS 优化和渲染。它的收益依赖 dense target 与训练场景分布，且网络预测不能替代后续多视图监督。
+
+% METHOD: 2503.14274
+\paragraph{Improving Adaptive Density Control：校正尺度、阈值调度与显著性剪枝（2025）\cite{2503_14274}}
+该工作~\cite{2503_14274}将 3DGS 的 Adaptive Density Control 作为主要优化对象。它以 PixelGS 的像素加权、深度缩放位置梯度和已有的 clone-opacity correction 为起点，进一步处理一个实际偏差：标准实现用相机中心分布估计 scene extent，因而相机集中拍摄大场景时会把场景尺度估小，错误影响 clone/split 选择以及尺寸剪枝。
+
+其 corrected scene extent 改由初始化 SfM 点云给出：以平均相机中心到所有 SfM 点的平均距离度量范围，而非仅取最远相机到平均相机的距离。这个尺度进入高斯的相对大小判定，因此让大而远的场景不因相机轨迹很小而被过度 split 或 prune。第二个改动是 densification threshold 不再固定。位置梯度高表示一个高斯在优化中试图同时覆盖多个位置，早期允许较低阈值可以快速补足欠拟合区，随训练推进以指数上升阈值收紧候选，避免后期持续增加基元并帮助收敛。
+
+方法还结合克隆/分裂后 opacity 的校正，使 parent 与 child 的 alpha 组合尽量不突变，从而减少后方高斯透射率被意外压低；其 pruning 则以基元对图像的显著性而非仅低 opacity 判断，避免把背景中虽淡但仍有可见贡献的高斯删掉。因而它不是一种新表示或渲染器，而是一组可插入既有 3DGS/PixelGS 管线的 ADC 规则；效果取决于 SfM 初始化点云能否反映真实范围，以及阈值日程与原有 densification 配置的匹配。
+
+% METHOD: 2505.10787
+\paragraph{EA-3DGS：以自适应四面体网格组织户外初始化与结构感知增密（2025）\cite{2505_10787}}
+EA-3DGS~\cite{2505_10787}针对户外、大尺度场景中 SfM 点不足、弱纹理区域缺几何以及数百万高斯超出训练显存的问题。它首先构造自适应四面体 mesh 来分割网格，在 mesh face 上初始化 Gaussian，而不是仅沿原始稀疏点云无结构播点；论文将此作为对低纹理几何区域的初始化约束。
+
+训练中，贡献感知 pruning 依据一个 Gaussian 对当前视图的可见/渲染贡献删除冗余基元。与只追踪像素梯度的致密化不同，structure-aware densification 将局部结构信息加入判据，论文特别以低曲率区域为目标补点，试图保留场景几何所需的 Gaussian，而非仅保留高颜色残差处的点。这样，mesh 初始化、删点和补点共同控制大场景内基元数。
+
+存储侧使用 codebook/vector quantization 压缩 Gaussian 参数以降低磁盘占用，渲染仍是 Gaussian splatting。它的创新落在户外数据的组织与资源控制，而非更换 alpha compositing；表现依赖网格质量、所选贡献/结构度量以及量化对特定场景参数分布的适配。
+
+% METHOD: 2506.06462
+\paragraph{Splat and Replace：让重复实例共享几何与基础外观（2025）\cite{2506_06462}}
+Splat and Replace~\cite{2506_06462}利用场景中同一物体的多次出现来弥补单个实例被遮挡、远距离拍摄或细节不足的问题。它先训练基础 3DGS，再把每个重复实例从独立高斯集合变换为同一 shared template 的不同刚体放置；模板存共同几何与 base appearance，每个实例只保留 appearance offset，因此来自所有实例视图的渲染损失会共同更新模板。
+
+第一阶段是 3D instance segmentation。用户以文本查询启动 GroundingDINO 得到每实例 box，SAM-HQ 给出训练图像中的 mask；每个 Gaussian 增加可学习 contrastive feature，渲染为像素 feature 后，对同 mask 像素 pull、异 mask 像素 push。完成 feature 训练后，用户在每个目标实例点选一次，特征空间阈值选出对应高斯；低 opacity/过大高斯的正则与 space carving 清除仍同时服务实例与背景的残留基元。
+
+第二阶段把实例配准到共享坐标。方法不是直接在噪声 Gaussian 点云上做全局 FPFH，而从虚拟球面采样各实例视图，使用 MASt3R 做稠密二维匹配、恢复初始相对位姿，再以 ICP refine。配准后把多个实例融合到 template，令每实例都由其刚体变换和 instance-specific appearance offset 渲染。联合 fine-tuning 让一个实例的近景信息改善另一个实例的远景结果。该机制依赖可识别的重复物、足够的跨视角互补观测与相近光照；背景不因共享模板自动改善，强镜面高光或实例外观差异仍会破坏共享假设。
+
+% METHOD: 2506.12400
+\paragraph{Perceptual-GS：以可学习感知敏感度分配 Gaussian（2025）\cite{2506_12400}}
+Perceptual-GS~\cite{2506_12400}把 densification 从单一位置梯度改为“哪些区域对人眼局部结构更敏感”。它先由图像局部结构构造二值并经平均池化平滑的 sensitivity map，避免只按 Sobel 等边缘 response 幅度而遗漏弱但可感知的结构；随后为每个 Gaussian 加一个可学习 sensitivity $\epsilon_i$，使二维感知标签能在多视角中累积到三维基元。
+
+训练使用 dual-branch renderer：RGB branch 是原 3DGS 的 $L_1$ 加 D-SSIM；sensitivity branch 用相同 alpha compositing 渲染各基元 $\epsilon_i$，以 BCE 对齐该视图的 sensitivity map，总损失以权重相加。低敏感区域的 sensitivity loss 会降低其整体优化驱动，因而不会因普通 position gradient 大量生长；warm-up 500 iter 后，方法按已学习的高/中敏感度与权重阈值选择必须 densify 的基元。高敏感区域优先补足可见关键结构，medium 区补精度；对敏感区域较少的场景，高敏感集合还可只 clone，限制规模增长。
+
+当初始 SfM 点云很稀、仅分裂大高斯会给出错误分布时，scene-adaptive depth reinitialization 重新安置/细化深度结构。clone 同时采用 opacity decline，避免 parent 与 child 直接继承同 opacity 而人为增加局部不透明度。该方法不是主观质量损失的替换，而是引入一张从图像得到的附加监督图；其判别仍取决于 sensitivity map、阈值和 SfM/深度初始化是否可靠。
+
+% METHOD: 2507.12498
+\paragraph{Wavelet-GS：将点云与图像的低/高频分支分别优化（2025）\cite{2507_12498}}
+Wavelet-GS~\cite{2507_12498}把初始点云经 XYZ 三维离散小波变换拆为 $\mathcal P_{\mathrm{low}}$ 与 $\mathcal P_{\mathrm{high}}$，分别代表全局结构和细粒几何/纹理；两支各自 voxelize、预测 Gaussian，再以小波可加性将 $\mathcal G_l(x)+\mathcal G_h(x)$ 合并为最终表示。这是分支化的高斯优化，不是对既有 SH 颜色简单做二维 wavelet 后处理。
+
+低频支用 MLP 从 voxel center 预测 variance、mean、opacity 与颜色，按 voxel 内 Gaussian 平均梯度执行 grow，并以随机选择限制新增 voxel；累计 opacity 低的 voxel 被 prune。其渲染监督为 $L_1$、SSIM 和基元 scale 乘积的 volume regularization，后者鼓励小、少重叠的 Gaussian 以维持整体结构。高频支另用一组 MLP 预测同类属性，着重边缘与纹理；对过大或过小的 high-frequency deviation 用阈值 mask 抑制 voxel growth，以免噪声驱动无界扩张。
+
+为处理高频外观/照明，训练图像还做二维 DWT，得到近似与水平、垂直、对角 detail maps；近似图经 MLP 形成结构 feature，并以二阶 SH 表示 radiance transfer。高频颜色结合该 relight module 的 $\tilde c_k$，并使用 Laplacian--Wavelet loss 同时比较多尺度 Laplacian pyramid 与小波系数。这个设计的表达力来自频率拆分与多种正则，但其效果依赖 voxelization、小波阈值和所用 SH/Blinn 类照明假设；高频分支并非天然等于真实物理光照。
+
+% METHOD: 2509.25603
+\paragraph{GaussianLens：按需在局部 RoI 以现有与像素引导高斯共同增密（2025）\cite{2509_25603}}
+GaussianLens~\cite{2509_25603}解决 feed-forward 3DGS 面对高分辨率局部细节时，整图高分辨率预测会超显存、单靠低分辨率初始高斯又不能补出锐利结构的问题。它保持输入重建的大部分 Gaussian 不动，只在指定 Region of Interest 运行 transformer densification，从而把算力集中到用户/任务所需的局部高分辨率区域。
+
+RoI Gaussian 由多视图 mask 选择：渲染输入 3DGS，统计每个 Gaussian 在 mask 内的 opacity contribution，只保留至少两个 context views 中可见的基元以减少单视图歧义。除这些 $\mathcal G^{RoI}$ 外，方法从 RoI 像素回投生成 $\mathcal G^{pixel}$，为缺少的锐利细节提供新候选。网络输入包含 Gaussian 参数、渲染重建损失对参数的梯度与投影特征，并以 multi-scale projection-based Gaussian--image cross-attention 聚合局部高分辨率图像特征；两个来源分别有 embedding 与 decoder head。
+
+每个输入 Gaussian 的 decoder 输出 $K$ 个增密 Gaussian：先预测多样化的位置 offset，再以特征和新位置预测尺度、opacity、rotation、颜色等；默认参数遵循原 3DGS clone 的缩小 scale/opacity，使零 offset 时仍近似原基元。最终将 densified $\mathcal G^{RoI}\cup\mathcal G^{pixel}$ 与未变的背景 $\mathcal G^{bg}$ 合并。可选存在 mask 以 Gumbel-softmax 选择激活高斯并施加稀疏正则。该方法需要可靠 RoI/mask 与初始 Gaussian scaffold；它提升的是局部，不承诺修正背景或单视图 hallucination。
+
+% METHOD: 2510.26921
+\paragraph{DC4GS（2025）\cite{2510_26921}}
+原始 3DGS 的致密化主要看位置梯度有多大，却无法区分两种同样“敏感”的情形：一个高斯可整体向同一方向移动来修正误差，或它横跨两种结构、不同像素要求它朝相反方向移动。DC4GS把后者定义为应分裂的异质区域，并把这种判断接入既有的 adaptive density control，而不改变高斯表示或标准可微光栅化。
+
+对高斯 $i$ 在某视图影响到的每个像素，令 $g_{i,j}=\partial L_j/\partial\mu'_i$ 为屏幕空间位置梯度，并先归一化为方向向量 $u_{i,j}$。这些方向的圆均值 $C_i=N^{-1}\sum_j u_{i,j}$ 的模长 $\kappa_i=\lVert C_i\rVert$ 是方向一致性：接近一说明像素意见一致，接近零说明梯度在角度上分散。DC4GS将每视图的位置梯度幅值聚合 $\lVert\hat g_{i,v}\rVert$ 乘以不一致度 $1-\kappa_{i,v}$，并对可见视图平均，形成 DCC 分裂分数。只有分数超过位置阈值且高斯尺度满足原有尺度条件时才分裂；因而高梯度但内部同质的区域会被抑制，真正跨越边缘或多结构的基元才被优先细化。
+
+它还改变子高斯的落点，而非沿用随机扰动。候选点限制在该各向异性高斯最大尺度对应的主轴上；每个候选点用垂直于该轴的切分线把贡献区域分为左右两部分，并分别计算 $J_l=(1-\kappa_l)\lVert\hat g_l\rVert$、$J_r=(1-\kappa_r)\lVert\hat g_r\rVert$。选择使 $J_l+J_r$ 最小的位置，必要时由离散候选的多项式回归细化估计，再在该处执行分裂。训练图像仍以原 3DGS 的重建损失驱动；DC 是从该损失反传的位置梯度取得的控制量，贡献在于将“是否加点”和“点放在哪里”用同一结构异质性依据连起来。
+
+% METHOD: 2604.21400
+\paragraph{You Only Gaussian Once（YOGO，2026）\cite{2604_21400}}
+YOGO针对超密、异构传感器采集时传统 ADC 高斯数不可预测的问题。它将场景切为互不重叠的空间多边形，每块给定目标预算 $N_m^{target}$；因此“要在哪里长多少高斯”从全局梯度阈值的副作用变成可显式配置的资源约束。
+
+每次致密化事件先剪枝，记录区域当前数 $N_m^{cur}(k)$ 与缺口 $\Delta N_m(k)$，再按剩余事件数分配配额 $N_m^{densify}(k)=\max(0,\Delta N_m(k)/(K-k+1))$。在区域内部只选择累计位置梯度最高的相应数量基元扩增，因而在设定的调度结束时数量向区域预算收敛。为提高选择质量，梯度是按跨视图高斯足迹面积归一化的绝对像素梯度，避免大投影基元获得天然优势；剪枝依据最大有效 opacity $\alpha T$，而非仅看自身 opacity，移除虽不透明但始终被前景遮住的基元。选中后沿最大尺度主轴生成三个位置扰动的子基元，并缩放其尺度/opacity，以更有针对性地恢复细长和各向异性结构。
+
+面对多传感器图像，YOGO先用主传感器训练锚点场；冻结该场后，对辅助图优化逐视图仿射色彩变换 $G_jC_{rend}+b_j$。变换相对恒等的对角增益、非对角串扰和偏置偏差组成 availability score，超过阈值的辅助帧不进入最终混合训练。这使辅助数据必须先通过辐射/几何一致性的可用性筛选，而不是无差别地增加图像数量。方法还提出 Immersion 超密多传感器数据与评测轨道；其预算可控性不消除训练成本，且区域划分、预算分配、阈值和辅助数据校准仍决定是否把资源放在正确结构上。
+
+% METHOD: 2605.29136
+\paragraph{Eulerian Gaussian Splatting（2026）\cite{2605_29136}}
+Eulerian Gaussian Splatting不把场景看成一串需要 clone/split/prune 的拉格朗日基元，而把 Gaussian 中心视为从可学习密度 $p_\theta(\mu)$ 抽取的样本。每次渲染从密度场抽取一组位置，再从独立的属性 hash grid 查询 opacity、颜色、尺度和旋转；优化同时改变概率质量和位置相关属性，让更多样本自动落到图像误差需要的空间。
+
+密度用 Hashed Probability Pyramid 表示。它是从粗到细的多层分段常数三维分布的乘积：最粗层全局归一化，细层对每个父格的 $2\times2\times2$ 子格条件归一化。采样先从粗层选格，再逐层按父格条件细化；高分辨率层用 hash 将许多块映射到有限参数表，避免立方网格的内存增长。以同一均匀随机变量在层间递推，可使最终样本对全部 pyramid 参数可微；无界场景则先从单位立方采样，再用收缩映射分配近远空间容量。
+
+渲染图像是对位置分布的期望，属性梯度可直接反传，但分布参数的 pathwise 梯度方差很高。论文改用 score-function 估计器，并以 leave-one-out control variate：第 $i$ 个样本的概率梯度由其移除前后图像差 $I-I_{-i}$ 加权；该差可由 $o_i\,\partial I/\partial o_i$ 从普通反传取得，因此无需为每个高斯重渲染，且保持无偏并显著降方差。监督使用 $L_1$--D-SSIM，加 opacity、尺度与高阶 SH 正则。
+
+为进一步稳定，样本被圆整到最细格中心并去重；密度集中后重复样本增加，去重后的实际渲染高斯数自然下降，形成无需显式剪枝的自适应压缩。早期还混入少量退火噪声以避免某区域概率降为零后无法恢复；训练结束可将一次采样得到的显式 Gaussian 再用普通梯度优化微调。hash 碰撞、Monte Carlo 方差和有限样本下的密度覆盖仍是这种概率表示相对显式 ADC 的代价。
+
+% METHOD: 2409.12892
+\paragraph{3DGS-LM：以 Levenberg--Marquardt 完成后期 Gaussian 收敛（2024.09）}
+3DGS-LM~\cite{2409_12892}不靠减少 Gaussian 或替换 rasterizer 加速，而把标准 3DGS 后期的 Adam 优化改为针对最小二乘重建目标的 Levenberg--Marquardt。流程先按普通 3DGS 从 posed images 和 SfM 点云开始，允许 densification 生成足够 primitive，但在尚未收敛时切换到 LM。LM 在阻尼的 Gauss--Newton 方向上更新位置、旋转、尺度、opacity 和 SH 参数，从而利用局部二阶信息减少后期大量一阶迭代。
+
+实现难点是 GPU 上的 Jacobian-vector product：论文缓存 rasterization 中间梯度，并以 custom CUDA kernels 对多个图像子集计算更新方向，再按加权方式合并。渲染与损失仍基于 3DGS 的 alpha 合成和 $L_1+$D-SSIM 型图像误差；区别在优化器而非场景表示。该方法需要先有可用的稠密 Gaussian 初始化，LM 的内存/线性代数代价也使其更适合取代收敛阶段而不是从随机状态直接训练。
+
+
+% METHOD: 2412.13547
+\paragraph{Turbo-GS：面向 4K 拟合的稀疏渲染与收敛感知调度（2024.12）}
+Turbo-GS~\cite{2412_13547}从优化过程而非表示本身加速高分辨率 3DGS：dilated rendering 缩小每次迭代的渲染足迹，同时保持高分辨率质量；convergence-aware schedule 将训练计算投入到更有收益的阶段；position-appearance-based densification 以位置和外观共同决定增密。它仍以标准 Gaussian 和图像重建目标为核心，收益依赖调度、稀释渲染和增密判断对场景细节的适配。
+
+
+% METHOD: 2501.01003
+\paragraph{EasySplat：以 pointmap 初始化和邻域形状比较改进致密化（2025）\cite{2501_01003}}
+EasySplat~\cite{2501_01003}处理的是无位姿、多视图输入下，COLMAP/SfM 初始点云与相机位姿不稳、而标准 3DGS 又难以在初始点稀少处主动补点的问题。它保留高斯椭球与可微 splatting 的主训练框架，但把初始化和致密化都改为具有局部结构依据的过程。
+
+给定 $N$ 张未知位姿图像，方法先计算相邻图像的余弦相似度，并取相邻相似度的变化率；变化率最大的若干位置把序列切成视图组。每组以组内第一个视图为参考，将其余视图与参考视图配对，送入预训练 DUSt3R 得到每一对的两张 pointmap 及置信图。随后，论文以置信度加权的全局对齐，同时求各 pair 的相似变换、相机位姿和一致的全局点云；这个分组图替代了密集视图上的完全配对图，目的是降低 pointmap 估计和全局对齐的内存负担。对齐后的点云初始化高斯，且相机位姿继续参与 3DGS 优化。
+
+它的第二个改动发生在训练中的 densification。原始梯度阈值仍是候选条件：论文每 100 次迭代计算一个高斯的平均 view-space position gradient，并以梯度与尺度阈值判断是否应分裂。为避免大高斯在局部细节区没有足够梯度而长期保留，EasySplat 对每个候选高斯检索 $K$ 个最近邻，计算邻居协方差（椭球形状）的均值；若该高斯的形状大于该局部均值，就将其视为异常大的基元并分裂。因而，梯度负责发现尚未拟合的图像信号，邻域形状比较负责把局部相对过粗的覆盖进一步拆细。该设计依赖 DUSt3R pointmap 与相邻帧顺序；论文没有把它表述为对任意无序、极稀疏视图集合的通用保证。
+
+% METHOD: 2511.04283
+\paragraph{FastGS（2025）\cite{2511_04283}}
+FastGS针对训练中的自适应致密化控制冗余高斯：原始 3DGS 用单个图像空间位置梯度选择 clone 或 split，容易为只在某一视图显著的误差增加基元。它保留 SfM 点云初始化、标准高斯参数化和可微 splat 渲染，但把“是否增加/删除一个高斯”改为多视图重建误差的决策。
+
+在多视图一致致密化（VCD）中，从训练集随机抽取 $K$ 个视图，计算渲染 RGB 与真值之间的逐像素 $L_1$ 误差，min--max 归一化后以阈值形成高误差掩码。将高斯 $\mathcal G_i$ 投影得到其二维足迹 $\Omega_i$，统计该足迹在每个采样视图覆盖的高误差像素数并取平均，得到 $s_d^i$。只有 $s_d^i$ 超过致密化阈值时，才对相应高斯执行原有的增殖操作。这个量不是高斯自身的 opacity、尺度或单视图梯度，而是在多个视图反复出现的欠拟合证据。
+
+多视图一致剪枝（VCP）复用同一足迹计数，但按每个视图的全图光度误差加权；光度误差是 $L_1$ 与 $1-\mathrm{SSIM}$ 的组合。对各视图加权求和并归一化得到 $s_p^i$，超过剪枝阈值的高斯被移除，意在删去持续关联于较差重建且对画质贡献有限的基元。为减少渲染前处理，FastGS还在精确 tile 相交的基础上用马氏距离收紧二维包围盒，剔除贡献很小的 Gaussian--tile 配对。其模型优化仍是渲染颜色的 $L_1$--SSIM 组合损失；加速来自更少的无效增殖、剪枝以及更少的 tile 工作，而不是改写颜色监督本身。
+
+% METHOD: 2601.16736
+\paragraph{AdamW-GS（2026）\cite{2601_16736}}
+AdamW-GS研究的是 3DGS 训练中 Adam 状态与正则项如何耦合，而非改变 splat 的几何表示。论文指出，稀疏可见性使一个高斯在当前视图没有梯度时，常规 Adam 的动量和二阶矩仍会衰减并影响以后重新可见时的步长；另一方面，把 opacity/尺度等属性正则的梯度和光度重建梯度一起送入 Adam 预条件器，会使正则强度被各基元的 moment 非线性放大或压低。
+
+第一部分以 Sparse Adam 只更新当前可见基元的属性，避免不可见高斯发生隐式状态演化，但单独使用会造成状态分布失衡。Re-State Regularization（RSR）在固定间隔抽样当前基元并重缩放其一、二阶 moment；它把重缩放后的状态写回优化器，使新生成、重分配和长期未见基元不因零状态或陈旧状态获得不合适的更新。该机制是调整优化状态，不是对渲染图像附加一项损失。
+
+第二部分的 Decoupled Attribute Regularization（DAR）将属性正则从光度梯度的动量路径拆开：光度项仍按 Adam 的预条件更新，正则梯度也以分离的、由解耦二阶矩缩放的项加入，并用上界裁剪其步长。论文将 opacity 和尺度正则作为实例；这样在欠构建区域，较大的重建梯度不会被正则主导，而在小梯度或鞍点附近，正则仍可推动冗余属性演化。AdamW-GS把 Sparse Adam、RSR 与 DAR 重新组合，并可接在 vanilla 3DGS 或 3DGS-MCMC 的致密化流程上。其适用性取决于稀疏可见性和属性正则确实是训练瓶颈，RSR 的采样/缩放调度与正则强度也仍需按场景配置。
+
+% METHOD: 2602.00395
+\paragraph{3DGS$^2$-TR（2026）\cite{2602_00395}}
+3DGS$^2$-TR把 3DGS 的光度优化写成最小二乘问题，并以可扩展的二阶近似替代纯一阶 Adam 更新。完整 Jacobian 或 Gauss--Newton 矩阵在“像素数乘高斯参数数”的规模上无法显式存储；方法因此只通过 Jacobian--vector product（JVP）和 vector--Jacobian product（VJP）访问曲率信息。
+
+每轮从图像采样构造随机梯度与对角曲率估计：VJP利用已有 rasterizer 反向传播，JVP则将 CUDA 光栅化核改写为前向模式自动微分的 dual-number 运算，使 $Jv$ 不必缓存每像素每 splat 的 Jacobian。以这些随机估计构造带动量的梯度和对角预条件器，更新近似为 $\Delta x=-\widehat D^{-1}\widehat g$；定期更新曲率统计、其余步复用统计，以控制二阶信息的计算开销。
+
+二阶估计偶尔会给出过大步长，且 3DGS 的排序、可见性和稠密高斯簇使局部响应强非线性。3DGS$^2$-TR对此不使用统一的全局 learning rate 限制，而为每个高斯参数计算 trust-region 半径。半径来自更新前后未归一化 Gaussian splat 的 squared Hellinger distance，并以尺度行列式归一化；在给定容许距离 $\epsilon$ 下，位置、尺度、opacity、颜色和四元数旋转分别有解析或上界形式的最大扰动。最终将每个坐标的二阶步裁剪到对应半径内再更新。
+
+因此细小或高 opacity 高斯、短轴方向与敏感旋转会获得更保守的更新，而透明或几何允许度更大的方向可移动更多。方法保持标准 3DGS 的参数化与渲染目标，贡献在于可计算的 JVP--VJP 二阶预条件和分参数几何信赖域；其额外计算、随机曲率质量与信赖域阈值仍是实际训练代价和调参来源。
+
+% METHOD: 2603.23297
+\paragraph{Drop-In Perceptual Optimization（2026）\cite{2603_23297}}
+该工作不提出新的高斯参数化、致密化或光栅化，而是检验“训练时应让渲染图怎样接近真值”。原始 3DGS 常用 $L_1$ 与 D-SSIM，倾向逐像素保真；论文对比这一基线、含 $L_1/L_2/$MS-SSIM/LPIPS 的复合目标，以及 Wasserstein Distortion（WD）家族，并以盲测成对人评作为选择标准，而不是只优化 PSNR。
+
+WD先把渲染与参考映射到深层特征，再在局部邻域比较特征分布的 Wasserstein 型失真。局部 pooling 尺度 $\sigma$ 控制可允许的纹理重采样程度：较大邻域不要求特征在同一像素严格对应，因此可减少“像素对齐但视觉生硬”的约束。WD-R是在 WD 上加入防止训练失稳/过拟合的正则版本；它可将原有图像损失直接替换，故可套到原始 3DGS、Mip-Splatting 或 Scaffold-GS，而高斯渲染、优化变量和致密化规则本身保持原状。
+
+训练开始仍先以原始损失 warm-up，建立稳定几何后才接入 WD/WD-R，避免早期高斯增密和裁剪在缺少直接像素项时失控。该方法的贡献是把感知质量变成可替换的目标函数接口，不是声称所有数值指标都会提高：论文明确显示，WD 类目标可能以 PSNR/SSIM 的小幅下降交换更好的人类主观偏好或感知指标。结果也取决于特征空间、pooling 尺度、正则强度和任务所需的“逐像素准确”与“视觉自然”之间的取舍。
+
+% METHOD: 2605.15760
+\paragraph{Learn2Splat（2026）\cite{2605_15760}}
+Learn2Splat将“怎样由当前渲染误差更新高斯”学习为一个跨场景优化器。原始 Adam 对每个参数用局部一、二阶统计独立更新，无法知道相邻基元正共同覆盖同一表面，也难以表达位置、尺度、旋转等属性在一个结构变化中的耦合。方法仍以 3DGS 渲染损失产生梯度，但让一个神经优化器从多场景训练轨迹中学习更新规则。
+
+每步先从当前 Gaussian 场、图像梯度和优化状态构造特征。优化器把空间近邻的 Gaussian 作为上下文聚合，使一个基元的更新可参考邻居的几何/外观和梯度；同时按属性组编码位置、尺度、旋转、opacity、颜色等，使它能输出协调的参数增量而不是为每个标量套同一公式。其输出将“方向”与由梯度规模和内部状态控制的“步幅”分开，训练进程中小梯度自然减小更新，因此不必把特定训练长度的手工 learning-rate schedule 硬编码进规则。
+
+元训练展开多轮 3DGS 优化，用后续渲染质量反传更新优化器参数；部署到新场景时冻结学得规则，仍按标准初始化、渲染、致密化配置迭代更新高斯。它与 AdamW-GS 的区别是后者显式设计 moment/正则解耦，Learn2Splat以数据学习空间和属性耦合。泛化的边界在于元训练分布：新场景、相机采样、表示或迭代长度若偏离训练经验，学习到的更新可能不再优于稳健的一阶基线。
+
+% METHOD: 2408.07967
+\paragraph{FlashGS（2024）\cite{2408_07967}}
+FlashGS 优化的是原 3DGS rasterizer 的候选 Gaussian--tile 对，而不是训练出的场景。原实现以三倍标准差圆形范围生成 tile 对，细长椭圆和低 opacity Gaussian 会带来大量不贡献像素的假阳性，随后排序和逐像素 alpha blending 都被拖慢。FlashGS 先以 opacity 阈值和投影协方差确定实际有效的椭圆范围；用紧致轴对齐框粗筛，再以椭圆与矩形 tile 的精确相交判定保留候选。为避免每个 tile 解昂贵二次方程，它把线段重叠条件作代数变换，消去除法和平方根。
+
+精确筛选增加了预处理计算，因此实现按椭圆覆盖 tile 数量自适应调度：小椭圆由单线程处理，大椭圆交给 warp；并把带宽受限的预处理与计算受限的后续工作重新编排。渲染端以两级 prefetch 重叠 tile 索引和 Gaussian 属性的全局内存读取与计算。可见性、投影、排序和 alpha 合成语义保持 3DGS；收益取决于原场景的椭圆形状、opacity 分布及 GPU 线程调度。
+
+% METHOD: 2409.08669
+\paragraph{AdR-Gaussian（2024）\cite{2409_08669}}
+AdR-Gaussian 将一部分原本在每像素串行执行的低 opacity culling 前移到 Gaussian-parallel preprocess。它从给定的最小可见 splatting opacity 推导投影椭圆的 adaptive radius，以协方差最大特征值和 opacity 决定有效半径，并与原 99\% 范围取较小者；进一步使用该阈值椭圆的 axis-aligned bounding box，剔除仅落在大圆但不落在实际椭圆范围内的 Gaussian--tile 对。
+
+剩下的问题是 tile 内不同像素的候选数差异很大，最重的线程决定整体时间。第二阶段根据像素负载重新分配渲染工作：减少重载像素的低贡献处理，并让轻载像素承担更多候选，以降低等待同时控制质量损失。它不改变 Gaussian 参数和训练目标，是裁剪粒度和 GPU 负载平衡的 renderer 改造；最小 opacity 与平衡策略决定速度和画质的权衡。
+
+% METHOD: 2410.18931
+\paragraph{Sort-free Gaussian Splatting：以加权和近似非交换 alpha 合成（2024.10）}
+Sort-free Gaussian Splatting~\cite{2410_18931}针对标准前到后 alpha blending 的非交换性迫使每视图排序，尤其限制移动设备。它以 weighted sum rendering 近似合成，使 primitive 贡献可交换，从而去掉 view-dependent sorting 和相应实现复杂度。表示和投影仍沿用 Gaussian primitive，但训练/渲染使用该近似加权累计来获得像素颜色。收益是并行与移动端友好；代价是它不再严格等价于有遮挡顺序的 transmittance 合成，复杂遮挡、半透明层与深度排序强相关处可能出现近似误差。
+
+
+% METHOD: 2412.00578
+\paragraph{Speedy-Splat：稀疏像素与稀疏 primitive 的快速 3DGS（2024.12）}
+Speedy-Splat~\cite{2412_00578}将加速目标同时落在训练图像采样与 Gaussian primitive 数量上，而不是只优化 rasterizer。论文围绕资源受限场景识别冗余像素与冗余 primitive，保留能够支撑重建的稀疏集合，从而降低训练和渲染负担；具体采样与稀疏化规则应随其原文实现设定使用。它属于优化/压缩路径，基本渲染仍是 3DGS splatting，质量与速度取舍取决于稀疏预算和场景细节分布。
+
+
+% METHOD: 2412.17378
+\paragraph{Balanced 3DGS：以细粒度 tiling 平衡 CUDA rasterization（2024.12）}
+Balanced 3DGS~\cite{2412_17378}不改 Gaussian 表示，而解决 renderCUDA 中像素和 Gaussian 工作量差异造成的 SM/warp 负载不均。它以跨 block 动态 workload distribution 将 tile 动态映射到 SM；以 Gaussian-wise parallelism 取代单纯 pixel-wise parallelism，降低 warp 内各线程处理 Gaussian 数差异；再将一个 thread block 的任务细化为 4-pixel tiles，使更多任务可在 SM 间平衡，并按负载状态自适应选择 kernel。细粒度策略会增加访存开销，因此主要针对严重不均衡的训练 rasterization，而非所有场景都必然更快。
+
+
+% METHOD: 2402.00525
+\paragraph{StopThePop（2024）\cite{2402_00525}}
+StopThePop 处理的是 3DGS 的合成次序而非高斯表示本身。原始 tile rasterizer 用每个高斯均值的 view-space $z$ 作为深度键；同一 tile 内的像素因此共享一份顺序。对扁长、互相交叠的高斯，这个均值深度不等于某条具体视线上的最大贡献位置，旋转相机时相对前后次序会跳变，表现为 popping。论文保持 alpha compositing 的形式，但把离散混合位置改为沿每条视线使该 3D Gaussian 响应最大的深度 $t_{opt}$，即由高斯的均值、逆协方差和视线方向计算出的 ray-optimal depth。
+
+完全按像素排序所有候选 splat 会使训练和实时渲染都不可用，因此方法利用相邻视线的顺序相关性做分层近似：先在 tile 级计算较准确的深度并进行 opacity culling，再把需要重新比较的候选项送入由共享内存和寄存器协作的多级队列；大范围队列提供粗排序，越接近像素的队列越细，最后在像素级以 $t_{opt}$ 做局部插入排序并前到后合成。这样，正确的对象不是“一个 tile 的统一顺序”，而是每条 ray 的近似正确顺序。前向和反向光栅化均采用此管线；对极扁高斯，论文还对逆尺度作上界约束以稳定深度计算。
+
+它与后面的抗锯齿方法形成互补：StopThePop 修正的是遮挡/透明度混合的次序，不改变像素足迹或滤波。论文报告完全逐像素排序代价很高，分层版本仅比原始渲染器增加小幅开销；但这种收益依赖候选顺序的空间连续性，复杂重叠和队列容量仍是近似排序的边界。
+
+% METHOD: 2503.16681
+\paragraph{GauRast：复用三角形 rasterizer 的 Gaussian 固定功能路径（2025）\cite{2503_16681}}
+GauRast~\cite{2503_16681}是硬件架构方案，并不修改场景高斯、训练损失或 3DGS 的三阶段算法。其观察是 edge GPU 上 projection、排序之后的 Gaussian rasterization 往往占主要运行时间；而该阶段与 triangle rasterizer 都是在 tile 中迭代 primitive、向像素写入覆盖与属性，只是覆盖测试和归约不同。
+
+因此作者在 Graphics Processing Cluster 内增强既有三角形 rasterizer，而非另造完整 3DGS 加速器。tile buffers、控制器、存储接口以及大量加法器/乘法器由 triangle path 与 Gaussian path 共享；每个 processing element 另加 Gaussian-specific 的概率密度计算逻辑，例如 exponentiation，并用 mux 与 input gating 在 triangle/Gaussian 两种模式间切换。三角形的深度最小值选择不能直接用于 3DGS：后者要对同一像素的深度有序高斯计算密度、遮挡和 alpha 累积，故 PE 的 reduction path 也扩展为该 compositing 操作。
+
+调度仍是 CUDA 协同式：CUDA cores 为一张图完成 3D-to-2D projection、预处理和排序，把 rasterization 交给 GauRast；在其运行时 CUDA 可开始下一张图的前两阶段，形成流水。论文用 RTL 原型和周期精确模拟评估，意味着该结果描述的是对 GPU 固定功能单元的设计修改，不是能通过普通 CUDA 安装到现有显卡的软件库。其价值在于以小幅硬件增量复用三角形数据通路，同时保留传统网格 rasterization 兼容性。
+
+% METHOD: 2503.18682
+\paragraph{Hardware-Rasterized Ray-Based GS：将 RayGS 求交量映射到图形管线（2025）\cite{2503_18682}}
+该工作~\cite{2503_18682}保留 RayGS 沿每条相机射线求高斯最大密度点的定义，却将其改写为可由标准 hardware rasterization shader 计算的量。标准 3DGS 用投影局部线性化，把高斯 support 近似为图像平面的椭圆；RayGS 则对方向 $x$ 使用 $\tau(x)=(x^T\Sigma^{-1}\mu)/(x^T\Sigma^{-1}x)$，在 $\tau(x)x$ 这个射线上的最大密度点计算 Mahalanobis divergence。后者减少投影近似伪影，但原 CUDA 实现的求值较慢。
+
+作者为每个 RayGS primitive 推导其 camera-specific support boundary，并在三维空间找包围该 support 的最小 quad；vertex shader 输出用于覆盖和插值的几何量，fragment shader 据此恢复射线上的 RayGS opacity，依旧做深度有序 compositing。关键不是将高斯退化成普通屏幕椭圆，而是让 quad 覆盖 ray-based support，使图形管线能并行产生所需 fragments。该渲染路径面向已经训练好的 RayGS 模型，因而通常不保留训练时的可微 rasterizer。
+
+论文还处理训练与测试采样尺度不一致导致的 MIP aliasing。它把三维高斯在垂直该射线、穿过最大密度点的平面上边缘化为二维高斯，再做局部平滑来近似像素面积积分；归一化同时针对 RayGS 的射线方向推导高效近似。结果是 RayGS 的精确射线评估与硬件 rasterization 的高帧率结合，但其适用性仍受图形 API、pinhole 相机和近似的 quad/support 构造约束。
+
+% METHOD: 2503.24366
+\paragraph{StochasticSplats：用随机透明度估计替代全局排序（2025）\cite{2503_24366}}
+StochasticSplats~\cite{2503_24366}针对 alpha compositing 的排序瓶颈。传统 3DGS 将穿过像素的高斯按中心深度排序，并计算 $\sum_i c_i\alpha_i\prod_{k<i}(1-\alpha_k)$；排序成本与需要渲染的像素数无关，因此难以用较低质量换取更低代价，也无法表达同一对三维基元在不同像素交错的次序。
+
+方法采用 stochastic transparency 的 Monte Carlo 解释：每个 fragment 按其 opacity 概率随机接受为完全不透明样本，否则 discard；深度测试在任意 primitive 输入顺序下保留最近被接受者。等价地，算法按 alpha-blending 的 summand 权重 $P(i)$ 抽样 Gaussian $i$，单样本颜色是 $c_i$，多次独立 sample-per-pixel 平均得到无偏颜色估计。因此渲染时不作全局排序，可通过 SPP 在噪声与成本之间调节，并以 OpenGL shader 利用硬件深度测试。
+
+训练需要处理二元随机决定的导数。论文从 alpha-blending 的梯度构造 detached Monte Carlo estimator：不对抽样概率本身求导，sampled Gaussian 接收颜色梯度，sampled 及其前方高斯接收 opacity 梯度。为降低损失梯度与渲染梯度共享随机数导致的偏差，先渲染一张图计算 loss gradient，再用不同 seed 渲染 decorrelated 图，最后以相同 seed replay 以回传参数。为减轻 mean-depth billboard 的 popping，方法把 billboard 定向为最大密度面的平面近似；高质量模式还可按 Beer--Lambert extinction 抽样 free-flight distance，并在重叠高斯间取最小值完成 volumetric intermixing。随机估计的代价是低 SPP 的噪声，且任意非 $L_2$ 损失的完全无偏梯度并非论文声称已解决的问题。
+
+% METHOD: 2505.19564
+\paragraph{K-Buffers：以多层 z-buffer 的潜在特征融合增强点渲染（2025）\cite{2505_19564}}
+K-Buffers~\cite{2505_19564}处理 rasterization-based neural point fields 及 3DGS 的一个信息损失：常规 depth test 只保留每像素最近点，点云噪声、孔洞或遮挡时该单层描述不稳；直接将多层点颜色按体渲染合成会过拟合、占用大量显存。方法因此保留 $K$ 个深度层，却在 feature space 而非 z-buffer/颜色空间融合。
+
+具体地说，depth test 期间记录前 $K$ 个 z 值；从每层的相机位置、射线方向和深度查询/编码 neural point，得到 $K$ 张 pixel-wise feature maps。为避免一个三维点 splat 到许多像素时反复产生多个 queried points，论文选择该点覆盖像素中最小 ID 的方向作为编码代表，从而削减待编码点数；另有 feature correction 以弥补这一压缩带来的损失。随后 K-Feature Fusion Network 以两层卷积、激活和 softmax 预测 $[0,1]$ 的逐像素权重，将多张 feature map 融合并去噪，最后由 decoder 生成颜色图。
+
+训练/推理的关键区别于 NeRF 式多样本体渲染：KFN 学的是各层潜在描述的选择与融合，而非假定这些层的颜色/密度可直接 alpha 累积。该设计可接入 neural point fields 与 3DGS 的 rasterization 输出，但 $K$、查询点压缩与轻量 KFN 构成质量、内存和速度的取舍；它不消除输入点云本身的几何错误。
+
+% METHOD: 2604.02120
+\paragraph{GEMM-GS（2026）\cite{2604_02120}}
+GEMM-GS不改变高斯、深度排序或 alpha 合成的数学结果，而是把其中最耗时的二维 Gaussian 指数计算组织成 Tensor Core 擅长的矩阵乘法。常规 renderer 在每个 tile 的每个像素、每个已排序 Gaussian 上单独计算二次型 $power_{ij}$；这些标量乘加使现代 GPU 的 GEMM 单元闲置。
+
+方法在 tile 内选一个参考像素，将任意像素坐标拆成参考位置加固定的相对偏移。这样每个 Gaussian 的协方差逆、中心偏移等可组成一个六维向量 $v_{g_i}$，每个 tile 像素的相对坐标与常量组成六维向量 $v_{p_j}$，二次型便成为两者的点积。像素向量只依赖 tile 内位置，可离线预计算并复用；每个 Gaussian--tile 只需构造一次 Gaussian 向量。对于典型 $16\times16$ tile，将一批 Gaussian 向量和全部像素向量堆叠为矩阵，即可用 batched GEMM 同时得到整批 $power_{ij}$，再按原本的排序 alpha 合成颜色。
+
+实现维持每 tile 一个线程块、顺序处理已排序 Gaussian 列表，但以三阶段双缓冲和异步内存拷贝重叠属性加载、向量构造与 Tensor Core GEMM；共享内存限制下再把矩阵分成小批。它是对 blending 计算形式和内核调度的等价重排，因而可叠加剪枝、压缩或更精确 culling。收益依赖有可用 Tensor Core 的 GPU、tile/batch 形状和 blending 在总时延中的占比；如果瓶颈移到排序或前处理，单独改写指数计算的收益会受限。
+
+% METHOD: 2604.27437
+\paragraph{Softmax-GS（2026）\cite{2604_27437}}
+Softmax-GS追溯标准 splatting 的排序依赖：从体渲染式化到 $\sum_k c_ka_k\prod_{j<k}(1-a_j)$ 时，推导假定裁剪 Gaussian 沿 ray 的支撑不重叠，并忽略自遮挡。真实相邻表面常有重叠；一旦相机旋转改变两个相近高斯的排序，固定顺序合成会产生跳变。方法不直接删掉深度顺序，而是在近距离重叠时让 Gaussian 竞争其吸收量，并在远离时恢复普通合成。
+
+对重叠高斯的指数 $p_k$，竞争权重为 $w_k=\exp(\beta p_k)/\sum_j\exp(\beta p_j)$。$\beta$ 小时趋向平滑混合，大时趋向 winner-take-all 的清晰边界。精确地把 $w_ko_k$ 沿 ray 积分会失去实时性，故实现先在屏幕空间 absorbance 上近似：对两个 splat，将 softmax 后 absorbance 与原 absorbance按 $\exp(-\gamma|d_j-d_k|)$ 插值。也就是说，深度很近时使用竞争结果，深度分开时迅速回到普通 $a_k$。渲染按近到远线性扫描，将已处理基元聚合为一个“past”状态，与当前基元做同样的二者竞争。
+
+这种更新若直接使用会使后处理者被前者额外折扣，并改变原有透射率。Softmax-GS显式求两项的修正 absorbance，使竞争比例保持对称且乘积透射率等于原始 $T_k$，插值后再用缩放因子恢复该透射率，因而相同深度的两个高斯不会因处理次序得到不同颜色。单高斯边界锐度由 generalized exponential function 控制：以 $\|\cdot\|^{2\alpha}$ 替代普通二次距离，但不改参与 softmax 的指数 $p$。该方法只在每 patch 最靠前的有限个 Gaussian 上缓存中间状态以维持线性反向传播；近似在强竞争/近似排序条件下更可信，重叠很复杂或缓存窗口外的相互作用仍有近似误差。
+
+% METHOD: 2605.04844
+\paragraph{QuadBox（2026）\cite{2605_04844}}
+QuadBox只替换 rasterizer 的 Gaussian--tile 相交阶段。投影后的各向异性椭圆通常用一个保守轴对齐框列出 tile，长而倾斜的椭圆会让许多根本不含有效 alpha 的 tile 进入复制、排序与混合。方法的目标不是更改高斯的颜色或 alpha 公式，而是以更贴合椭圆的整数可遍历区域减少后续工作。
+
+对通过 opacity 阈值的二维 Gaussian，DualBox先围绕其主轴构造两组轴对齐框，捕捉沿长轴的有效支撑；QuadBox再依据椭圆方向和偏心率对这些框自适应延伸，最终以四个 AABB 的并集近似倾斜椭圆。比起单一外接矩形，该并集保留椭圆内的主要投影区域，同时剔除远离长轴的角落 tile。它仍是保守覆盖而非逐像素椭圆测试，因此不会因过度裁剪丢失有效贡献。
+
+QPass利用四个框在 tile 网格上的离散范围做整数区间遍历：对每个 tile 行/列只判断预计算的边界区间，避免对每个候选 tile 执行浮点椭圆相交和大量分支。得到的 tile--Gaussian 列表继续走原始深度排序和 alpha blending，训练和场表示均不变。收益随投影椭圆的倾斜、细长程度和预处理占比而变化；若场景主要由近圆高斯或后续排序才是瓶颈，紧框带来的提升会较小。
+
+% METHOD: 2606.00352
+\paragraph{HiGS（2026）\cite{2606_00352}}
+HiGS从 GPU 工作划分重构 3DGS rasterizer：传统实现用同一小 tile 同时 binning、排序和 blend，密集区域会把大量基元集中到少数 tile，而细 tile 的独立排序/调度又产生额外开销。HiGS将“决定哪些高斯归属一块”和“每个像素怎么混合”拆为宏 tile 与更小 render tile 两层，使一个处理单元能在宏块内按高斯批次并行服务多个细 tile。
+
+前端把相机变换、二维协方差、视向和三阶 SH 评估融合成单一核，并产生可见性 bitfield。之后以 macro-tile 为单位两次分区：count pass 对每个高斯批统计命中的宏块，prefix sum 给出每个宏块的数量和写入偏移，fill pass 写入 $(depth,Gaussian\ id)$ 对。每个宏块的深度列表用按段 radix-sort cascade 排序：小段由不同容量 CTA 直接处理，超长段拆块后由常驻 kernel 和设备端 merge queue 合并，整个过程没有主机同步。
+
+宏 tile 内的细 render tile 并非各自重新读完整列表。CTA 的 warp 各对应一个 render tile，通过共享内存 ring buffer 批量取已排序 Gaussian；bitmask 转置后每个 warp 只处理与自己的细 tile 相交的条目。每个宏块批次先生成部分 RGBT 到全局 tile buffer，最后独立 compositing kernel 依宏块批次的深度顺序把这些部分结果前到后合成，并在 transmittance 饱和时提前结束。因而表示、排序语义和 alpha 合成未变，变化是多粒度工作队列、内存格式与异步调度。实现针对现代 NVIDIA GPU 的共享内存、fp16 和 warp 行为优化，收益依赖硬件架构、场景密度和宏块负载均衡，不能视为训练或模型压缩方法。
+
+% METHOD: 2407.07090
+\paragraph{3D Gaussian Ray Tracing（2024）\cite{2407_07090}}
+该工作用 OptiX ray tracing 取代屏幕空间 tile splatting，目标是更一般地渲染体积粒子场景。每个 Gaussian 仍是可训练的各向异性透明粒子，但先进入 BVH：作者以按 Gaussian 协方差、均值和 opacity 自适应拉伸的正二十面体网格作 bounding proxy。相比宽松 AABB，这会减少 ray traversal 的假命中，同时利用硬件三角形相交。
+
+一条 ray 不是反复追踪单个最近粒子。ray-generation 程序每次从 BVH gather 一批相交 proxy，any-hit 程序将命中按距离维持有序缓冲；随后逐个取回真实 Gaussian，在沿 ray 响应最大的解析位置采样其密度和 SH 颜色并前到后累积，再从最后处理点继续追踪下一批，直至耗尽或透射率足够小。proxy hit 的顺序近似实际采样点顺序，是速度与严格排序之间的可控近似。
+
+反向阶段重新追踪相同 rays 与同一粒子次序，手写 OptiX 导数并以 atomic scatter-add 累积 Gaussian 参数梯度。训练仍采用 3DGS 风格的 prune、clone、split，但因 screen-space gradient 不再合适而使用 world-space 位置梯度，远处粒子梯度还按相机距离缩放；可见性权重用于达到粒子预算时剪枝。它的优势来自 BVH 和硬件 ray tracing，代价是依赖 OptiX/相交代理设计，并非原 rasterizer 上的局部替换。
+
+% METHOD: 2410.01804
+\paragraph{EVER：对常密度椭球做精确体渲染（2024.10）}
+EVER~\cite{2410_01804}用位置、旋转、尺度、常密度和颜色的椭球 mixture 表示场景，但不把它们投影成 3DGS billboard 后 alpha compositing。每条光线与椭球相交，按精确 emission-only 体渲染计算贡献；由此避免 rasterized Gaussian 的 popping 和视点相关密度，同时保留可微优化。输入是 posed images 与稀疏点云，优化椭球使渲染匹配观测；ray-tracing 路径也自然支持 defocus 和鱼眼等相机效应。代价是它不是 3DGS 的 tile rasterizer，实时性和适用场景受精确相交/体渲染开销约束。
+
+
+% METHOD: 2412.12507
+\paragraph{3DGUT：以无迹变换支持畸变相机与二次射线（2024.12）}
+3DGUT~\cite{2412_12507}替换标准 3DGS 投影中对相机变换的线性化近似。它用 Unscented Transform 传播 Gaussian 通过复杂、时间相关相机模型，因此可处理强畸变与 rolling shutter；同时直接在三维中按顺序评估 particle，使表示既可 splat 也可 trace，并与 3DGRT 对齐以支持 traced secondary rays 的混合渲染。代价是更一般投影/排序路径而非原 EWA rasterizer 的最简近似。
+
+
+% METHOD: 2502.01157
+\paragraph{Radiant Foam：以 Voronoi 体单元作精确可微体渲染（2025）\cite{2502_01157}}
+Radiant Foam~\cite{2502_01157}从根本上替换了 3DGS 的椭球 splat 与 alpha compositing：场景由一组 Voronoi sites 诱导的凸体单元表示，每个单元存常数密度和辐射；沿视线对这些单元的分段体渲染是精确的，而非 NeRF 式采样近似。其目标是保留可微优化和高效 GPU 渲染，同时把表示改成能自然进行射线-体单元遍历的形式。
+
+具体而言，sites 的 Delaunay 三角剖分给出 Voronoi 图的对偶；第 $i$ 个 cell 是离第 $i$ 个 site 最近的三维点集合。论文选择 Voronoi 而不是直接在 Delaunay 四面体上存场：Delaunay connectivity 翻转会造成离散变化且四面体数可变，而 Voronoi 翻转恰在受影响面面积为零时发生，因此连续场对 site 位置仍连续；同时 cell 数始终等于 site 数，故每个 cell 都能稳定绑定密度和辐射。渲染时，改造通用凸 cell 光线追踪，使它预取邻接顶点并逐面求交；按深度获得射线内常值段后，透射率乘积与段内密度、长度和辐射给出颜色累积。
+
+训练从 COLMAP 稀疏点初始化 sites。重建损失对 site 位置的梯度范数乘以 cell 近似半径，作为 underfit cell 的致密化分数，并按该分数的 multinomial 分布采样候选；这样优先在几何或光度细节不足的地方加 site。剪枝不能只删零密度 cell，因为近空 cell 仍可能界定物体边界，所以仅当一个 site 密度很低且其邻居也低时才移除。总目标为 RGB 的 $L_2$ 重建损失加一项沿射线权重分布的 quantile regularizer；后者与 distortion loss 同样促使密度集中到表面、抑制 floater，但避免二次嵌套求和。论文实现了 CUDA 的光线追踪和三角剖分；它说明无需专用 ray-tracing hardware，但表示的动态拓扑和体单元维护仍是相对 3DGS 的工程代价。
+
+% METHOD: 2503.12284
+\paragraph{REdiSplats：以扁平高斯的网格近似连接编辑与光线追踪（2025）\cite{2503_12284}}
+REdiSplats~\cite{2503_12284}希望让 Gaussian 资产同时能被传统网格工具编辑、进入物理模拟，并以光线追踪处理阴影、反射与变化光照。它采用扁平高斯：将一个尺度轴压到零，把基元视为局部平面上的椭圆；随后以嵌入该局部坐标系 $OY$--$OZ$ 平面的多边形网格逼近该椭圆，而不是继续只依赖屏幕空间 rasterization。
+
+论文采用八边形作为效率和近似质量的折中。网格顶点由高斯局部框架与椭圆半径生成，因而一条射线与这个平面多边形求交就可确定对应高斯及其局部距离；该距离再与学习的 opacity 和高斯密度峰值结合，得到 ray-based alpha。命中的扁平高斯按射线深度排序，沿射线以透射率加权聚合颜色；训练与推理均把这一路径接入可微渲染，并通过 NVIDIA OptiX 执行求交。与 3DGRT 用三维包围代理再估计高斯响应不同，这里网格是对扁平基元本身的近似。
+
+编辑时移动多边形顶点即可改变底层高斯；为避免任意拖动破坏多边形结构，作者从选定的顶点对恢复尺度与方向等高斯参数。相同网格还能被导出到 Blender 或 Nvdiffrast 并由物理引擎驱动。代价是该方法将表示限定为扁平基元并依赖 OptiX 光追路径；它并非对一般三维各向异性高斯的无损网格转换。
+
+% METHOD: 2507.19718
+\paragraph{GSCache：以分层 Gaussian cache 近似体路径空间辐射（2025）\cite{2507_19718}}
+GSCache~\cite{2507_19718}不是以 3DGS 重建摄影场景，而是在 volume path tracer 内缓存不同 path length 的辐射。它将所有长度为 $n$ 的路径贡献视为 path-space 子集，第 $n$ 个 cache level 用一个三维 Gaussian 点云保存该子集辐射；每帧先 splat 各 level 为 cache image 给 path tracer 查询，再以当前路径样本通过梯度更新 cache。
+
+初始化从体数据与 transfer function 中随机追踪射线，delta tracking 找到首次有效 volume interaction 后记录位置与 albedo。该点云复制到多层，后层按指数下采样；kNN 距离给 isotropic Gaussian scale，过大邻域尺度经 z-score 截断并整体缩小以稳定噪声样本的优化。因而 cache 的位置分布跟随实际 density/transfer-function 可见区域，而非从多视图 RGB/SfM 初始化。
+
+路径端以 NEE 估计每顶点直接光，用当前 throughput 的 luminance 与用户系数 $C$ 决定是否 early terminate 到对应深度的 cache。自然终止时，若路径贡献为零则以 cache 代替；early termination 采用类似 Russian roulette 的 importance correction。cache miss 时调整后续 throughput；cache hit 时还必须除以此前各层未命中概率连乘 $\beta$，否则预衰减 cache radiance 会使图像变暗。$C$ 因而控制速度、方差与偏差的取舍。方法需要 cache 初始化和在线训练，且固定 cache 大小对 transfer function/场景变化需要重新初始化或适应；它的收益主要在低 SPP 的科学体 path tracing，而非标准 3DGS alpha rasterization。
+
+% METHOD: 2603.23637
+\paragraph{Stochastic Ray Tracing for 3DGS（2026）\cite{2603_23637}}
+该工作把 3DGS 的沿光线合成改写为随机估计问题，目标是避免为每个像素显式排序所有相交 Gaussian。标准前到后 alpha 合成的可见性依赖有序列表；已有 Gaussian 光追若保留这一列表，排序与交点管理仍是主要代价。方法从每条 ray 关联的基元中随机抽样少量项，构造像素颜色及其反向梯度的无偏 Monte Carlo 估计器。
+
+训练或渲染时，采样器以随机子集估计该 ray 上的 Gaussian 贡献，而非遍历完整排序集合；因此计算量由每条 ray 的样本数而非所有潜在交点主导。估计器保持可微，能直接参与对位置、协方差、opacity 和外观的重建优化。它不是把光线上的遮挡简单删去，而是将遮挡/透射率的累积用随机过程估计，所以样本数不足会带来方差，需以多次迭代或合适采样来换取稳定性。
+
+同一 ray-based 公式还用于可重光照高斯场：直接着色可从逐 Gaussian 材质/光照属性求出，阴影 ray 则以相同随机机制测试遮挡，而不依赖栅格化 shadow map 或延迟合成近似。于是主 ray、阴影与反射路径共享一套可微估计框架。相对于排序 rasterizer，它的优势是将排序瓶颈替换为可控采样；代价是随机噪声、对采样分布的依赖，以及复杂照明下可能需要更多 ray 样本。
+
+% METHOD: 2606.00817
+\paragraph{Directed Distance Fields（2026）\cite{2606_00817}}
+Directed Distance Fields（DDF）把训练完成的 Gaussian 场转成辅助的 ray-query oracle。3DGS rasterizer 高效回答主相机的一整幅图，却不能自然求阴影、环境光遮蔽等二次 ray；直接为每个 Gaussian 建 BVH 的时间和内存随基元数增长，SDF 虽紧凑但一条 ray 要反复 sphere tracing。DDF输入 ray 起点 $\mathbf x$ 与方向 $\mathbf d$，一次网络前向输出首表面沿该方向的距离和命中/可见性。
+
+流程先由多视图图像拟合外观 Gaussian 场，再用几何监督训练小型 neural field。论文区分两种监督：从高斯渲出的深度在薄部件处本来已被 splat 平滑，作为目标会让 DDF 学到模糊几何；用 ray-cast 的干净距离或由神经表面产生的清洁距离，才能让目标保留薄结构。因而 DDF不改原始 Gaussian 参数，也不以其渲染深度为唯一“真表面”，而是将 appearance 场和几何 query 场分工。
+
+部署时新 ray 不遍历 Gaussian 或网格，只做一次 hash-grid/MLP 查询，故模型大小与单次查询成本不随高斯数增长。主视图外观仍可由 3DGS rasterization 输出；需要全局光照时，DDF提供二次 ray 的距离/遮挡用于阴影、AO 等。该常数时间表述针对每条网络查询，并不意味着训练免费或所有 ray 起点都可靠：监督表面过平滑、远离训练表面的起点及复杂薄几何都会限制 oracle 的准确性。
+
+% METHOD: 2606.30869
+\paragraph{GRay（2026）\cite{2606_30869}}
+GRay追求直接 ray trace 三维 Gaussian、但把速度拉近 splatting。两种 renderer 的瓶颈并不相同：tile rasterizer 对一个 tile 中的每个高斯、每个像素都做投影评估，基元很小且很多时会有大量无效工作；ray tracer 通过 BVH 只评估实际与 ray 相交的高斯，成本更接近真实交点数量。论文的反直觉观察是，许多小高斯会拖慢 rasterization，却能因减少每 ray 相交数而帮助 ray tracing。
+
+因此 GRay用 dense initialization 取代稀疏 SfM 初始化加长期 clone/split：先由密集匹配网络在相邻参考图之间求对应，再以已知相机三角化出覆盖可见表面的海量小高斯，之后不依赖传统致密化。对 ray tracer，论文在 3DGRT/EPBRR 的基础上调整 Gaussian 代理包围、BVH traversal、per-ray accumulation 和透明度处理，并配合更适合 dense-initialized 场的 pruning、学习率和正则调度。它仍从每条 ray 的相交列表按深度累积 Gaussian 贡献，不是把光追改成无序加权合成。
+
+训练时 DI 在起点即给出高密、小尺度表面覆盖，ray tracing 只对真正交叉的子集做工作；而 tile rasterizer 即使小高斯只覆盖 tile 的少数像素，也会在该 tile 的全部像素上测试它。GRay由此把“更多高斯一定更慢”的经验改为依赖 renderer 的复杂度判断。其目标是接近 splatting 的速度，代价是相较标准 3DGS 可有质量折中，并且需要 BVH/硬件 ray-tracing 管线；在大投影高斯、交点很多或不适合 DI 的场景中，交点选择的优势会减弱。
+
+% METHOD: 2607.01290
+\paragraph{AnchorSplat（2026）\cite{2607_01290}}
+AnchorSplat是 source-free 的 3DGS 资产超分：输入已经存在但低质量的 Gaussian asset $\mathcal G_{low}$，一次前向生成更稠密的 $\mathcal G_{high}$，不重新访问原始多视图照片。直接让全局 decoder 从每个点特征生成任意位置的新高斯会失败，因为一个局部特征会收到来自所有视图、任意像素的混杂梯度，最后常出现模糊几何和混乱颜色。
+
+方法先以 3DGS feature encoder 在每个输入中心 $\mu_j$ 处提取局部描述 $f_j$，再以 Point Anchor Mechanism 限制第 $j$ 个 decoder 输出的位置：$\mu'_{j,k}=\mu_j+\epsilon\tanh(\Delta\mu_{j,k})$。即每个 anchor 只能在自身邻域生成高斯，故其生成基元只投到对应的局部像素集合，远处像素对 $f_j$ 的渲染导数严格为零。这个几何约束将跨视图梯度对齐到同一局部三维区域，而不是仅在损失中事后惩罚不一致。
+
+Equivalent Densification Mechanism 用 decoder 的固定 $1\!\to\!K$ 映射替代迭代 ADC：从 $f_j$ 同时预测局部偏移、颜色、尺度、旋转和 opacity。输出的近零 opacity 充当连续、可微的隐式 pruning；非零的多个输出则是单次 cloning/splitting 的等价物。训练集提供 $(\mathcal G_{low},I_{HR})$ 对，生成资产经标准 differentiable rasterizer 得到图像，用 $L_1$、$1-SSIM$ 和 VGG 感知损失反传训练编码器/decoder。因而它合成的是数据分布学习到的高频资产细节，严格 source-free 时无法凭空验证不可见真实纹理；锚定半径和每 anchor 输出数也限制了可恢复的几何尺度。
+
+% METHOD: 2404.03202
+\paragraph{OmniGS（2024）\cite{2404_03202}}
+OmniGS 将 3DGS 从针孔相机推广到单张 equirectangular 全景图的重建与渲染。它保留每个 primitive 的位置、旋转、尺度、opacity 和 SH 颜色，以及 tile-based alpha blending；改变的是 camera projection、协方差 Jacobian、深度排序与反向梯度，而不是把全景图当作普通大幅 pinhole 图像。
+
+相机坐标中的三维中心先被映到单位球的 longitude 和 latitude，再线性映射到等距柱状图的二维像素坐标。局部仿射投影的 Jacobian 由这套球面坐标映射导出，并与相机旋转和三维协方差相乘，得到投影二维 Gaussian 的协方差。由于全景相机没有唯一的前向 $z$ 深度，候选 Gaussian 以相机中心到 Gaussian 核心的径向距离排序，然后按同样的 alpha compositing 合成；tile 内仍先投影、复制覆盖实例、排序并在透射率达到阈值后早停。
+
+训练继续最小化渲染 equirectangular 图与真值的像素/结构相似损失，但中心、旋转、尺度的梯度需穿过 latitude/longitude 投影与新 Jacobian，论文显式替换这些导数。方法的适用性来自相机模型，不能由原 pinhole 公式直接得到；极区畸变、经线接缝以及 equirectangular 采样不均匀性仍是该投影表示的固有限制。
+
+% METHOD: 2409.04751
+\paragraph{Fisheye-GS（2024）\cite{2409_04751}}
+Fisheye-GS 将 3DGS 的针孔投影替换为等距鱼眼模型。它保留 preprocess、tile binning、depth/tile radix sort 和 rasterization，只在 preprocess 中替换 Gaussian 均值的投影、二维协方差的 Jacobian，以及这些量的反向导数，因此是面向相机模型的轻量模块而非新表示。
+
+前向中相机坐标均值经 equidistant projection 映到像素；投影 Jacobian 与相机变换、三维协方差相乘形成二维协方差。反向中，均值梯度通过该 Jacobian 回传，相机坐标和协方差梯度还需包含 Jacobian 对三维位置的导数。色彩和 opacity 不依赖投影模型，沿用原始路径。方法适用于所假设的鱼眼标定；模型误差或极端边缘的投影畸变不会被 Gaussian 优化本身消除。
+
+% METHOD: 2410.20686
+\paragraph{ODGS：面向全向相机的 Gaussian 投影与重建（2024.10）}
+ODGS~\cite{2410_20686}处理全向图像而非针孔图像：标准 3DGS 的局部透视 Jacobian 与椭圆 splat 假设在全向投影下不再直接成立。论文据此重新推导 omnidirectional camera 下三维 Gaussian 到图像域的 rasterization，并以该投影模型对位置、颜色、尺度、旋转和 opacity 做光度优化。它的改动位于相机模型和投影/协方差路径，不是将全景切为若干透视图后缝合；适用边界是所采用的全向成像标定模型。
+
+
+% METHOD: 2412.06250
+\paragraph{Splatter-360：宽基线全景的前馈 Gaussian 解码（2024.12）}
+Splatter-360~\cite{2412_06250}直接输入宽基线 ERP 全景，避免将其转换为透视图造成的信息损失。双投影编码器并行处理 ERP 与 cubemap：Unimatch CNN 和 cross-view attention 提取跨视图特征，cubemap 分支还注入 DepthAnythingV2 单目深度特征；融合后在球面空间构建 cost volume，对数采样深度候选并以球面投影做跨视图 correlation，再由 U-Net 细化深度。最后 Gaussian decoder 将每像素特征和球面深度解码为 pixel-aligned primitive，执行标准 splatting。
+
+其关键是将多视图匹配放在球面域，以避免平面 sweep 在源相机后方采样错误特征。方法的泛化能力依赖全景位姿、宽基线匹配和预训练深度先验；遮挡和无纹理区仍是由 cost volume/单目先验共同决定的歧义来源。
+
+
+% METHOD: 2412.12096
+\paragraph{PanSplat：面向 4K 全景的球面 Gaussian 金字塔（2024.12）}
+PanSplat~\cite{2412_12096}是两张 posed 宽基线全景的前馈模型。它不用 pixel-aligned Gaussian，而用 Fibonacci lattice 在球面更均匀地布置 primitive，降低极区冗余；四层 spherical Gaussian pyramid 以不同密度表达粗到细的细节。FPN 与跨视图 Swin attention 建立特征金字塔，最粗层球面 cost volume 以 inverse-depth candidates 匹配并融合单目深度特征，逐层缩小深度搜索范围细化几何。
+
+各层 Gaussian head 从 cost volume、图像和特征预测中心、opacity、协方差、颜色，并由跨层 residual 连接强化 coarse-to-fine 依赖。渲染采用六个 $90^\circ$ cubemap faces 再可微拼回全景。为训练 4K，先无梯度渲染全图并缓存像素梯度，后按 face 回传至 Gaussian、按 tile 重生 Gaussian 并回传网络；这是一种两步 deferred backpropagation。该设计以球面几何和内存分块为核心，质量仍受两视图覆盖、cost volume 深度歧义和 cubemap 拼接路径限制。
+
+
+% METHOD: 2511.06457
+\paragraph{Inpaint360GS（2025）\cite{2511_06457}}
+Inpaint360GS处理 $360^\circ$ 场景中的对象移除：难点不是单视图补色，而是先确认跨视图的同一对象、找出移除后真正未见的区域，再把二维生成结果稳定地写回高斯场。它先用 RGB 序列训练高斯辐射场，并从每个视图取得二维分割建议；高斯的常规位置、尺度、旋转、opacity 和 SH 颜色仍由 alpha 合成渲染。
+
+为获得跨视图一致的对象 ID，Key Object Management System 维护“对象 ID 到高斯集合”的数据库。每一视图中，投影到二维掩码内的高斯先用 $K=2$ 的空间聚类分开前景与背景，只把更靠近相机的一簇归给该掩码；随后以两个高斯索引集合的 GS-IoU 与数据库条目匹配，超过阈值则继承已有 ID，否则新建对象。该关联只提供噪声较小的二维监督：每个高斯再学习一个特征向量，按 alpha 权重合成为像素特征，经线性层和 softmax 预测对象类，用交叉熵监督，同时以邻近高斯特征相似性作空间正则，从而把 ID 蒸馏进三维场。
+
+用户选定对象后删除其高斯。系统对准对象中心生成一条 PCA 对齐的环形虚拟轨迹，沿轨迹从残余高斯场渲染 RGB 和深度，并从这些连续视图取得未见区域掩码；这比只在原始离散训练帧上补洞拥有更多遮挡处上下文。二维阶段首先修第一帧，之后把前一帧的修复结果和当前帧共同编码、在特征空间优化再解码，递归条件化以保持相邻视图纹理连续。深度也由高斯 alpha 合成得到并补全，和修复 RGB、掩码一起反投影为未见区域点云以初始化新高斯。
+
+最后不是冻结所有未遮罩基元、只优化洞内高斯，而是采用局部与全局混合监督：遮罩区域的 $L_1$ 和 LPIPS 对齐修复参考图，整幅图的 D-SSIM 约束结构和边界过渡。这样二维补全提供内容先验，深度初始化给出写回三维的位置，3D 优化再通过标准渲染把结果传播到新视角；其效果仍会受最初分割关联、深度补全和大遮挡区域二维生成的可靠性限制。
+
+% METHOD: 2603.05882
+\paragraph{CylinderSplat（2026）\cite{2603_05882}}
+CylinderSplat是从单张或稀疏、有位姿的全景图直接预测 Gaussian 场的前馈方法。它针对两个缺口：像素反投影只覆盖实际看见的表面，稀疏基线下会留下洞；常规 Cartesian triplane 又与 $360^\circ$ 图像的环向结构不对齐，容易在全景几何上产生失真和混叠。
+
+像素分支先在每帧内部以 self-attention、帧间以 cross-attention 聚合多视图特征，因此输入视图数量可变，不依赖固定 cost volume。分支预测精化深度和像素特征，将每个全景像素反投影成特征点云，再解码为该处的 Gaussian 参数；这部分主要重建至少在一个输入视图中被观察到的区域。
+
+体积分支以每个相机为中心建立圆柱坐标的稠密虚拟体。其特征不显式存储 $\Theta\times Z\times R$ 体素，而压缩到三个正交平面 $(\Theta,Z)$、$(Z,R)$ 与 $(R,\Theta)$；查询三维圆柱坐标时从三平面采样并融合特征。该 cylindrical triplane 由像素分支特征初始化，并以 triplane attention 增强，用来预测/修正被遮挡或稀疏观测区域的 Gaussian，从而填补点云分支没有覆盖的部分。选择圆柱而非笛卡尔坐标是为了让环向全景与常见 Manhattan 式室内结构有更均匀的参数化。
+
+训练按课程分阶段建立像素几何、体积补全及两分支融合，最终以预测 Gaussian 的标准 rasterization 合成新全景视图并接受图像监督。两分支的分工也给出其边界：像素分支的细节依赖可见输入，体积分支对洞的内容是由数据先验补全而非额外观测；圆柱先验也更适合围绕相机的全景场景，而非任意拓扑。
+
+% METHOD: 2606.07932
+\paragraph{LEGS（2026）\cite{2606_07932}}
+LEGS是对重建损失的结构加权，而不改变 Gaussian 表示、可微 rasterizer 或致密化。它认为一阶梯度边缘只描述亮度斜坡，平坦区与轮廓/角点/细线在标准 $L_1$--D-SSIM 中贡献相近；相较 EGGS 的线性梯度权重，二阶 Laplacian 对高频局部结构更敏感。
+
+对每个训练图像 $F^i$，方法预先计算通道 Laplacian 的范数 $E^i_\Delta(u,v)$，再在当前视图内 min--max 归一化到 $[0,1]$。该图是固定的输入图结构先验，不随迭代高斯场改变。归一化响应经过候选非线性映射 $f_m$，得到 $\tilde E^i_{\Delta,m}$；最终像素权重为 $W^i_{\Delta,m}=1+\beta\tilde E^i_{\Delta,m}$。不同曲线可分别放大或压低弱、中、强响应，而 $\beta=0$ 恰回到无权光度训练。
+
+渲染图 $U^i$ 与真值的 $L_1$ 由 $W$ 逐像素重加权，再和原有 SSIM 距离组合成 $L_{LEGS}$。所以高 Laplacian 的轮廓和细节把更多梯度送给既有的 Gaussian 优化，低结构区域不再同等主导；原始 alpha 合成和各属性更新路径保持不变。它可替换其他 3DGS 变体的图像损失，但权重完全来自输入图，也会提升噪声、压缩纹理或错误边缘的影响，非线性曲线与 $\beta$ 需要根据数据分布选择。
+
+% METHOD: 2410.17932
+\paragraph{VR-Splatting：按中央凹视觉混合 Gaussian 与 neural points（2024.10）}
+VR-Splatting~\cite{2410_17932}以 VR 的 foveated rendering 为目标：中央凹区域需要高频细节，外围可用较低成本表示。它端到端从 SfM/MVS 相机和点云优化，将 Gaussian splats 与 neural point rendering 分工，结合更精细的外围渲染、加速的中央凹渲染及基于 fovea/边缘的融合函数。这样把 primitive 或像素预算集中到用户注视区域，而非整帧均匀提高密度。视觉质量随注视点估计、融合边界和外围降级策略变化，因而不是不带眼动条件的通用高保真替代。
+
+
+% METHOD: 2505.10144
+\paragraph{VRSplat：为宽视场头显整合无 popping 投影与单次 foveated rasterization（2025）\cite{2505_10144}}
+VRSplat~\cite{2505_10144}面向头显的两个具体失配：宽 FOV 放大标准 EWA 局部仿射投影在图像边缘的拉伸/云雾伪影，而头部微动会让 tile 内基于高斯中心的排序产生明显 popping；同时全分辨率双眼渲染对帧率要求很高。它使用紧凑 Gaussian 场景作为输入，论文用 Mini-Splatting，但声明该管线不绑定某一种重建器。
+
+其质量路径把 Optimal Projection 与 StopThePop 置入 3DGS CUDA renderer。前者将高斯投到相机周围单位球上不同的切平面，替代只在中心准确的单一像平面近似；后者依据每像素射线的高斯最大密度位置评估深度来稳定局部顺序。为让表示适应这两种评估，VRSplat 以一个已训练的紧凑场景为起点，按 StopThePop 深度与 Optimal Projection 重新 fine-tune Gaussian 参数，而不是仅在推理时更换 rasterizer。
+
+性能路径利用人眼中心/周边分辨率差异，却不分别启动多次 renderer。它在一轮 tile-based rasterization 中让不同 tile 以不同分辨率处理，单次 launch 完成 focus 与 peripheral 区域，减少预处理、排序、内存访问和 kernel launch 的重复。输出是面向头显的 foveated 图像；效果依赖 gaze/foveation 配置、紧凑模型和 GPU 预算。论文的定位是把已有质量技术与 VR 调度结合，非声称提出新的 Gaussian 表示或独立的全局排序理论。
+
+% METHOD: 2506.07069
+\paragraph{Neural Sorting 与 Axis-Oriented Rasterization：以学习的深度衰减近似排序（2025）\cite{2506_07069}}
+该工作~\cite{2506_07069}将 3DGS 排序的功能重新解释为“为每个高斯生成随深度下降的 transmittance/decay factor”。它以 weighted order-independent transparency 的归一化混合式 $C=\sum_iF(d_i)\alpha_ic_i/\sum_iF(d_i)\alpha_i$ 替代严格的前后排序，而不手工指定单调函数 $F$，改由一个极小 MLP 根据深度学习该函数。
+
+训练从正常排序 3DGS checkpoint 开始；每个高斯投影后将深度输入两层 MLP，MLP 使用 Leaky-ReLU 与 exponential 输出 $F(d_i)$，Gaussians 随即无需排序直接 tile rasterization。渲染图与真值按原始 3DGS 损失比较，反向同时更新 MLP 与 Gaussian 参数，但高斯学习率乘很小的冻结因子以缓慢适应新混合规则。论文发现只训练 MLP 不足以收敛，并关闭 clone/split，避免基元数量与拓扑突变破坏这一后训练过程。
+
+硬件侧将该 MLP 与 rasterization 共设计。axis-oriented array 将二维 conic 评估沿 X/Y 轴拆到专门 PE line，复用并减少每像素 MAC；同一可重构 $16\times16$ PE array 在 rasterization 与 neural sorting 两模式间切换。细粒度 interleaved pipeline 以 subtile 重叠当前 rasterization 与下一 subtile 的排序内存访问，$\pi$-trajectory tile schedule 提升 cache locality。由此，论文给出的核心产物是算法--专用硬件协同，而不是普通 GPU 上自动获得的无排序加速；学习的 $F(d)$ 也是对复杂遮挡的近似，质量依赖于从预训练 checkpoint 的适配。
+
+% METHOD: 2509.21702
+\paragraph{PowerGS：在质量约束下共同优化 3DGS 渲染与显示功耗（2025）\cite{2509_21702}}
+PowerGS~\cite{2509_21702}将 XR 的优化对象从单独 FPS/模型大小扩大到总功耗：渲染功耗由参与绘制的 Gaussian 数及 GPU 工作决定，显示功耗又受像素颜色/亮度影响，两者都可能牺牲质量。论文不假定渲染功耗对高斯参数可微，而把满足最低质量 $Q_{min}$ 的模型视作 display-power 与 render-power 平面上的 iso-quality curve，并在该曲线上寻找总功耗最小点。
+
+实现先从预训练 dense 3DGS 出发，以 pruning ratio $\rho$ 产生不同 rendering power 的候选；同时在训练损失中加入由权重 $\lambda$ 调节的 display-power 项，让颜色向更省电的显示状态偏移。通过调整 $\rho$ 与 $\lambda$，得到质量相近但显示/渲染功耗不同的少量样本。随后分别以 $\rho$ 参数化 display 与 rendering power，并重建凸的 iso-quality curve；论文采用逆 Michaelis--Menten 形式拟合饱和关系，因此给定曲线后最小总功耗点可闭式求出，而无需对不可微 power model 反传。
+
+该程序也可放入 foveated rendering，进一步降低周边渲染/显示负担。它的输出是针对具体场景、质量预算、显示器和渲染平台选择的 pruned/颜色优化模型，而不是通用的 3DGS densification 方法；拟合质量依赖实际 power 测量，显示 power 模型和感知质量约束的迁移性需要在目标 XR 硬件上重新验证。
+
+% METHOD: 2603.11531
+\paragraph{Mobile-GS（2026）\cite{2603_11531}}
+Mobile-GS把移动端瓶颈定位为 per-pixel 的深度排序和过大的高斯模型。它保留 Gaussian 投影，但将严格前到后 alpha 合成替成无需排序的加权累积：对落在同一像素的高斯，以 opacity、深度和尺度相关权重求颜色加权均值，再以全体 opacity 的透射率与背景混合。这样 rasterizer 不必生成或排序大量 tile--splat 深度对，换取的是对可见性顺序的近似。
+
+无序权重由基元深度、最大尺度及可学习的调制项共同决定：远处高斯被抑制，较大的投影高斯可获得更高影响，opacity 仍控制贡献和前景/背景透射率。为补偿无序混合无法自然表达的遮挡和视角相关外观，方法附加一个小型 MLP，以观察方向、Gaussian 几何和外观属性输出视角相关颜色/增强项；训练仍由渲染结果与参考图的重建监督驱动，同时学习这一补偿和权重相关参数。
+
+模型侧的压缩与渲染设计协同进行：先用低阶 SH 通过蒸馏保留原场的外观，再以神经向量量化编码属性，最后按渲染贡献剪去冗余基元。因而部署时既少做排序，也少传输和访问属性。与标准 alpha 合成相比，它不是几何上严格等价的透明度计算，复杂层叠、细小遮挡与补偿网络没有见过的视角仍是近似误差来源；它的目标是移动 GPU 的速度--质量--存储折中。
+
+% METHOD: 2406.00609
+\paragraph{SuperGaussian（2024）\cite{2406_00609}}
+SuperGaussian 把低质量三维表示的超分拆成“视频细化，再回写三维”两步。给定低分辨率 Gaussian splats、NeRF、网格或其他可渲染表示，它沿多条平滑、已知相机轨迹渲染相邻视角视频；预训练视频超分模型利用时序对齐产生高分辨率视频，随后再用这些帧和已知位姿优化一套新的 Gaussian splats。最终 3D fitting 的作用是消除视频网络遗留的跨帧不一致，而不是把每帧结果当成独立纹理。
+
+作者使用 VideoGigaGAN 作为实例化的视频上采样器，并为三维退化专门微调：从 MVImgNet 的图像构造低分辨率监督，拟合低分辨率 Gaussian、沿原轨迹重渲染，令该视频恢复到原视频尺度。微调损失组合 Charbonnier 回归、LPIPS 和 GAN 项，以适配 splat 放大时的条纹、块状等非普通双三次退化。对目标场景，每条轨迹的视频经上采样后成为高保真多视图监督。
+
+最后阶段按官方 3DGS 流程，以已知相机直接拟合 Gaussian 到恢复后视频，使用 $L_1$ 和 SSIM；论文实验采用有限迭代而不重新做 SfM。故它利用的是外部视频生成先验，能增加原低质量表示缺失的视觉细节，也会继承其可能的生成幻觉；三维重新优化和多轨迹覆盖是约束这些幻觉一致性的关键。
+
+% METHOD: 2406.10111
+\paragraph{GaussianSR（2024）\cite{2406_10111}}
+GaussianSR 从低分辨率多视图输入获得高分辨率 3DGS，但不要求成对高分辨率训练集。它先拟合低分辨率 3DGS，再以其初始化高分辨率 Gaussian；每次从该模型 render 高分辨率视图，送入预训练的二维超分 diffusion model，以 Score Distillation Sampling (SDS) 梯度把图像拉向“以对应低分图为条件的高分辨率”分布。同时把渲染图下采样并与输入低分图做 MSE，保证几何/颜色不因生成先验而脱离原观测。
+
+总优化由 SDS 和 sub-pixel MSE 构成，梯度经 differentiable rasterizer 更新 Gaussian。困难在于 SDS 随噪声时间步采样而高方差，原 3DGS 用固定位置梯度阈值的 split/clone 会把这种随机梯度误当成细节证据，制造冗余 Gaussian。为此，GaussianSR 逐步收缩 diffusion timestep 的采样范围以降低后期扰动，并在 densification 时随机丢弃部分冗余候选，以抑制由 SDS 方差引发的 primitive 爆增。
+
+它与 SuperGaussian 的区别是先验直接以 SDS 作用于 3DGS render，而非先生成整段视频再重建。其高频外观受 diffusion 条件分布强烈影响；MSE 只约束下采样一致性，不能单独证明每个生成细节在真实场景中存在。
+
+% METHOD: 2503.01774
+\paragraph{Difix3D+：将单步扩散修复器蒸馏回 3D 表示（2025）\cite{2503_01774}}
+Difix3D+~\cite{2503_01774}不改变 3DGS 的高斯参数化，而是针对远离输入相机、欠约束区域的伪几何和纹理伪影，训练一个可同时服务 NeRF 与 3DGS 的图像修复器，并把它同时用于重建和最终渲染。核心风险是直接逐帧扩散修复会破坏跨视图一致性；论文的答案是先用渐进轨迹生成、再把已修复视图蒸馏回三维表示。
+
+修复器 Difix 建立在 SD-Turbo 单步 image-to-image 模型上。输入是当前 3D 表示渲染的有伪影新视图和最近的干净训练参考视图；作者把自注意力改为 reference-mixing layer，将目标与参考沿 view 维度编码后，在合并的 view--spatial 维度上执行注意力，以从参考图像取回物体、颜色和纹理。VAE encoder 冻结、decoder 以 LoRA 微调；训练以退化渲染而非随机噪声为输入，使用重建 $L_2$、LPIPS 和权重为 $0.5$ 的 VGG Gram style loss。论文通过稀疏/循环重建、交叉相机与刻意 underfitting，构造“有 NVS 伪影的渲染--对应真值”训练对。
+
+在 3D 更新阶段，先由原始参考图优化表示；随后每 1,500 次迭代把真值相机位姿向目标位姿轻微扰动，渲染中间新视图，经 Difix 清理后加入训练集，再继续优化。逐步扩大相机偏移使扩散模型始终拥有可用的视觉条件，并让修复内容由三维表示吸收以改善多视图一致性。最终输出仍可再经过一次 Difix 后处理以消除残余模糊，但该步本身仍可能有轻微跨帧不一致；因此它是蒸馏后的补充，而非独立 2D 修复的替代。
+
+% METHOD: 2503.14171
+\paragraph{Gradient-Aware Upscaling：利用 3DGS 解析图像导数的样条上采样（2025）\cite{2503_14171}}
+该方法~\cite{2503_14171}不在三维空间增加高斯，而是改变 3DGS 的分辨率策略：rasterizer 在低分辨率输出颜色及其像素空间导数，随后用这些导数做可微样条插值到监督或显示所需的高分辨率。动机是普通 bicubic 插值只从邻近离散像素作有限差分估计斜率，容易产生阶梯或振铃；3DGS 的 Gaussian kernel 与前后向 alpha compositing 则允许解析计算连续图像的斜率。
+
+对每个像素，方法仍按深度合成投影高斯，但在合成循环内同时递推 $\partial I/\partial x$、$\partial I/\partial y$ 和混合导数。每项由高斯 opacity 的空间导数、当前 transmittance 的导数以及颜色组成；transmittance 用累计 alpha 的递推形式计算，因此不需要数值差分。上采样时，围绕目标位置的 $4\times4$ 邻域定义双三次多项式；经典方法放入有限差分导数，而这里把上述解析一阶与混合导数放入系数约束，求得样条并在任意子像素位置求值。
+
+训练时，低分辨率 splat 图及其导数经该插值器升到真值分辨率，图像损失从高分辨率输出反传，链式经过样条和解析梯度再更新高斯；低分辨率 rasterization 因此少生成 fragment。推理也可用同一流程。作者以 CUDA 手写前后向，并指出性能仍受全分辨率 SSIM 与上采样反传制约；方法依赖 3DGS 可高效求解析导数，且平滑样条不能恢复低分辨率中从未采到的锐利细节。
+
+% METHOD: 2506.07897
+\paragraph{GaussianVAE：把 Gaussian densification 谱系作为跨分辨率序列预测（2025）\cite{2506_07897}}
+GaussianVAE~\cite{2506_07897}把一个场景在多种训练分辨率下的 3DGS 重建视为同一 Gaussian 随 densification 演化的谱系，而非把低分辨率渲染做二维超分。预处理收集多分辨率重建，并为每个 Gaussian 追踪位置、尺度、旋转、颜色、球谐和 opacity 在各 densification 步的 lineage；目标是外推未训练分辨率的参数状态。
+
+模型是 transformer encoder--symmetric decoder 的 Hessian-aware VAE。encoder 以 Gaussian lineage 的时间序列做 self-attention，decoder 分开重建 geometry（位置、尺度、旋转）与 appearance（颜色、opacity），避免外观修正干扰几何稳定。训练时遮蔽多步谱系中的末端节点，要求模型预测缺失状态；采用 coarse-to-fine 日程，并以 densification 发生较多的区域作为 Hessian-inspired 优先对象。损失由 KL latent regularization、appearance MSE 和几何 Chamfer alignment 加权组成，论文还使用 cyclic KL annealing。
+
+最终模型作为已训练 3DGS 的后处理：不替换 splatting renderer，而是预测该场景在未见分辨率上的 Gaussian 属性，等价对缺失的参数演化做 inpainting。因而它需要多分辨率 3DGS 谱系作为训练信号，且对谱系变化很少、纹理同质的场景较难获益；论文所称“无高分辨率输入”指推理/外推阶段，并不意味着系统不需要预先收集低分辨率演化数据。
+
+% METHOD: 2506.09952
+\paragraph{UniPre3D：以 Gaussian image rendering 统一点云预训练尺度（2025）\cite{2506_09952}}
+UniPre3D~\cite{2506_09952}不是生成最终 3DGS 场景，而是把预测 Gaussian 并渲染新视图作为点云 backbone 的自监督预训练任务。其动机是 object point cloud 常用 masked generative reconstruction、scene point cloud 常用 contrastive learning，二者在任务难度和尺度上难统一；将三维特征映射到像素监督，使 Gaussian covariance 自适应小物体与稠密场景的点尺度。
+
+3D branch 将点云输入 backbone，轻量 Gaussian predictor 为每点输出 23 维属性，包括位置 offset、opacity、scale、quaternion 与 spherical-harmonic features；可微 splatting 在未用作参考的视角渲染图像，并以像素 MSE 监督。2D branch 用预训练 image model 提取 reference-view features，经轻量 adaptation MLP 后回投影到三维，再与 backbone 中间 feature 融合。object 场景没有深度，故把三维点投到图像网格、选每像素最小深度点做对应，在 decoder 末端 concat/MLP 融合；scene 场景有深度，则将像素反投影为 pseudo point cloud，与 encoder 早期的 3D points 合并并 voxelize，形成 point fusion。后者也提高 Gaussian primitive 数以应对稀疏大场景。
+
+为避免参考图直接泄露目标，rendered views 与 reference views 不重合；scene 还限制两者的视角间隔以令二维信息仍相关。object 训练对前景/背景 MSE 加权。该方法的产物是可迁移的 point-cloud backbone，Gaussian head 和 renderer 是预训练监督接口；它仍要求同时整理点云、相机、图像（场景还需深度），并且 object/scene 使用不同融合策略，因而“统一”并不等于完全相同的数据流程。
+
+% METHOD: 2512.02172
+\paragraph{SplatSuRe（2025）\cite{2512_02172}}
+SplatSuRe解决低分辨率多视图训练中“所有像素都用生成式超分图监督”会破坏跨视图一致性的问题。它的判断是：若某一表面在另一个相机中曾以更大的屏幕投影出现，低分辨率真值已经间接提供了该区域的高频证据，不应再强行注入超分细节；只有没有更高频观测的区域才主要依赖 SR。
+
+首先用低分辨率图像训练稳定的 3DGS。对每个高斯在所有可见训练视图计算未加 3DGS 抗锯齿膨胀的屏幕半径 $r_t^i$，以 $\rho^i=r^i_{\max}/r^i_{\min}$ 近似其跨视图采样频率，并经阈值和 sigmoid 映射为 $[0,1]$ 的 Gaussian fidelity score；可见少于三个视图的高斯分数置零。高分表示至少有某个视图提供较可靠的细节，低分表示任何视图都未充分采样，故更需要 SR。
+
+训练每一目标视图时，方法将这些逐高斯分数经 alpha splatting 渲染为权重图，并额外标出“本视图正好是该高斯最大半径视图”的基元。前一项强调低分、欠采样区域；后一项避免遗漏本视图已是最佳观测而其他视图更差的区域。归一化后的 $W_t$ 决定 SR 图像在每个像素的权重。高分辨率渲染 $R_{HR}$ 下采样后，以标准 $L_1$--D-SSIM 对齐低分辨率真值形成 $\mathcal L_{LR}$；它与 SR 图像之间的同类光度损失按 $W_t$ 加权形成 $\mathcal L_{SR}$，总目标为 $(1-\gamma)\mathcal L_{LR}+\gamma\mathcal L_{SR}$。
+
+这使最终高分辨率高斯场同时服从真实 LR 多视图约束和局部 SR 指引。与在整个图上替换真值的超分路线相比，它明确把生成细节限制在几何观测不足处；但 fidelity 分数依赖先训练的 LR 几何、可见性和半径估计，误判时仍可能把 SR 监督施加到错误区域。
+
+% METHOD: 2512.12898
+\paragraph{Queried-Convolution Neural Networks（2025）\cite{2512_12898}}
+Queried-Convolution Neural Networks（QNN）将 3DGS 的 splat 图像当作低频基底，再学习其缺失的高频残差。论文的出发点是，逐坐标 MLP 没有图像邻域归纳偏置；普通 CNN 虽可看邻域，却不知道其输出位置对应的坐标。QNN 把两类信息一起输入卷积，使预测同时依赖邻域的低频信号和显式查询位置。
+
+设低频近似为 $F_{LP}$，对一个查询像素，QNN收集其邻域的编码坐标与 $F_{LP}$ 邻域值，在通道维拼接后送入 CNN，输出残差 $\Delta F$，最终为 $F=F_{LP}+\Delta F$。在 3D 新视图合成中，$F_{LP}$ 就是标准 Gaussian rasterizer 生成的 splatted RGB 图，查询是二维图像坐标；网络一次处理完整图像，而不是像 NeRF 那样对每个像素多次查询。该结构也解释了它与两个退化情形的关系：去掉坐标会成为普通 CNN，去掉邻域/低频信号并以 MLP 逐点处理则回到传统 neural field。
+
+集成流程是先由 3DGS 正常渲染低频图，再将坐标与该图拼接进 QNN，得到三通道残差并相加。论文用与对应 3DGS baseline 相同的图像重建损失监督最终预测，并以端到端方式训练；其实现将 QNN 放在训练后段，避免一开始由不稳定的低频基底驱动残差网络。这里没有改变高斯的位置、协方差、opacity 或其前向 alpha 合成，提升来自一个可查询的二维卷积后处理器。该假设要求任务具备规则二维邻域，因此不适用于只有孤立射线、没有可卷积网格的查询场景。
+
+% METHOD: 2412.00155
+\paragraph{T-3DGS：由不确定性与时空 mask 排除视频 transient objects（2024.12）}
+T-3DGS~\cite{2412_00155}从含动态物体的无约束视频重建静态场景。它在标准 3DGS 上加入 reconstruction uncertainty predictor，以语义特征产生每像素 transient probability；随后由 transient mask refiner 使用 SAM2 在多帧间传播和修正 mask，使动态区域在空间、时间上更一致。被识别的区域不作为静态 Gaussian 的可靠重建监督，从而减少人车等短暂物体留下的浮点和拖影。其效果受语义识别与 SAM2 传播准确度控制，长期遮挡或持续动态区域不能凭 mask 恢复被遮住的静态几何。
+
+
+% METHOD: 2412.16619
+\paragraph{Topology-Aware 3DGS：以持久同调保护点云局部结构（2024.12）}
+Topology-Aware 3DGS~\cite{2412_16619}针对稀疏点初始化/插值破坏局部结构的问题。其 Local Persistent Voronoi Interpolation 在每点 kNN 邻域中比较插值前后的拓扑特征，依此在三维和二维 Voronoi interpolation 间自适应切换；生成的点补充 3DGS primitive，使增密不仅依赖像素梯度，也受持久同调意义上的结构完整性约束。它改善的是初始化/几何结构路径，效果受邻域、拓扑尺度与插值假设制约。
+
+
+% METHOD: 2503.17798
+\paragraph{GaussianFocus：patch attention、尺度约束与分块重建（2025）\cite{2503_17798}}
+GaussianFocus~\cite{2503_17798}针对两类问题：训练图像被逐点拟合时，过大的高斯可能形成冗余的“air wall”；而大场景一次装入全部影像和点云会超出显存。它保留原始高斯渲染，但从图像监督、尺度控制和场景组织三方面加约束。
+
+图像路径中，方法周期性产生 attention-enhanced 的 patch，并以 Sobel 在预测与真值的每个通道上计算 $x/y$ 梯度。edge loss 是两方向梯度的 $L_1$ 差，frequency loss 也以水平和垂直变化的差近似约束高频；二者与标准 $L_1$ 和 D-SSIM 合成总损失。论文设定中，attention-enhanced 图像每 50 次迭代用于对应的边缘/频率监督，其余迭代直接对渲染输出计算。高斯 sphere constraint 则在初始化和训练中限制 scale matrix，避免尺度无限膨胀而吞没结构。
+
+对大场景，先按 XYZ bounding boxes 切分点云；离 block 中心过远、会扭曲切分的稀疏离群点由距离迭代剔除。每个 block 收集相应的相机与 SfM 点，独立训练 3DGS，最后合并各 block 的 3D 文件。该办法降低单次训练的显存压力，也允许并行，但块边界、相机/点归属和最后合并的连续性是额外工程问题；它不等价于一个端到端联合优化的全局模型。
+
+% METHOD: 2503.18458
+\paragraph{StableGS：以双 opacity 路径隔离深度正则与外观拟合（2025）\cite{2503_18458}}
+StableGS~\cite{2503_18458}从 floater 的优化停滞出发：在多个视图中，半透明错误高斯的 alpha-blended 颜色可与背景误差近似抵消，使颜色损失对 opacity/几何的梯度接近零。直接对标准 3DGS 的最终输出施加强深度约束能推动错误几何，却会把有噪声的几何监督传到纹理、细结构和半透明外观，造成模糊。
+
+其 Dual Opacity GS 为每个高斯增加可学习辅助 opacity $\alpha'_k$。基础几何 opacity 是 $\sigma_k(x)$，只由原始 $\alpha_k$ 决定；最终渲染 opacity 是 $\sigma'_k(x)=\alpha'_k\sigma_k(x)$。由此同一组高斯有两条路径：geometric-regularization path 用 $\sigma$ 渲染中间颜色和深度，仅接收几何约束；appearance-refinement path 用 $\sigma'$ 渲染最终颜色和深度，以辅助参数在已稳定几何上恢复透明度与细节。总损失把最终输出的标准 3DGS color loss、几何路径的辅助 $L_1$ 颜色项，以及只作用于几何深度的 geometry loss 相加。
+
+geometry loss 有两部分。自监督一致性将 view $i$ 的几何路径深度按已知相机位姿 warp 到 view $j$，与 $j$ 直接渲染的深度作双向 $L_1$；只选择足够共视、旋转适中且非近纯旋转的图像对。对弱纹理区域，DUSt3R pointmaps 提供外部深度，但 pairwise 尺度各自未知；论文以矩阵分解把大规模点云对齐等价压缩为七个带权“equivalent points”，联合优化各对尺度及同一图像跨对的一致性，再以置信度加权深度差形成 prior loss。双路径的关键是这些强约束不直接污染最终外观；同时其效果仍取决于相机位姿、视图重叠和 DUSt3R 先验在该场景中的可靠性。
+
+% METHOD: 2509.24421
+\paragraph{Proxy-GS：以轻量 proxy mesh 统一遮挡 culling 与结构化增密（2025）\cite{2509_24421}}
+Proxy-GS~\cite{2509_24421}针对 Scaffold/Octree 一类 MLP-decoded anchors：即便远处 anchor 完全被遮挡，传统 frustum/LOD 筛选仍会 decode 它们；训练时高梯度也可能在不可见区域生长 anchors。方法先从稠密点云构建并简化 coarse proxy mesh，室内可由 MapAnything 等重建补充点云，再让硬件 rasterizer 快速输出 proxy depth。
+
+代理 mesh 会分成细粒 cluster，Hi-Z 先剔除不可见 cluster，Early-Z 和最小 fragment shader 专门写深度；depth 保留在 GPU，和 anchor 的 frustum test 融合进同一 CUDA kernel。每个 anchor 投到像素后，hardware $z$ 转为线性 camera-space depth，并加安全 margin；若 anchor 深度在 proxy depth 后面则不 decode/不 render。该过程给 MLP-based Gaussian 提供任意视角的轻量 occlusion prior，而不是在 Gaussian rasterizer 内做昂贵的 per-pixel ray tracing。
+
+训练期同一 proxy 约束 densification：对渲染误差异常高的图像 patch，读取 patch center 的 proxy depth、反投影到 mesh surface，将该三维点插为新 anchor；proxy-grid 限制每个 cell 可插 anchor 数，防止点在同一面上过密。因而 anchor 增长发生在有结构且可见的代理面，而非被遮挡的高梯度区。收益依赖 proxy mesh 的几何与深度精度；简化过度、mesh 漏面或 depth margin 设置不当会导致错误 culling 或错误的 surface-guided densification。
+
+% METHOD: 2603.00492
+\paragraph{ArtiFixer（2026）\cite{2603_00492}}
+ArtiFixer从稀疏视图得到的初始三维重建出发，生成任意相机路径上的无伪影视频；它也可将生成的视频再蒸馏回三维表示。其关键问题是两种条件分布都不够合适：纯高斯噪声会与已有重建的细节脱节，而直接从退化渲染 latent 开始又会使完全未观测区域没有生成自由度。
+
+教师是由预训练 text-to-video 模型微调得到的双向条件流模型。退化 3DGS 渲染经冻结 VAE 编码为 $z_{deg}$，opacity 图在 latent 尺度变为 $O_z$，并构成源 latent $z_{mix}=O_z z_{deg}+(1-O_z)\epsilon$。因而高 opacity、已有可靠内容的区域从渲染出发，低 opacity 或空洞区域从高斯噪声出发。每个 transformer block 还以独立线性层注入未经过 VAE 的 opacity 与逐像素 Plucker raymap；后者由射线方向和相机中心的叉乘构成，保证渲染为空时仍有相机条件。清晰参考图像经冻结 VAE 编码后作为 cross-attention 的键和值，PRoPE 在该注意力中编码目标与参考的内外参。
+
+训练使用成对的稀疏重建/真值视频，以 conditional flow matching 预测增强 latent；相机分组刻意制造大空洞，且随机将序列尾部的 RGB 与 opacity 清零、保留 raymap，迫使模型由参考图、文字和相机条件完成未观测视角。学生模型从教师权重开始，施加 block-causal mask 和每帧不同噪声，再以自回归 chunk rollout、KV cache 与 distribution matching distillation 变为少步因果生成器。推理时滚动缓存允许任意长路径；若需更快渲染，可一次生成一组一致的新视图后按标准流程重建 3DGS。它生成的是受条件约束的合理内容，不能把完全未观测的真实几何当成已被测量的事实。
+
+% METHOD: 2408.08206
+\paragraph{WaterSplatting：把介质体渲染接到显式 3DGS 几何上（2024.08）}
+WaterSplatting~\cite{2408_08206}指出普通 3DGS 只显式合成表面/几何 primitive，无法描述水下散射介质。它保留 3DGS 作为几何、opacity 和方向外观的快速 rasterization 表示，但另设一个体积场编码水体；该场对每个像素只查询一次，而非沿每条射线大量采样，从而将介质的透射/散射效应与前景 Gaussian 合成结合。
+
+渲染仍先把 Gaussian 投影、按深度排序并 alpha 合成，同时使用得到的深度和颜色在介质模型中求水下成像校正。训练除重建约束外还引入与 HDR 人类感知对齐的损失，以处理水下亮度范围。这个双表示折中保留实时 splatting，却依赖所假设的介质模型；若水体空间变化或成像效应偏离该模型，单次像素查询的近似会限制表达能力。
+
+
+% METHOD: 2410.01517
+\paragraph{UW-GS：面向吸收、散射与运动干扰的水下 3DGS（2024.10）}
+UW-GS~\cite{2410_01517}针对水下成像中距离相关的颜色衰减、散射以及移动干扰物。它在 Gaussian 外观中引入随传播距离变化的颜色模型，以物理启发的 density control 增强远处结构，并从二值运动 mask 区分动态内容；这些改动共同避免标准清澈介质假设把水体效应和运动物体拟合为错误的静态 primitive。训练以论文设计的重建/约束项联合优化，渲染仍以 splatting 为主。其适用性依赖水下成像与运动掩码假设，mask 或介质模型失准会传给重建结果。
+
+
+% METHOD: 2411.19420
+\paragraph{RF-3DGS：以 Radio Radiance Field 表示无线多径信道（2024.11）}
+RF-3DGS~\cite{2411_19420}将无线 Tx--Rx 多径传播转写为 Radio Radiance Field：空间中的传播路径对应具有 spatial-CSI 的无线射线/贡献，而不是 RGB 光学颜色。论文先从确定性 multipath channel model 建立 RRF，再引入 3DGS 的显式 primitive 与高效 splatting 来加速无线场重建与查询。它属于无线信道建模接口，训练和评价应围绕 CSI/传播量而非普通图像 PSNR；3DGS 在此提供的是可微显式空间聚合工具。
+
+
+% METHOD: 2411.19588
+\paragraph{Gaussian Splashing：水下直接体渲染的扩展 Gaussian（2024.11）}
+Gaussian Splashing~\cite{2411_19588}认为普通 3DGS 在水下的 alpha 合成无法表达距离相关散射。它为 Gaussian 增加三个可学习参数，并按水下成像近似修改直接渲染过程：背景光在单张图中近似常量，衰减主要随 scene depth 线性变化。论文同时重写深度估计和原 3DGS 损失，并加入相关约束，以 CUDA 实现将这些水下物理量纳入前后向。因而它与仅附加二维后处理不同，但对水体均匀性和深度相关近似有依赖。
+
+
+% METHOD: 2412.07293
+\paragraph{EventSplat：以事件流的对数亮度变化监督静态 Gaussian 场景（2024.12）}
+EventSplat~\cite{2412_07293}用带位姿的移动事件相机流重建静态 3DGS。它随机取事件子轨迹，将同一像素的极性事件累加为对数强度变化图 $D$；从当前 Gaussian 场景在子轨迹首尾位姿 rasterize 两张图，取 remosaiced log images 的差 $\hat D$ 作为预测。彩色事件相机必须重新施加 Bayer pattern 后再取对数，不能直接把 RGB 渲染图与单通道事件累计图相减。
+
+初始化时，预训练 event-to-video 网络生成可供 SfM 使用的纹理先验；稀疏位姿以 cubic/spherical cubic spline 插值到事件时间。优化沿用 $L_1+\mathrm{SSIM}$，但只在真实累计到事件的像素上监督。该方法利用事件的高时间分辨率和 HDR，却依赖轨迹插值、事件阈值与事件到视频初始化质量，不能视作普通 RGB 3DGS 的直接替换。
+
+
+% METHOD: 2502.01826
+\paragraph{GSRF：用复值高斯与复值光线追踪合成射频场（2025）\cite{2502_01826}}
+GSRF~\cite{2502_01826}将 3DGS 的目标从 RGB 新视角改为“给定发射器和接收器位置，合成接收 RF 数据”。光学颜色的实数 alpha 混合不能表达射频传播中的相位干涉，因而每个基元除了均值、旋转和缩放，还维护复值辐射 $\psi_k$ 与复值透射率 $\rho_k$。初始化不依赖 SfM：论文把已知场景体积划为等大的立方块以生成初始点云，随后以显式梯度更新几何和复值属性，并按梯度驱动的 clone、split、remove 调节基元密度。
+
+方向相关的辐射并非使用 RGB 3DGS 常见的球谐颜色，而是 Fourier--Legendre expansion：方位角用 Fourier 项、仰角用 Legendre 多项式，复系数同时编码振幅与相位。$\rho_k$ 则描述波穿过该高斯产生的振幅衰减和相位偏移。对于一个接收器，方法从以接收器为中心的 Ray Emitting Spherical Surface 向所有方向发射射线，将球面方位/仰角映射为二维 receiving RF plane；每个三维高斯通过该映射和投影协方差 splat 到此平面，从而筛出可能相交的射线。这是为没有光学像平面的 RF 场定义的“正交 splatting”接口。
+
+对每条射线，命中的高斯按距接收器深度排序。渲染器用高斯在代表性交点的权重乘以复辐射，并乘以前方高斯复透射率的累积乘积，因此传播过程中同时累积衰减与相位。CUDA 前向/反向核和显式梯度实现这一复值运算。监督随接收器类型而变：阵列天线的空间频谱用 $L_1$、SSIM 和二维 Fourier-domain loss 的加权和；单天线的实值功率用 $L_1$，复值信号用平方 $L_2$。这使优化目标与要合成的 RF 观测相对应。论文也明确其当前模型是特定静态场景上的拟合：未见场景的零样本空间泛化以及有移动遮挡物的时间适应仍需预训练、形变或再训练。
+
+% METHOD: 2509.00989
+\paragraph{Multi-Spectral Gaussian Splatting：比较 Separate、Split 与 Joint 的光谱训练耦合（2025）\cite{2509_00989}}
+该研究~\cite{2509_00989}不是只为 RGB 高斯再加一个 NIR 标签，而是系统比较多光谱相机组输入如何共享几何。输入包含 RGB、窄带红/绿、red-edge 与 NIR 图像，各相机有自身内外参，并假定已有全局对齐稀疏点云；每个 Gaussian 的球谐颜色可扩为多光谱 reflectance 系数。
+
+Separate 是朴素基线：每个 spectral modality 独立优化一套 3DGS，因此几何可各自适应但模型冗余、跨波段不一致。Split 先由 RGB 训练稳定几何，再复制几何为各光谱通道独立拟合颜色/后续属性，试图在共享起点与每波段保真之间折中。Joint 则只维护一个 Gaussian 几何集合，每个基元同时存多通道 SH color，并对所有波段共同反传；论文的 staged joint training 先仅优化 RGB 建立几何，再按实验选择冻结或继续更新 position/covariance，以控制几何耦合和 spectral cross-talk。
+
+三种策略的共同渲染路径仍是每通道的 Gaussian alpha compositing；区别是哪些参数在波段间共享、何时放开几何优化。该文的价值是给出多光谱 3DGS 的训练协议和耦合权衡，而非声称所有波段天然能互相校正：band-specific 对齐、相机校准、曝光/噪声差异和联合训练造成的 cross-talk 都会影响某一通道的保真度。
+
+% METHOD: 2510.12174
+\paragraph{UniGS：以 ray--ellipsoid 交点统一渲染 RGB、深度、法线与语义（2025）\cite{2510_12174}}
+UniGS~\cite{2510_12174}将每个 Gaussian 扩展为位置、quaternion、scale、opacity、SH、semantic logits 和可学习 gradient factor 的共享地图。与以 Gaussian center 加权深度的常规近似不同，它对每个像素向后追踪射线并与 Gaussian ellipsoid 求交；交点使 depth、normal 的计算显式依赖 rotation 与 scale，也使对应几何监督的解析梯度能更新这些属性。
+
+几何路径从 ray--ellipsoid intersection 得到每个命中基元的深度和表面法线，再用相同前后 alpha compositing 输出 depth/normal；RGB 由 SH，语义由 per-Gaussian logits 在同一 differentiable rasterization 中聚合。因此 RGB、深度、法线和 semantic map 的各项损失都反传到同一组高斯，而不是维护互相不一致的多套地图。论文的监督可来自多模态真值，或在缺少精确几何/语义标签的数据上使用 Normal-GS 深度结果与 OpenSeed 标签作为先验。
+
+为控制冗余，gradient factor 是每基元可训练属性：它调制优化/梯度传播，使贡献弱的 Gaussian 持续衰减并可微 pruning，而非只在离散周期依据 opacity 删除。最终系统的技术重点是用 CUDA 解析梯度维持多模态几何一致性并压缩表示。它依赖 ray--ellipsoid 交点的稳定计算与可信的 depth/normal/semantic 监督；若这些先验含系统误差，会同时影响共享地图的多种输出。
+
+% METHOD: 2511.12304
+\paragraph{LiDAR-GS++（2025）\cite{2511_12304}}
+LiDAR-GS++面向单次行车扫描的 LiDAR 重仿真。只沿原始车道采集的点云在横向外推视角会出现未观测区域；直接拿生成扫描监督整个场又会把生成器的幻觉写入已经拟合好的表面。该方法因此把“扩展观测”和“保护已收敛区域”分为两个阶段，而不是把扩散结果简单拼接进训练集。
+
+表示从点云的 range view 开始：每个像素保存强度、深度和 ray-drop；逆投影再把 range view 变回点云。场由二维 Gaussian $\xi=\{\mathbf x,\mathbf R,\mathbf S,\rho,r,\alpha,\mathbf v_\xi\}$ 构成，除了位置、旋转、尺度、强度、ray-drop 概率和 opacity，每个基元还有可优化 token。四个轻量 MLP 以 token、局部光线方向和飞行距离为条件预测属性，使相同表面可呈现方向与距离相关的 LiDAR 返回。渲染时先求每条激光 ray 与高斯切平面的交点，再按 alpha/透射率积分输出 range view 的深度、强度和 ray-drop；初始重建用深度 $L_1$、强度的 $L_1$--D-SSIM、ray-drop 的 $L_2$ 以及尺度正则共同优化这些 token、MLP 和位置偏移。
+
+为获得外推监督，系统先将训练好的场平移到相邻视角，得到粗糙 range view，再输入预训练的 LiDAR-to-LiDAR 条件扩散模型。该模型以 VAE 把真实扫描和粗渲染编码到 latent，拼接带噪扫描 latent 与条件 latent，按标准噪声预测 $L_2$ 训练；为构造训练对，论文在人为退化的高斯场中扰动输入并随机丢弃基元。推理时扩散模型冻结，生成的外推扫描只作为额外监督。
+
+关键的 DDAD 用当前渲染深度与 transmittance 接近 $0.5$ 的交点深度之差定位失真区域：差值大意味着该 ray 的高斯尚未形成稳定表面。扩展训练把真实与生成扫描混合，却只在这一掩码内施加生成监督，并保留原始观测的监督来维持已收敛几何。最终仍从优化后的二维高斯场实时渲染 range view，再逆投影为 LiDAR 点云；生成先验的收益与限制都取决于粗外推的条件质量和失真掩码是否能隔离幻觉区域。
+
+% METHOD: 2602.17124
+\paragraph{Multimodal Gaussian Splatting（2026）\cite{2602_17124}}
+该工作把稀疏雷达 RF 深度测量用于 3DGS 初始化，目标是在可用 RGB 视图很少、COLMAP 点云不足时提供几何先验。它并不把雷达信号直接加入每个高斯的颜色渲染损失；多模态耦合发生在“从雷达构造可信初始点云”这一步，之后仍采用标准视觉 3DGS 训练。
+
+输入是相机图像与一帧雷达在少数方位/俯仰角上的深度观测。为补全未测角度，方法将角度空间划分为互不重叠区域，在每个区域各自拟合局部 Gaussian Process；查询位置只条件于该区域的深度点，输出深度后验均值和方差。相对对所有观测构造一个全局 GP，这一局部化既避免远处测量的不相关影响，也将每个 GP 的代价从全局观测数的三次复杂度降至局部样本规模，并允许不同区域并行预测。
+
+从可用方位角采样查询点，保留后验方差较低的预测深度，再与相机标定共同形成 RF 辅助点云，作为高斯中心的初始化。随后以训练 RGB 图像运行原始 3DGS：高斯经常规投影与 alpha 合成渲染，优化目标仍是 $L_1$ 与 D-SSIM 的组合。这样雷达提供的是几何覆盖和初始化可靠性，视觉图像负责外观拟合；边界也很直接，稀疏雷达的深度预测只在局部核与置信度筛选可靠时有益，论文没有将所有未见角度当作确定的表面监督。
+
+% METHOD: 2604.13340
+\paragraph{MSGS（2026）\cite{2604_13340}}
+MSGS将 3DGS 的外观从三通道 RGB 扩展为离散波段上的光谱辐射，而几何仍由所有波段共享的一组中心、尺度、旋转和 opacity 描述。这样同一表面不再为每个颜色通道学习互不关联的外观，而是在每个 Gaussian 保存多光谱球谐（MS-SH）系数，视角方向上的每个波段辐射均由对应 SH 展开给出。
+
+初始化时从重建管线提供的基础颜色建立零阶光谱外观，高阶 MS-SH 系数从零开始学习；渲染阶段沿深度顺序对各波段的 Gaussian 贡献做同样的 alpha 合成，先得到每像素光谱向量。为与普通显示和 RGB 监督对接，方法再用 CIE 1931 颜色匹配函数将谱辐射积分成 XYZ，结合白点校正与 gamma 映射为 RGB。因而 RGB 只是光谱场的一个观测/显示投影，而不是直接存储的唯一颜色。
+
+优化同时利用多光谱图像的波段重建误差和由光谱转换出的 RGB 误差；共享几何迫使不同波段在同一表面、遮挡和投影上保持一致，波段特有的反射则由 MS-SH 承担。该表示的代价是外观参数、显存和每像素合成随波段数增加，并且光谱到 RGB 的变换依赖所选的颜色匹配与白平衡假设；它不能凭 RGB 训练数据恢复未被观测的真实连续光谱。
+
+% METHOD: 2407.03857
+\paragraph{PFGS：以 neural feature 而非直接 RGB splat 渲染稀疏点云（2024.07）}
+PFGS~\cite{2407_03857}面向稀疏彩色点云的高保真新视图渲染。它不把输入点直接当作固定 Gaussian，而是以多尺度点云特征提取器产生每点 descriptor，再用三个回归头预测旋转、尺度和 opacity；这些属性将点投影为 Gaussian，同时将 descriptor rasterize 成二维 feature maps。渲染器的中间产物因而是 Gaussian splatting RGB 图与 feature splatting map 的拼接，而不是最终颜色。
+
+后续多尺度、渐进式 decoder 从这些投影特征恢复图像细节。训练分两阶段：第一阶段只训练多尺度特征提取和 Gaussian 回归以获得 splatting/feature maps，第二阶段训练完整解码器；重建监督按论文的渐进、多尺度设计施加。该方法把难以由稀疏几何覆盖的纹理和孔洞交给二维特征解码，但其输出质量也依赖训练时学到的点云与视图分布，不能等同于直接优化的场景 3DGS。
+
+
+% METHOD: 2501.09302
+\paragraph{Creating Virtual Environments with 3DGS：XR 虚拟环境的三种实施路线比较（2025）\cite{2501_09302}}
+这是一项 XR 系统比较研究，而非提出新的 3DGS 优化器。它把“用 3DGS 创建可在头显中运行的虚拟环境”拆成三条实际管线，并用 Unity 端渲染和用户体验来比较它们的适用边界。
+
+第一条是直接的新视角合成：采集目标环境的多视图图像，借助 COLMAP 估计相机参数和稀疏点云，以原始 3DGS 训练场景，再将训练好的高斯数据导入 Unity，用现成 Gaussian-splatting shader 在 XR 中解码和绘制。第二条是网格重建：以 SuGaR 的表面正则化训练较均匀、贴近表面的高斯，从可见表面采样点和法线，用 Poisson surface reconstruction 生成三角网格，再用训练高斯提供的线索为网格贴图，最后导入 Unity。它以网格交换直接 splat 的高保真和可编辑性，换取传统 XR 图形与碰撞系统更容易使用的表示。第三条是全景 3D 场景：从固定位置的多视图图像合成全景，仿照 DreamScene360，以预训练单目深度和可优化几何场建立一致结构，并用伪视图与变形高斯补足未观测区，再按第一条路线导入 Unity。
+
+论文在 RTX 4090 与 Meta Quest 3 上渲染这三类场景，并以 SUS 问卷做小规模用户研究。其结论应理解为这三条管线的工程权衡：直接 3DGS 的移动时视觉一致性较好，但把所有高斯同等处理时只有有限的对象级交互；基于高斯的网格化在远处物体上难与传统 TSDF 重建竞争；固定视点全景适合环视和虚拟导览，却在用户平移时容易出现畸变。因此，本条目的技术贡献是可复现的系统接口、评测协议和适用边界，而不是一组新的训练损失。
+
+% METHOD: 2503.05511
+\paragraph{Free Your Hands：以转盘采样和光照旋转条件化捕获物体（2025）\cite{2503_05511}}
+该工作~\cite{2503_05511}关注的是物体采集流程，而不是单纯替换 3DGS 优化器：固定相机在三脚架上、让物体在消费级转盘上转动，可避免手持视频的模糊并自动产生均匀而稠密的观测。难点在于自然环境光在物体坐标系中会随物体反向旋转，因而标准“视角变化而光照固定”的 3DGS 假设不再成立。
+
+作者将采集视为 view 与 light-rotation 两维采样。对每个固定相机位置完成一次转盘旋转并从视频取 $N$ 帧，$M$ 个相机位置产生 $M$ 条在该二维域中的对角采样线：视角与光照角在一条转盘序列内被绑定，但改变相机位置会提供另一条线。表示仍可用 3DGS：每个高斯不再用球谐函数直接给颜色，而是储存 appearance latent $x$，由 $c=\mathrm{MLP}(x\mid v,\theta)$ 根据观察方向 $v$ 和光照旋转角 $\theta$ 预测辐射。MLP 在 splatting 前求值，像素仍由原有的可微 alpha blending 合成，所以渲染器无需改变。
+
+论文还研究采样角度的取舍。完整旋转带来更多帧，却令同一物体外观跨较大的光照变化，增加二维条件场的回归难度。其 swing 采集让转盘在原始姿态两侧往返 $s$ 弧度，并在停顿时移动相机；在给定采集时间下，$s$ 增大提高样本数、减少人工挪动次数，却令样本远离目标固定光照切片。文中的实验将 $0.2\pi$ 作为所测设置中的折中，而非所有物体和光照的普适常数。
+
+% METHOD: 2504.17954
+\paragraph{iVR-GS：以可编辑高斯替代不可访问体数据的体可视化（2025）\cite{2504_17954}}
+iVR-GS~\cite{2504_17954}服务于 volume visualization：用户可能只能从高性能服务器得到不同视角的 DVR 图像，而不能在本地访问原始体数据。它先为每个 basic transfer function 对应的可见子场景训练一个基本模型，随后把多个基本模型组合为完整 VolVis 场景；显式高斯使模型可组合，也使颜色、opacity 与光照能在本地实时修改。
+
+视图采样按 basic scene 复杂度自适应：先用 icosphere 的初始图像计算颜色与 alpha 的熵，再按归一化熵追加不同数量的视角。每个基本模型分两阶段优化。base 3DGS 在原始几何参数外为每个高斯加入 normal，渲染深度与 normal map，并以从深度导出的 pseudo-normal 做 $L_2$ normal-consistency；颜色与 alpha 均用 $L_1$ 加 SSIM 监督。随后 editable stage 用 Blinn--Phong 取代 SH 颜色：每个高斯维护 normal、offset color、ambient/diffuse/specular 系数和 shininess，basic scene 共享 palette color，故替换 palette 即可重着色。该阶段还以低-opacity $L_1$、offset-color 稀疏和 shading-attribute bilateral smoothness 约束压缩冗余、避免 palette 偏移并使平滑区域属性连续。
+
+多个基本模型会增加存储，故 iVR-GS 对除位置和 normal 外的 editable attributes 做 k-means vector quantization：基元保存 codebook index，组合时解压并拼接 primitive lists。推理中用户可改 palette、opacity 或 Blinn--Phong 参数/光向；inverse exploration 则冻结所有基元，只优化每个基本模型的颜色/opacity 变换和全局光照变换，以 $L_1$ 与 SSIM 拟合一张参考图。它提供的是由预渲染 VolVis 图像学习出的可编辑代理，而非恢复原始体标量场；编辑与新视角质量依赖 basic TF 覆盖、训练视图和 Blinn--Phong 假设。
+
+% METHOD: 2504.18165
+\paragraph{PerfCam：以 3DGS、检测跟踪和传感时间序列构成产线数字孪生（2025）\cite{2504_18165}}
+PerfCam~\cite{2504_18165}是工业生产线的 proof-of-concept 系统，而非新的 Gaussian 参数化。它把“可从不同角度查看的场景模型”与“可计数、可追踪的当前生产状态”并置，用于输出吞吐、停机时间、传送带速度和 OEE 等 KPI。
+
+采集端由安装 RGB/深度相机的小型三轴机械臂在产线周围取帧，并把振动、声音、力、气体、温度和运动等传感数据写入时间序列数据库或 CSV；时间戳把视觉流和传感流对齐。离线/建模路径先用 COLMAP 进行 SfM/MVS 得到稀疏和稠密点云，再以 SuGaR/3DGS 建立可实时浏览的场景。检测路径对采集图像做人工或 SAM 辅助的 bounding-box 标注与数据增强，微调 YOLOv11 检测器，并以 ByteTrack 的关联结果为跨帧对象保留 ID 和轨迹。
+
+KPI 是在这一数据接口上计算的：经过参考线的轨迹计数给吞吐；单位时间位移给带速；传感状态的 stop--start 区间求总 downtime。给定计划时间、理想 cycle time 和 good/total pieces，系统按 $\mathrm{OEE}=\mathrm{Availability}\times\mathrm{Performance}\times\mathrm{Quality}$ 合成设备效能。检测框和轨迹再根据参考坐标叠到重建/实时视图，GUI 同步展示传感历史。论文明确这是尚未完全整合为生产级原型的 PoC：图像覆盖、遮挡、强反光、实时算力、摄像头部署和工业数据接口都会限制精度与扩展性。
+
+% METHOD: 2508.18540
+\paragraph{G2LF：将 3D Gaussian 场景单次 plane sweep 为光场 quilt（2025）\cite{2508_18540}}
+该工作~\cite{2508_18540}解决光场显示需同时产生数十个相邻视角、逐视图调用 radiance-field renderer 会重复计算的问题。G2LF 是统一 N2LF/G2LF/V2LF 框架中的 3DGS 路径：不重新训练高斯，而把已训练的 3DGS 转换为 slice-based 中间表示，再通过 swizzle blending 写入 light-field display 所需的 quilt。
+
+管线在一个 pass 中沿深度 sweeping planes 处理所有相邻视图共有的非方向性成分，避免每个 camera 独立 rasterize。对 3DGS，Gaussian 的位置、opacity 与基础颜色被投到各 slice；view-dependent spherical-harmonic 颜色可作为更精确但更耗内存/算力的选项。每个 slice/chunk 存中间 framebuffer，随后 swizzle 把不同 plane 的像素按子视图几何关系重采样并融合为多视图 quilt；chunk 数、plane resolution 和插值方式是质量/帧率开关。
+
+该方法的输出面向 Looking Glass 等光场显示的 interlacing buffer，不是单个 novel-view 图像。它对显式 3DGS 与 sparse voxel 更稳定，论文指出 N2LF 的 NeRF importance sampler 在 plane-sweep 视图上有 out-of-distribution 问题。代价是 slice representation 显著增加内存，更多/更高分辨率 slices 和 quilt views 都会增加 blending 工作；物理显示器自身的角度与深度分辨率也限制多余采样的实际收益。
+
+% METHOD: 2510.18054
+\paragraph{HouseTour（2025）\cite{2510_18054}}
+HouseTour把房产导览拆为两个可分离但共享空间条件的生成问题：由稀疏、按时间排序的已知相机位姿和对应 RGB 帧，补全一条更密集的镜头轨迹，并生成描述整套房屋空间关系的文字摘要。3DGS 在这里不是轨迹规划器，而是在已经得到的相机路径上渲染导览视频；这一区分很重要，因为它把几何重建、镜头设计和语言叙述的职责分开。
+
+轨迹模块 Residual Diffuser 以已知位姿所在时刻为硬约束。它先在平移上作样条插值、在旋转上作 SLERP，得到基线轨迹 $\mathcal S$；扩散网络不直接预测绝对位姿，而是预测残差 $\Delta\mathbf p$，最后组成 $\tilde{\mathbf p}=\mathcal S+\Delta\mathbf p$。在观测到的时刻，残差在前向加噪和反向去噪中都固定为零，其他时刻才参与条件扩散。1D 卷积 U-Net 从带噪残差、时间步和基线轨迹恢复残差，因而能处理不同长度的路径；训练时还改变已知位姿的稀疏程度。监督不只比较离散相机点：平移在相邻姿态的稠密样条采样点上计算 $L_2$ 距离，旋转用 $\mathrm{SO}(3)$ 上的测地距离，这样优化的是连续的游览曲线而非重建系统采样点的密度模式。
+
+语言模块以 Qwen2-VL 为基础分两阶段训练。第一阶段用 LoRA 和多帧图像学习房产摘要的视觉语言映射；第二阶段把每一帧去噪后的位姿和 Residual Diffuser 瓶颈层的时序特征拼接，经线性适配器映射为语言模型嵌入，并放在新增的轨迹起止和占位 token 之间。因此文字生成既看 RGB 证据，也可利用路径的全局空间结构。推理时用全部重建位姿和点云训练 3DGS，再仅以稀疏视图约束补全路径，并沿该路径渲染视频。方法的边界是：它假定输入已有相机位姿；3DGS 主要服务于可视化，论文并未把稀疏视图新场景重建作为核心问题。
+
+% METHOD: 2512.20148
+\paragraph{Apple Pose Annotation with 3DGS（2025）\cite{2512_20148}}
+这是一条面向果园苹果 5D 姿态估计的数据构造管线，而不是新的 Gaussian 表示或渲染器。问题在于，果脐、果梗等姿态线索经常被叶片遮住：若逐帧在二维图像中标注，同一个苹果会出现缺失或相互冲突的姿态标签，也难以避免同一果实跨训练/测试集的数据泄漏。
+
+流程从多视角 RGB 采集开始，先以 SfM 稀疏点和相机位姿初始化标准 3DGS，并训练带位置、协方差、opacity 与 SH 颜色的果园场景。研究者将训练好的 3DGS 转成高密点云，在三维空间按苹果逐个裁剪并手工标注果实中心、尺度与由果脐确定的方向。于是每个独立果实只需一份三维姿态标注；凭已知内外参，可把其点云和 3D oriented bounding box 投到任意原始或新渲染的相机图像，自动产生二维框、三维框及所需的姿态标签。
+
+为让投影标签反映真实可见性，管线还依据相机视锥、遮挡和渲染深度计算苹果的可见/遮挡比例。数据集按树而非随机按图划分，避免同一苹果穿过数据切分；3DGS同时渲染 RGB 与 opacity 归一化的期望深度，新视角图像用于扩展训练样本。最终用这些 RGB-D 与投影标签训练 FRESHNet：它平行编码彩色点云和 RGB、融合特征后预测苹果的三维有向框，并用果心到果脐的单位方向替代冗余的完整旋转监督。这里 3DGS的作用是统一三维标注坐标系和可控合成数据，结果仍受重建对叶片/果实边界的保真度、遮挡估计以及原始 3D 标注质量限制。
+
+% METHOD: 2309.07668
+\paragraph{ChromaDistill：将二维着色知识蒸馏到灰度辐射场（2023.09）}
+ChromaDistill~\cite{2309_07668}处理多视图灰度输入的三维着色，但论文的场景底座是 Plenoxels 稀疏体素辐射场，并非直接修改 3DGS。第一阶段以灰度观测训练 luma radiance field，学习几何与亮度；第二阶段冻结/继承这一场景函数的结构，用预训练二维着色教师 $\mathcal T$ 对每个输入灰度图产生彩色伪目标，再通过可微渲染把教师知识写入三维表示，避免逐视图独立着色造成的新视图颜色漂移。
+
+蒸馏在 Lab 空间进行：渲染图与教师图的 $L$ 通道用 MSE 对齐以保留原灰度内容，$a,b$ 两个色度通道用 $L_1$ 对齐以注入颜色。为缓解教师结果褪色，作者从最粗图像金字塔开始蒸馏，向更细尺度时将上一级预测的色度上采样后作为正则；底座的训练仍保留 Plenoxels 光度项和 TV 正则。得到的颜色由同一三维场渲染，因此相机变化时遵循场的几何与遮挡关系。
+
+这是一种“以二维教师作为颜色监督”的方法，真实性上限受教师先验和灰度图中不可辨识的颜色影响；原论文并未声称仅由灰度能恢复唯一真实颜色。它与 3DGS 的关系在于同属显式/快速辐射场的着色问题，而不应被表述为 Gaussian 参数化改进。
+
+
+% METHOD: 2311.12897
+\paragraph{Compact Dynamic 3D Gaussian：以低自由度时间函数表示动态 primitive（2023.11）}
+Compact Dynamic 3D Gaussian Representation~\cite{2311_12897}反对为每一个时间步单独存一套 3DGS：那会使存储随视频长度增长，也使单目或少视图的每一时刻缺少足够观测。它让每个 Gaussian 的尺度、SH 颜色和不透明度跨时间共享，只令中心 $\boldsymbol\mu(t)$ 与旋转四元数随时间变化。中心坐标由有限项 Fourier 正余弦展开表示，旋转用线性函数近似；因此每个 primitive 的参数量由 Fourier 阶数与 SH 阶数决定，而不取决于帧数，并在连续时间上抑制逐帧不连续跳变。
+
+给定时间 $t$，先由这些函数求中心和旋转，构造 $\boldsymbol\Sigma(t)=\mathbf R(t)\mathbf S\mathbf S^\top\mathbf R(t)^\top$，再按原始 3DGS 投影、排序和 alpha 合成。训练分两阶段：static stage 先只优化跨时间不变属性和位置/旋转截距，建立稳定先验；dynamic stage 再优化全部 Fourier/线性系数。图像项为 $L_1$ 与 D-SSIM 的加权和，并沿用 3DGS 的梯度驱动 split/clone 与低 opacity prune。
+
+为解决少视图下的运动歧义，作者从相邻帧以 RAFT 获得前后二维光流监督；Gaussian 的 Fourier 位移先给出三维 scene flow，经投影 Jacobian 变为二维，再以与颜色相同的 alpha 合成得到像素 flow，并对其施加 $L_1$。这将时间一致性绑定到显式运动参数，而非每帧独立拟合。其前提是给定时间戳和标定相机，且平滑 Fourier/线性轨迹对瞬时拓扑变化或剧烈非平稳运动的表达能力有限；论文也因相邻相机跳变而不在 D-NeRF 设置中使用该 flow 项。
+
+
+% METHOD: 2312.02973
+\paragraph{GauHuman：在 canonical 人体空间中蒙皮的 Gaussian（2023.12）}
+GauHuman~\cite{2312_02973}把可动人体建模为 canonical space 的 Gaussian 集合，而不是为每个姿势重建一份点云。它假设相机、人体区域 mask 与 SMPL 的形状/姿势参数可得，以 SMPL 顶点初始化 Gaussian 中心。对每帧姿势，前向 Linear Blend Skinning 同时变换中心和协方差：各关节刚体变换按该 Gaussian 的 LBS 权重混合，使椭球随肢体旋转、平移并保持可由 tile-based differentiable rasterizer 快速 splat。
+
+LBS 权重并非直接固定为最近 SMPL 顶点的权重。网络以 canonical 位置的位置编码为输入，由 $\mathrm{MLP}_{\Phi_{lbs}}$ 预测对该 SMPL 权重的偏移；另一个 pose-refinement MLP 修正由图像估计的 SMPL 姿势。训练完成后，Gaussian 的 LBS 权重可预先查询保存，修正姿势也可缓存，故新姿势下的推理主要是蒙皮变换加常规 rasterization。
+
+作者还把静态 3DGS 的增密规则换成人体先验约束：对近邻 Gaussian 用 KL divergence 而非仅位置梯度筛选 split/clone，借 kNN 将成对计算从二次量级降到线性量级；对梯度大、尺度小且 KL 小的冗余对执行 merge，并以平均位置、不透明度、SH 及放大后的协方差初始化。优化由重建、mask 等论文列出的多项损失组成。方法的边界来自其输入先验：SMPL 不能解释的服饰、发丝或大幅拓扑变化仍需 Gaussian 自身补偿，且姿势/分割估计误差会直接传给 canonical-to-posed 变换。
+
+
+% METHOD: 2312.09031
+\paragraph{iComMa：通过匹配再比较来反演固定 3DGS 的相机位姿（2023.12）}
+iComMa~\cite{2312_09031}的对象不是重新训练场景，而是在已训练且固定的 3DGS $\Theta$ 上，为查询图像求 $SE(3)$ 相机位姿。它把位姿增量参数化为六自由度李代数 $\tau\in se(3)$，经指数映射与初始位姿组合，因此每次更新都留在 $SE(3)$。3DGS 的相机变换和投影协方差本身可微，论文显式将位姿送入 rasterizer 的反向过程，使渲染损失能对 $\tau$ 求梯度。
+
+直接 render-and-compare 在大旋转或大平移初值时易落入局部区域，故 iComMa 同时使用两类信号。比较损失 $\mathcal L_{Com}$ 是当前位姿渲染图与查询图的像素 MSE，用于最终精调；匹配损失 $\mathcal L_{Ma}$ 则以 LoFTR 在渲染图和查询图中得到高置信匹配点，对归一化二维坐标施加平均 $\ell_2$ 距离。总损失以权重混合两项，先利用几何匹配把位姿拉入近似正确区域，再关闭匹配模块、仅以像素项收敛细节；论文使用阈值 $\epsilon=0.001$ 切换。
+
+优化使用 Adam，前阶段保持较大学习率，后阶段指数衰减。推理路径因而是“渲染当前位姿—LoFTR/像素比较—对李代数更新”的迭代，而不是一次前馈姿势回归。它的代价和边界也由此而来：需要已有高质量 Gaussian 场景且每个查询都要迭代渲染与匹配；当查询与场景没有可辨识的可匹配内容时，匹配项不能替代场景几何证据。
+
+
+% METHOD: 2312.13299
+\paragraph{Self-Organizing Gaussian Grids：把 splat 属性重排为可压缩二维网格（2023.12）}
+Self-Organizing Gaussian Grids~\cite{2312_13299}针对原始 3DGS 的存储布局：每个 Gaussian 的位置、旋转、尺度、opacity 和 SH 属性是无序数组，难以交给二维图像编码器压缩。它将所有 primitive 置入二维属性网格，要求同一网格位置在所有属性通道中始终代表同一个 Gaussian；关键不是单独排序每个通道，而是寻找一个同时重排所有属性的 permutation。训练开始前的高并行二维 sorting 先建立局部平滑邻域，随后在网格上施加 neighborhood loss，让相邻单元的属性保持局部可预测性。
+
+场景优化仍使用标准可微 3DGS renderer 和重建监督，并保留 prune/densification；每一次增密或裁剪破坏网格邻域后，都会重新排序以恢复二维局部结构。空间坐标还采用可逆的对数式 contraction，使无界坐标在中心附近保留更高相对精度。训练结束后存储的是未激活参数：opacity/scale 沿用 sigmoid/exp 激活，颜色、opacity、SH、旋转等按统计范围裁剪、归一化和分属性量化，再把二维 grids 用 JPEG XL 等现成图像编码保存。
+
+因此它的渲染模型没有改成二维图像，而是把 Gaussian 的参数存储组织改为二维可压缩信号。压缩质量依赖排序后邻域的平滑性，频繁增密必须再排序；量化范围和码率也会在极端属性或罕见细节上形成失真边界。
+
+
+% METHOD: 2312.13150
+\paragraph{Splatter Image：每像素前馈预测 Gaussian 的单视图重建（2023.12）}
+Splatter Image~\cite{2312_13150}把单目重建写成渲染器的近似逆函数 $\theta=\mathcal S(I)$，用一次图像到图像网络前馈输出 Gaussian mixture，而不是测试时为该物体执行 3DGS 优化。网络对输入 $H\times W$ 图像的每个像素输出一个参数向量：不透明度、沿相机射线的深度、三维 offset、尺度、四元数旋转和颜色/SH 系数。中心由像素坐标乘深度再加 offset 得到，因此大多数 primitive 可解释为视线附近的表面，同时网络可借 depth/offset 把一部分点布置到不可见侧，或以 $\sigma=0$ 关闭不需要的点。
+
+主干采用 SongUNet，末端 $1\times1$ 卷积输出每像素参数；sigmoid 约束 opacity 和近远平面内深度，尺度经指数化，四元数归一化后构造正定协方差。训练数据是 $(I,J,\pi)$ 的多视图三元组：输入源图 $I$，将预测 Gaussian 用相对位姿 $\pi$ rasterize，最小化目标图 $J$ 的重建误差；由于可整图渲染，作者还使用 LPIPS 等图像级损失及防止异常尺度的正则项。
+
+多视图输入时，同一网络分别产生各视图的 Splatter Image，再把中心和协方差用相对 $R,T$ 变换到共同参考系并取并集；对于一阶 SH，论文给出随旋转变换系数的方式，并在低阶设置下避免一般 Wigner 矩阵计算。为使多视图网络能协调，输入相对姿势经位置编码/FILM 注入 U-Net，并只在最低分辨率加 cross-attention。其速度来自把三维参数预测前移到一次前馈，但对遮挡背面和类别外物体的补全只能来自训练分布，不具有逐场景优化可利用的额外观测自由度。
+
+
+% METHOD: 2401.03890
+\paragraph{A Survey on 3D Gaussian Splatting：首批 3DGS 综述的组织方式（2024.01）}
+A Survey on 3D Gaussian Splatting~\cite{2401_03890}不是提出新的 Gaussian 参数化或训练算法，而是对早期 3DGS 工作建立技术地图。其叙事从显式与隐式 radiance field、点基渲染和可微 tile rasterization 的关系出发，解释 3DGS 如何以中心、协方差、opacity 和视向外观的集合替代沿射线 MLP 查询；随后按基础 3DGS、增强表示、性能比较、应用和未来方向组织文献。
+
+该综述的技术贡献是统一比较口径：将静态/动态重建、稀疏输入、尺度、压缩、编辑及医疗等应用放入任务轴，并以所收集的 benchmark、指标和渲染延迟比较说明显式表示的取舍。读者应把它当作检索与分类接口，而不是把其中的性能表或对未来方向的判断当作某一算法的实验结论；其覆盖范围也天然受论文截稿时点限制。
+
+
+% METHOD: 2402.00752
+\paragraph{Optimal Projection（2024）\cite{2402_00752}}
+这篇工作首先分析 3DGS 的局部仿射投影误差。标准实现把相机坐标中的所有高斯近似投到同一张 $z=1$ 平面，并以均值处的 Jacobian 传播协方差；这不是三维高斯的精确投影。论文把 Taylor 余项的期望平方写成与高斯均值方向有关的误差函数，指出当均值远离该公共平面的中心方向时误差会增大，广视角时尤其明显。
+
+其 Optimal Projection 不再让全部高斯共用图像平面。对每个高斯，先将均值方向归一到以相机为中心的单位球，再取该点处、垂直于该方向的切平面作为自己的投影平面；用这一径向投影的 Jacobian 将相机坐标协方差变换为切平面上的二维椭圆。也就是说，投影平面随高斯均值而变，而不是固定为 $z=1$。论文给出的误差分析表明，这一选择使所定义的仿射近似误差达到最小。
+
+因为投影结果位于许多不同的切平面，渲染器也相应改变：每个像素先按内参生成相机 ray，再映到单位球并查询该方向相交的切平面 Gaussian，以原有的深度顺序和 alpha blending 得到颜色；这不是 NeRF 式沿 ray 密集采样。协方差 Jacobian 的秩为二，实作中使用局部正交变换后取二维子空间完成二次型求值。该球面中间域也使方法可通过替换“像素到相机方向”的映射接入 fisheye 或全景相机。它的代价是引入专用 sphere-based rasterizer，因而不是可只改一个投影矩阵的普通 3DGS 插件。
+
+% METHOD: 2402.00763
+\paragraph{360-GS：在球面切平面上 splat 的全景 Gaussian（2024.02）}
+360-GS~\cite{2402_00763}针对 equirectangular panorama 不能直接套用透视 3DGS Jacobian 的问题：全景顶部和底部畸变使一个三维椭球在图像上不再近似二维椭圆；把全景切成多张透视图再拼接又会产生接缝。方法因此不把球面投影直接拟合为二维 Gaussian，而将每个 3D Gaussian 先投到单位球上、在其投影点的切平面做局部 affine splatting，再将该分布映射回球面/全景坐标，构成可微的 $360^\circ$ Gaussian splatting。
+
+这一渲染路径仍从三维中心和协方差出发：相机变换后通过经过球面投影点的切平面取得局部近似，先在切平面上得到二维分布，再映射到球面像素并按 alpha 合成。除投影模型外，论文还使用室内 layout：以布局先验指导 Gaussian 初始化，并以布局相关正则帮助室内结构完整，从全景输入直接优化场景和直接输出全景渲染。
+
+它的动机是避免“透视图优化后再缝合”的接口损失，而不是把所有成像模型统一为同一 rasterizer。方法假定输入全景的球面投影和室内布局先验可用；严重布局估计误差或非室内/非全景相机不在其设计范围内。
+
+
+% METHOD: 2402.10259
+\paragraph{GaussianObject（2024）\cite{2402_10259}}
+GaussianObject 解决四视图等极少视图对象重建中初始 3DGS 欠约束的问题。它先以结构先验做 coarse Gaussian 优化，再沿新视角路径渲染出退化图，使用经对象图像微调的 diffusion Gaussian-repair model 生成修复图；修复结果反过来作为新视角监督，配合 distance-aware sampling 修补高斯未覆盖区域。模型对 Gaussian 属性施加三维噪声以训练修复器，并可用 DUSt3R 预测的粗点云替代 COLMAP 初始化。它是“生成新监督再优化显式场”的少视图路线，生成器的先验和路径选择也会带来不确定性。
+
+% METHOD: 2402.14650
+\paragraph{GaussianPro（2024）\cite{2402_14650}}
+GaussianPro 以 progressive propagation 修正稀疏区域的 densification。它先从当前 Gaussian 场渲染深度和法线，在图像平面用 patch matching 传播可靠深度/法线，再以几何一致性过滤传播结果。渲染值与过滤后值显著不一致的像素被视为几何未被现有 Gaussian 正确表达，使用过滤深度和法线反投影到三维初始化新 Gaussian。于是新增点由多视图几何传播定位，而不是只依赖位置梯度阈值；可靠性依赖深度/法线估计与传播匹配。
+
+% METHOD: 2402.15870
+\paragraph{Spec-Gaussian（2024）\cite{2402_15870}}
+Spec-Gaussian 用 anisotropic spherical Gaussian (ASG) appearance field 取代仅由 SH 建模的视角外观，以表达具有方向各向异性的高光。它从 posed images 与 SfM 点云开始，使用 coarse-to-fine 训练先稳定大尺度外观再细化，从而抑制真实场景 floater。为控制 ASG 增加的存储和计算，方法采用 hybrid Gaussian：稀疏 anchor Gaussian 生成/支撑 neural Gaussians 的外观。故其核心变化是 appearance 参数化与锚点式共享，不是改变 alpha rasterization；ASG 容量、anchor 稀疏度决定外观质量与成本。
+
+% METHOD: 2402.17427
+\paragraph{VastGaussian（2024）\cite{2402_17427}}
+VastGaussian 将大环境重建拆为多个可独立优化的 cell。它先根据相机与空域可见性逐步划分训练数据，避免把无关视图和过大的 Gaussian 集合放进同一优化问题；每个 cell 独立训练并使用 decoupled appearance modeling 吸收跨时间/跨相机的外观变化，随后按空间关系合并 cell 的 Gaussian 集合以实时渲染全场景。其重点是可扩展的分块、可见性与外观解耦，而非单个 Gaussian 的新投影公式；分区边界、跨 cell 重叠及外观一致性仍决定最终接缝质量。
+
+% METHOD: 2403.04116
+\paragraph{X-Gaussian：面向 X-ray 投影的辐射 Gaussian（2024.03）}
+Radiative Gaussian Splatting for Efficient X-ray Novel View Synthesis（文中称 X-Gaussian）~\cite{2403_04116}处理的是 X-ray 新视角投影，而不是普通 RGB 图像合成。原始 3DGS 用球谐函数（SH）把颜色写成视向相关量；X-ray 成像主要由射线穿透后的衰减决定，同一三维位置的辐射强度应当不依赖观察方向。作者因此保留 Gaussian 的中心、协方差和不透明度，却把每个 primitive 的外观从 SH 系数改为可学习辐射特征向量 $\mathbf f_i$。Radiation Intensity Response Function（RIRF）以固定权重和 Sigmoid 将 $\mathbf f_i$ 映射为单通道、视向无关的强度；这正是该方法相对 RGB 3DGS 的表示层改动，而非把 RGB 颜色简单转成灰度。
+
+给定扫描器的几何参数，Angle-pose Cuboid Uniform Initialization（ACUI）直接求内、外参，并在包围被扫描物体的长方体网格中均匀采样 Gaussian 中心。这样绕开了依赖特征匹配的 SfM：论文指出 X-ray 投影低对比且不同深度会在同一位置重叠，因而 SfM 的初始化前提并不稳固。渲染时，Differentiable Radiative Rasterization（DRR）仍将三维协方差经相机变换和投影 Jacobian 变为探测器平面的二维椭圆，将 splat 分桶到 tiles 并按到探测器的距离排序；区别在于每个像素以 RIRF 强度 $\mathbf i_j$ 和 Gaussian 覆盖概率/不透明度 $\sigma_j$ 做前到后的透射合成，而不是以视向 SH RGB 做 alpha 合成。其 CUDA 前后向因此不需要计算视向相关外观。
+
+训练直接最小化渲染投影与观测投影的加权 $L_1+\mathrm{SSIM}$，共同优化位置、协方差、不透明度和辐射特征，并沿用 3DGS 的自适应点数控制。推理只需给定新的 X-ray 几何便执行 DRR。论文的适用边界也很明确：ACUI 针对等角度圆轨迹的锥束扫描设定，且实现依赖 CUDA；它不是针对任意相机照片的通用去视向化方案。
+
+
+% METHOD: 2403.06908
+\paragraph{FreGS（2024）\cite{2403_06908}}
+FreGS 针对的是大 Gaussian 覆盖复杂纹理时的“过重建”问题：图像已经有明显结构或细节误差，但像素空间 $L_1$ 的局部梯度可能很小，原 3DGS 的梯度阈值便不再触发 split。它不改变 Gaussian 投影和 alpha compositing，而是在每次训练图像的渲染结果与真值之间加入 Fourier-domain supervision，让频谱差异产生更能指向欠表达区域的梯度。
+
+具体地，方法对渲染图和真值做二维 DFT，将复频谱拆成 amplitude 与 phase，并分别计算两者在 Fourier 栅格上的差异。两项差异组成 frequency regularization，与原有像素空间训练目标共同反传到 Gaussian 参数及 densification 统计。作者的动机是：同一大 Gaussian 漏掉的整体形状和局部纹理会在不同频带留下差异，频率损失能避免只靠空间像素差时的梯度弱化。
+
+直接同时压低所有频带会使早期 densification 过难，故 FreGS 使用 frequency annealing：先用低通滤出的低频幅度/相位差建立粗结构；从设定迭代开始，逐步扩大动态高通滤波器允许的频带，再加入高频差异，形成由粗到细的分裂信号。它因此是训练损失和优化时序的改造，而不是测试时滤波器；频带权重、开始/结束迭代与高通范围都是需要调节的训练超参数。
+
+% METHOD: 2403.07807
+\paragraph{StyleGaussian：先把二维语义写入 Gaussian，再在三维中做任意风格迁移（2024.03）}
+StyleGaussian~\cite{2403_07807}的目标是把任意参考图的风格迁移到已经重建好的场景，同时不把每个新视角分别交给二维风格网络处理。它固定所有 Gaussian 的几何参数 $\left(\boldsymbol\mu,\boldsymbol\Sigma,\sigma\right)$，只改变颜色；这样生成的结果仍可由原 3DGS 光栅器渲染，多视图一致性来自同一组被改写的三维 primitive，而不是事后约束相邻帧。完整流程是 embedding、transfer、decoding 三步：$\mathbf c_p\!\rightarrow\!\mathbf f_p\!\rightarrow\!\mathbf f_p^t\!\rightarrow\!\mathbf c_p^s$。
+
+在 embedding 阶段，每个 Gaussian 带可学习特征，使用与 RGB 相同的前到后权重把它们渲染为像素特征，并以多视图 VGG 特征图作 $L_1$ 蒸馏监督。直接光栅化 256/512 维 VGG 特征会超过共享内存限制，故作者先渲染 32 维低维特征，再用可学习仿射变换映射到高维；仿射变换可交换到每个 Gaussian 上，故优化后可恢复其高维特征。transfer 阶段不另训场景网络，而对所有 Gaussian 特征使用 AdaIN：以风格图 VGG 特征的逐通道均值和标准差替换内容特征的统计量。
+
+随后，KNN-based 3D CNN 在每个 Gaussian 的 $K$ 近邻窗口上卷积，将变换后的特征解码为 RGB；它以堆叠后的邻域特征和矩阵乘法并行实现，而不是先渲染二维特征图再用二维 CNN 解码。解码器训练采用内容特征 MSE 与通道均值/方差风格 MSE 的加权和。完成一次三维解码后，后续新视角只走常规 splatting。代价是它不改变几何，形变型笔触或需要改几何的风格难以忠实表达；此外，特征存储与计算仍随 Gaussian 数增长，论文在 24GB 显存实验中将其数量限制为 $3\times10^5$。
+
+
+% METHOD: 2403.08733
+\paragraph{GaussCtrl：以深度和跨视图注意力约束的文本 3DGS 编辑（2024.03）}
+GaussCtrl~\cite{2403_08733}针对“逐张用二维扩散编辑、再反复更新场景”导致的跨视图不一致。它从已有的 posed 图像和对应 3DGS 出发，先以原场景重渲染所有训练视图及其深度图，再一次性生成多视图编辑目标，最后把这些目标作为监督重新优化原 Gaussian；因而 3DGS 仍是最终可渲染表示，扩散模型负责产生一致的编辑观测而非在测试时逐像素渲染场景。
+
+具体地，作者以 ControlNet 的深度条件分支编辑每张图。先用 VAE 将原图编码并经 DDIM inversion 回推到噪声 $z^T$，再以编辑 prompt 和该视图由 3DGS 渲染的深度图执行 classifier-free-guidance 去噪、解码成编辑图。深度图来自同一三维模型，提供几何一致的空间条件；DDIM inversion 又使各视图从其原本一致的内容出发，而不是从彼此独立的随机噪声出发。对于局部编辑，可选用 Lang-SAM 掩码过滤背景。
+
+仅有深度条件仍可能让不同视图的颜色和纹理漂移，因此作者把 U-Net 与 ControlNet 中的图像 self-attention 改成 latent alignment：当前视图既保留自身 attention，又与均匀采样的参考视图做 query-key-value cross-attention，并以系数 $\lambda$ 混合两者。随后用这些多视图编辑图像优化 Gaussian 属性，得到可从新相机位姿正常 splat 的编辑场景。该设计的取舍是它以既有深度稳定几何，适合材质、环境和局部外观编辑；论文给出的失败例也显示，诸如把熊雕像变成长颈鹿这类大幅几何替换，深度约束和二维编辑均难以可靠完成，文本意图也不总会被忠实执行。
+
+
+% METHOD: 2403.10147
+\paragraph{GGRt：无先验位姿的可泛化 Gaussian 新视角合成（2024.03）}
+GGRt~\cite{2403_10147}解决的是输入多张未标定位姿图像时，如何直接预测可渲染的 Gaussian，而非先为单一场景长时间优化 3DGS。它联合训练 Iterative Pose Optimization Network（IPO-Net）和 Generalizable 3D-Gaussians（G-3DG）。共享的 DINO 预训练 ResNet-FPN 先提取参考与目标图特征；IPO-Net 以特征重投影一致性为代价，按 RAFT 风格由 Conv-GRU 迭代更新相对位姿和目标深度，而非估计整个场景的一个固定绝对位姿。
+
+有了相邻参考图之间的相对位姿，G-3DG 对每个图像对作 pixel-aligned Gaussian 预测。它沿由像素射线诱导的极线采样另一张图的特征及深度位置编码，cross-attention 为每个像素选择对应关系；再以局部 self-attention 向缺少极线对应的区域传播尺度/深度信息。经过这些特征融合后，网络遵循 pixelSplat 的参数化预测每对图像的 Gaussian 参数，并把多个图像对生成的 primitive 拼接后进行新视图 splatting。连续帧会反复使用许多参考图，Gaussians Cache 因此按图像 ID 存储预测的点，下一步查询复用，随后释放不再匹配的条目，以减少重复预测和显存占用。
+
+无位姿学习的监督不是单一 RGB 项：联合损失以随训练步变化的权重结合 IPO-Net 的光度重投影损失、edge-aware 深度平滑项与 Gaussian 渲染目标的 RGB MSE。高分辨率训练时，deferred back-propagation 先在无自动微分下完整渲染并计算像素损失梯度，再分 patch 重渲染以把缓存梯度回传；局部 self-attention 与全图位置编码使两阶段的目标保持一致。部署时可先生成并缓存参考图的 Gaussians，再对查询位姿取邻近图对应的 primitive 做标准 splatting。该方法的核心边界是它依旧假设相邻视图有可匹配的视觉信息，位姿和深度的误差会传入 Gaussian 预测；缓存和 deferred back-propagation 是为连续参考流与显存约束设计的系统机制，不是单帧无条件生成器。
+
+
+% METHOD: 2403.10427
+\paragraph{SWAG：用图像条件颜色和 opacity 变化处理野外照片集（2024.03）}
+SWAG~\cite{2403_10427}面向无约束照片集中的天气、曝光、相机差异和偶发遮挡。标准 3DGS 让所有图像共享一套颜色与 opacity，容易把不同观测平均成错误颜色，或把游客等 transient content 烙进静态场。SWAG 为每张训练图引入 latent embedding，并以 Gaussian 中心的位置编码、该图 embedding 与原 SH 颜色为输入的 MLP 直接预测图像条件颜色；保留 SH 颜色作为输入是为了补回位置编码 MLP 的平滑倾向下的高频和视向细节。
+
+遮挡不另建一套动态场，而是为每个 Gaussian 学图像依赖的 opacity variation。该变化经温度化的二值化采样后从基础 opacity 中扣除，使遮挡存在时可参与合成、缺席时趋于透明；其跨图方差非零的 Gaussian 被定义为 transient，故可在渲染时剔除以获得去遮挡的静态视图。训练以 $L_1+$D-SSIM 优化 Gaussian、hash encoder、MLP 和每图 embedding；测试图没有预存 embedding 时，论文按 NeRF-W 的方式在测试图一半区域优化 embedding，再评估另一半。
+
+这个设计实现了局部、图像条件的外观控制，但也增加了训练和每帧推理开销。论文特别指出频繁出现的遮挡区域可能被整体判为 transient，全部移除会留下孔洞，阈值调整需要人工取舍；它不是对任意动态场景的时序建模。
+
+
+% METHOD: 2403.11056
+\paragraph{Analytic-Splatting（2024）\cite{2403_11056}}
+Analytic-Splatting 从像素响应而非三维 Gaussian 的参数化入手。标准 3DGS 在像素中心查询投影二维高斯 $g^{2D}(\mathbf u)$，随后把该点值放入 alpha 与 transmittance 的递推；当分辨率、焦距或距离改变时，单点采样没有反映像素窗口覆盖的连续信号，因而容易模糊或锯齿。方法要替换的正是这个点值：每个 splat 对像素的响应改为该二维高斯在像素面积上的积分近似，并把近似积分同时用于 alpha 和透射率的计算。
+
+直接积分二维相关高斯并不便于 CUDA 光栅化。论文先把一维高斯 CDF 以带三次项的 logistic 函数近似，于是单位宽窗口的积分可由两个窗口端点的近似 CDF 相减得到；不同标准差通过缩放自变量处理。对二维高斯，先对投影协方差做特征分解，以两个特征向量为坐标轴消去相关项，再将像素积分域绕像素中心旋到该坐标系中。所得二维响应近似为两个一维窗口积分的乘积。该旋转域是效率换来的近似来源，而非声称的精确二维积分。
+
+表示、优化变量、训练轮次和损失沿用 3DGS；作者以 CUDA 自定义 shading 实现替换渲染响应，并在多尺度训练/测试时按原设定采样不同尺度的监督图像。相对 Mip-Splatting 的预滤波，它试图更直接近似像素面积积分；相对 supersampling，它避免每像素增加大量样本。限制也来自同一实现选择：额外的根号和指数运算降低帧率，像素域旋转及 logistic CDF 都带来近似误差。
+
+% METHOD: 2403.11134
+\paragraph{Recent Advances in 3D Gaussian Splatting：按重建、编辑与应用归类的文献综述（2024.03）}
+Recent Advances in 3D Gaussian Splatting~\cite{2403_11134}同样是综述而非新算法。它先以传统 point-based rendering 说明 Gaussian 椭球投影、排序和 alpha blending 的来历，再把当时方法按功能划为三维重建、三维编辑和下游应用。重建部分继续按一般、困难输入、动态与压缩等问题细分；编辑部分覆盖外观、几何和物理模拟；应用部分收录 SLAM 等系统任务。
+
+因此该条目应提供的是分类法、方法关系图、时间线和比较表的阅读入口，而不是虚构一个统一训练损失或渲染流程。论文还讨论 mesh、SDF、NeRF 与 3DGS 的表示取舍，强调 3DGS 的高速与显式可编辑性并不使其自动适合全部任务。其文献结论只对应当时收录工作，后续方法需要另行核验。
+
+
+% METHOD: 2403.11831
+\paragraph{BAD-Gaussians（2024）\cite{2403_11831}}
+BAD-Gaussians 面向带相机运动模糊、且 COLMAP 初始位姿与稀疏点云不可靠的多视图序列。普通 3DGS 把每张输入图当作曝光瞬间的清晰监督，会把模糊拖影拟合进 Gaussian 外观或几何。该方法仍以一组可微 rasterized Gaussian 表示静态清晰场景，但将每帧的观测模型改为曝光时间内多张潜在清晰渲染的平均，并把相机轨迹纳入优化变量。
+
+对一帧模糊图，方法在曝光区间采样多个虚拟时刻，以对应位姿分别 rasterize 清晰图像，再在像素上求平均近似连续时间积分。位姿不是互不相关的离散变量，而是由 $SE(3)$ 上的连续 spline 插值得到，因此曝光内相机运动与相邻帧轨迹可共同调整。渲染的 blur image 与实拍 blur image 的 photometric loss 同时反传到 Gaussian 的位置、协方差、opacity、颜色以及轨迹控制参数；COLMAP 的模糊图位姿/点云只作为初始化。
+
+这条路线与本章的抗锯齿或增密方法不同，关键是正确的成像前向模型和 bundle adjustment，而不是给 sharp 3DGS 加后处理。模糊积分的样本数、轨迹参数化和初始可观测性决定优化稳定性；在没有足够多视角或运动模型不匹配时，场景结构、相机轨迹和曝光模糊之间仍会有歧义。
+
+% METHOD: 2403.13806
+\paragraph{RadSplat：以 radiance field 先验稳定复杂场景的 Gaussian 优化（2024.03）}
+RadSplat~\cite{2403_13806}将隐式 radiance field 的复杂场景鲁棒性与 3DGS 的 rasterization 速度串成两阶段管线。先用带 GLO 图像 embedding 的 Zip-NeRF 拟合 posed 图像；随后以 NeRF 的 median depth 沿随机像素射线反投影约一百万初始点，并以 NeRF 在零 GLO embedding 下渲染的“清洁”图像作为 Gaussian 训练监督。这避免直接让 3DGS 吸收曝光、光照等原始观测噪声，也借 NeRF 灵活射线模型处理非针孔镜头。
+
+Gaussian 阶段仍是标准 splatting 和 densification，但其裁剪指标不是 opacity：对每个点聚合所有训练射线上精确的贡献 $\alpha_i^r\tau_i^r$，取最大贡献作 importance，低于阈值者删除。测试前再聚类相机位置，并为每个 cluster 计算可见性 mask；查询视点只保留对应 cluster 中有贡献的 points，随机补采样相机以减轻测试视点偏差。
+
+这使表示更紧凑且将渲染加速前移到视点过滤，但代价是需要先训练 radiance field，且 visibility mask 的覆盖由相机聚类和采样决定；在训练视角分布之外，过强过滤会成为风险。
+
+
+% METHOD: 2403.14166
+\paragraph{Mini-Splatting（2024）\cite{2403_14166}}
+Mini-Splatting 的目标是把原始 3DGS 的“先不断增密、再按 opacity 剪枝”改成受控的重组织与简化。它先主动获得更均匀的 Gaussian 分布，再以几何可见性和重要性采样压缩，而不是直接从一个过密集合按单一分数删点。训练中的两项 densification 分别针对模糊和初始点云稀疏。
+
+Blur split 在 rasterization 前向过程中统计每个 Gaussian 成为像素最大 alpha-compositing 贡献者的面积；当这一最大贡献面积占图像比例过大时，说明一个 primitive 主导了大块模糊区域，便按 3DGS 的 split 规则将其拆分。Depth reinitialization 则不使用 alpha-blended depth 直接反投影：对每条 ray 只取最大贡献 Gaussian，并以 ray 与该 Gaussian ellipsoid 两交点的中点作为深度。把这些深度及原图颜色反投影、跨视图合并并抽样后，周期性重新初始化 Gaussian，从而向缺失区域补入较密且均匀的点。
+
+简化阶段先做 intersection preserving，仅保留曾为最大贡献 Gaussian、也就是实际给出上述 ray--ellipsoid 相交深度的 primitive。若还要更小的固定预算集合，方法不作确定性低分剪枝，而以由累积 blending weight 构成的重要性分布随机采样；这种抽样避免相邻同类 Gaussian 被一起删掉而破坏局部几何。它的表现依赖最大贡献代理、深度重初始化质量和目标保留率，因而并不等价于对所有透明层严格保持 alpha 合成。
+
+% METHOD: 2403.15124
+\paragraph{EndoGSLAM：面向内窥 RGB-D 的简化 Gaussian SLAM（2024.03）}
+EndoGSLAM~\cite{2403_15124}把 3DGS 用作内窥手术的在线 RGB-D map。因光源与相机共同移动，作者不用 SH 建模复杂视向外观，而以颜色、中心、半径、opacity 的各向同性 Gaussian 表示组织；这把单点可优化参数从原 3DGS 的 59 个降到 8 个。首帧以已知内参、深度反投影出点，半径设为投影中的一像素，opacity 初始化为 0.5；renderer 同时 alpha 合成颜色、深度与 visibility。
+
+跟踪时以上一帧位姿和恒定速度初始化当前位姿，渲染当前颜色/深度/可见性后最小化 re-rendering loss。亮度极暗或极亮的像素由灰度阈值 mask 排除，可见性阈值又限制损失到已可靠重建的组织。mapping 只将低可见性、新近处几何且颜色可靠的像素反投影为新 Gaussian。扩张后 partial refinement 偏向当前帧附近的时空 keyframes，优化颜色、深度和 SSIM 组合损失。
+
+这是依赖 RGB-D、刚性组织和移动光源假设的手术系统；论文将去除深度依赖和处理轻微形变列为后续工作，不能把它泛化为无深度的通用动态 SLAM。
+
+
+% METHOD: 2403.15530
+\paragraph{Pixel-GS（2024）\cite{2403_15530}}
+Pixel-GS 改的是 3DGS 的 adaptive density control。原始方法每隔一段训练迭代，把某 Gaussian 在参与视图中的 NDC 位置梯度模长做简单平均，超过阈值便 split 或 clone。稀疏 SfM 初始化区域的 Gaussian 往往较大：它们会在很多只擦过边缘的视图中被计入，但只有投影中心附近的少数视图产生显著梯度。简单平均于是稀释了真正需要增密的信号，留下模糊、针状等欠建模区域。
+
+论文把每个视图的梯度按该 Gaussian 实际参与计算的像素数 $m_k^i$ 加权，再除以总参与像素数，而不是除以参与视图数。像素参与数由投影半径、累计透射率和单 Gaussian alpha 阈值共同确定。对大 Gaussian，能覆盖较多像素且更可能包含投影中心的视图因而权重更高；对小 Gaussian，各视图的像素数相近，判据接近原始 3DGS。超过原有位置阈值后仍按原流程 split/clone，故该工作没有另起一套网络或颜色损失。
+
+加权也会放大相机附近 floater 的梯度。Pixel-GS 因此再乘一个随相机空间深度增长、并按相机轨迹半径归一和截断的 scale factor；近相机 Gaussian 的增密驱动力被压低，远处正常区域保留。作者维持原始 3DGS 的训练参数与 split/clone 阈值，只把最终增密统计量替换为“像素数 $\times$ 深度缩放 $\times$ NDC 梯度”的加权平均。它与本章的投影/排序方法不同：渲染公式不变，质量改善来自让有限 Gaussian 更合理地生长；深度尺度系数仍是需要设定的超参数。
+
+% METHOD: 2508.21154
+\paragraph{RadGS-Reg：由双平面 X-ray 重建 Radiative Gaussians 后做 3D/3D 脊椎配准（2025）\cite{2508_21154}}
+RadGS-Reg~\cite{2508_21154}将传统 CT 对 X-ray 的反复“render and compare”改为两个串接且协同训练的网络：RecM 从 AP/LA 双平面 X-ray 和相机参数预测 vertebra-level Radiative Gaussians，RegM 将其 voxelized volume 与术前 CT 做 3D/3D 刚体配准，输出相对 CT 的 6-DOF pose。推理前先用 X-ray 检测与 CT segmentation 选出同一节椎体，避免邻椎重叠干扰。
+
+RecM 由 image encoder、Counterfactual Attention Learning、GS head、X-ray rasterizer 与 density voxelizer 组成。每个 RadGS 有中心 density、三维位置和 covariance。CAL 将 factual attention 与随机替换 attention 的 counterfactual prediction 相减，逼迫 GS head 聚焦对椎体形态有因果贡献的 X-ray 区域。预测高斯一面 rasterize 回投影图，一面 voxelize 成体；重建损失包括投影 $L_1$、SSIM、体 TV，并对原始与 CAL-effect 高斯都施加对应项。
+
+RegM 对连接后的重建 Gaussian volume 与 CT volume 回归 pose，使用 3D NCC、SSIM 和估计/真值变换的 geodesic loss。训练先分别训练 RecM、RegM，再以两项损失联合 fine-tune；数据上依次使用模拟 DRR、真实双平面 X-ray 与目标 CT 派生 DRR 的三阶段预训练。这一方案输出的不是患者完整通用 CT，而是双视图支持下的节椎代理及刚体配准；软组织非刚性变化和对预处理椎体级检测/分割的依赖仍是明确边界。
+
+% METHOD: 2606.11841
+\paragraph{Scene-Adaptive Nonlinear Tone Curves（2026）\cite{2606_11841}}
+该方法是低照 LITA-GS 中伪 ground truth 的替换件，不改变 LITA-GS 的高斯属性、五路 rasterization、Progressive Denoising Module 或整体损失。原管线将每帧低照图按均值线性放大到固定目标亮度；这一操作对极亮像素敏感、容易截断 highlights，也不能按场景阴影压缩程度决定应抬高多少黑位。新方法只修改 exposure loss 所对齐的 $\hat I_{in}$。
+
+每张低照 RGB 先按 BT.601 得到亮度 $Y$，以 $p_{90}$ 而非均值作归一化尺度，并用 $r=p_{10}/p_{90}$ 描述阴影紧缩程度。场景自适应黑位偏移为 $\delta_0=\alpha(1-r)^\beta$：阴影更压缩时 $r$ 更小，曲线在零附近抬得更多；较亮场景则避免固定 offset 的过曝。方法提供两种非线性伪 GT：ASE 以有界的 $1-e^{-gt}$ 核平滑抬阴影、压 highlights，其中 gain $g$ 可随平均亮度改变；AP3 使用冻结的三次多项式及同类亮度缩放，最后 clamp 到 $[0,1]$。两者的曲线参数按数据集而非逐场景设定。
+
+将 $\hat I_{in}$ 换为 $f_{ASE}(I_{low})$ 或 $f_{AP3}(I_{low})$ 后，LITA-GS仍将增强 RGB、结构、深度、illumination 和噪声属性并行渲染，PDM 仍迭代去噪，低照重建、结构与曝光等原损失也不变。换言之它通过更合适的二维监督目标间接影响颜色高斯，而非从低照图生成未观测几何。曲线假定亮度统计能反映可恢复暗部；极端噪声、饱和或真实的艺术性低照外观仍可能被错误地当成需要提升的曝光。
+
+% METHOD: 2607.02721
+\paragraph{Provable Pruning via Coresets（2026）\cite{2607_02721}}
+该工作将 3DGS 剪枝表述为 coreset 选择，而非以 opacity、梯度或启发式 Hessian 单独排序。先固定一个非负渲染目标：在指定视图、ray、像素、tile 或全场景聚合上，每个高斯的贡献包含颜色、投影核/opacity 与当前 transmittance。高斯的 sensitivity 是它在这些查询中相对总目标的最大/聚合影响；按 sensitivity 概率抽样并赋予逆概率权重，保留的是带权子场而非仅把低分数项删除。
+
+理论首先给出边界：在任意连续查询族上，存在每个 query 都可单独隔离一个裁剪 Gaussian 的场景，因此任何少于全部高斯的加权子集都不能保证统一的乘性误差。正面结果只针对有限代表查询集 $\mathcal Q_f$。对固定、可加的 itemwise 目标，若样本数满足与 sensitivity 总和、$\epsilon$、查询数和失败概率相关的界，随机抽样以高概率给出 multiplicative $\epsilon$-coreset。真实 alpha 合成会因 reduced scene 改变 transmittance、破坏固定可加性；论文因此额外要求采样后的 log-transmittance 稳定，才能将固定目标保证转移到真正重渲染的误差。对连续的小相机区域，还需用代表点的 $\rho$-net、Lipschitz 连续性和非退化的目标下界扩展保证。
+
+实践中，方法以 per-channel、pixel、tile 或 scene 等不同粒度聚合贡献，论文实验使用敏感度选出的 vanilla-compatible 子集，重点评价 prune-only 与极短恢复优化。它可在剪枝后再微调，但其理论不是对无限视角、任意遮挡变化的全局承诺：有限查询覆盖、权重有效性和 transmittance 稳定正是保证成立的条件。长时间重优化或会合并/重参数化高斯的压缩方法属于不同恢复能力的比较维度。

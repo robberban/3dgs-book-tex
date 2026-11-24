@@ -1,0 +1,154 @@
+\chapter{3DGS 基础、综述与评测工具}
+
+% CODEx_AUTHORED_CHAPTER: draft
+\paragraph*{本章阅读锚点}
+本章是全书的入口，不把所有工作都当成“又一个 3DGS 变体”。先要抓住原始 3DGS 的三个锚点：显式各向异性高斯表示、训练中的自适应密度控制、以及 tile-based 可微 rasterizer。后续论文要么围绕这些模块做技术综述，要么提供更可靠的评测与数据集，要么把 3DGS 工具链工程化到 PyTorch、WebGPU、浏览器、VR 或跨平台可微渲染。读这一章时，重点不是记住每个工具名字，而是看它补齐了原始 3DGS 生态中的哪一个缺口：理论地图、公平基准、压缩评测、动态场景诊断、开源 kernel、Web 部署或跨平台渲染抽象。
+
+\section{原始方法}
+
+原始 3DGS 是后续所有增量写法的参照物。理解它时不要只记“高斯泼溅”这个名字，而要看三处具体替换：用显式各向异性高斯替换 NeRF 的连续 MLP 场，用 tile rasterization 替换逐射线体采样，用训练中的 clone、split 和 prune 替换固定容量表示。后续方法无论讲几何、动态、压缩还是生成，基本都在这些环节上继续改。
+
+% METHOD: 2308.04079
+\paragraph{3D Gaussian Splatting（实时辐射场渲染锚点）（2023）}
+3D Gaussian Splatting~\cite{2308_04079} 将场景写成一组显式的各向异性三维高斯，而非像 NeRF 一样以 MLP 沿射线反复采样密度。每个 primitive 存储中心、透明度、协方差和球谐颜色；协方差以旋转和逐轴尺度参数化，因此优化器可以同时移动、拉伸和转动椭球。
+
+实现从 SfM 相机和稀疏点云初始化。对每个训练相机，渲染器用透视投影的局部雅可比把三维协方差映射到屏幕椭圆，按 tile 收集候选 splat，并按深度排序后以 alpha 合成累积颜色。训练将渲染图与参考图的 L1/结构相似性组合误差反传到位置、尺度、旋转、透明度和 SH 系数；自适应密度控制根据图像空间位置梯度在欠表示区域克隆或分裂高斯，并周期性剔除贡献很小的 primitive。推理只保留投影、排序和光栅化，因此避免了逐像素射线采样。
+
+它建立了本书的基线：后续方法若改表示，就改变 primitive 或属性；若改几何，就改变监督、深度或表面对齐；若改速度，就改密度控制、排序或 GPU 管线。原论文的边界也在这里成立：其几何并不天然是显式表面，且初始化和密度控制仍依赖多视图观测质量。
+\textbf{方法信息：} 原论文公开了训练与实时高斯光栅化实现；本书后续章节均以该表示和 alpha 合成基线为参照。
+% METHOD: 2405.03417
+\paragraph{Gaussian Splatting Review（重建与 NVS 入门综述）（2024）}
+Gaussian Splatting: 3D Reconstruction and Novel View Synthesis, a Review~\cite{2405_03417} 是面向三维重建与新视角合成的入门型综述。它先区分“从多视图观测恢复几何和外观”与“从已获场景表示生成新视角”两类问题，再将 Gaussian Splatting 放回点云、网格、体素和 NeRF 的表示谱系。
+
+论文的技术单元是分类与比较，不是新的高斯训练算法：它按输入数据、模型结构、输出表示和训练策略梳理早期工作，并用 NVS 质量、重建几何、训练/渲染代价等常见评价维度说明不同表示的取舍。对本书的价值是提供阅读原始 3DGS 的前置坐标，而不是为后续方法给出可执行的损失或优化器。
+
+边界在于其覆盖时间早、领域变化快；其中的分类适合解释早期重建与 NVS 路线，不能代替后续动态、压缩、SLAM 或生成方向的专门评测。
+\textbf{方法信息：} 综述论文；本地 paper pack 记录其覆盖重建与新视角合成的表示比较。
+% METHOD: 2407.17418
+\paragraph{3D Gaussian Splatting Survey（技术模块与挑战地图）（2024）}
+3D Gaussian Splatting: Survey, Technologies, Challenges, and Opportunities~\cite{2407_17418} 以原始 3DGS pipeline 为参照建立技术地图。论文先回顾高斯均值、协方差、透明度和球谐外观如何经可微光栅化形成图像，再将后续研究按“改了 pipeline 的哪一环”组织。
+
+其分类有两层：任务层包含质量、压缩、大规模、动态、生成、SLAM、编辑和应用；技术层拆分初始化、属性配置、正则化、densification 和渲染优化等模块。这样的结构能把表面上不同的论文还原为共享的实现问题，例如原语数量、投影 footprint、排序、内存或时间建模。
+
+论文进一步将数据效率、泛化、大规模处理和动态建模列为持续挑战。作为综述，它不定义统一训练流程或报告某一方法的固定性能；本书仅用其分类法连接相应章节。
+\textbf{方法信息：} 综述论文；本地 source 包含 3DGS preliminaries 与任务/技术双层分类。
+% METHOD: 2410.12262
+\paragraph{3DGS in Robotics Survey（机器人任务视角）（2024）}
+3D Gaussian Splatting in Robotics: A Survey~\cite{2410_12262} 将 3DGS 放入机器人闭环，而非把它仅当作离线新视角合成器。论文从显式高斯、tile rasterization 和实时渲染这一基础出发，询问这种表示能否支持感知、地图、定位、导航、抓取和交互。
+
+综述按两条轴组织材料：应用轴包括场景理解中的定位/SLAM、重建、语义理解，以及交互中的导航、操作和抓取；技术轴汇总使 3DGS 能进入机器人系统的适应性与效率改动，例如动态建模、大规模、稀疏观测、内存和实时性。它同时汇总相关数据集、任务指标和开放问题，使读者能按机器人任务而非论文标题找到方法。
+
+其结论是实时显示和显式结构并不自动等于可部署：在线更新、动态干扰、语义可靠性、传感器误差与安全性仍需专门机制。它是路线图，不是机器人算法或训练配方。
+\textbf{方法信息：} 综述论文；资料库：\url{https://github.com/zstsandy/awesome-3d-gaussian-splatting-in-robotics}。
+% METHOD: 2508.09977
+\paragraph{3DGS Applications Survey（分割、编辑与生成）（2025）}
+A Survey on 3D Gaussian Splatting Applications: Segmentation, Editing, and Generation~\cite{2508_09977} 讨论的是“重建完成后，高斯场怎样成为任务接口”。论文以显式高斯和可微 rasterization 为背景，将下游工作系统分为分割、编辑、生成及相关应用，而不是提出新的通用 3DGS 优化器。
+
+分割部分覆盖语义、实例、开放词汇和指代表达等任务；编辑部分比较几何、外观、风格和场景组合；生成部分梳理文本、图像和视频条件下的三维内容生成。每类都连接问题定义、二维基础模型或生成先验、三维高斯承载方式、监督形式和评估协议，因此读者可以看清语义模型负责什么、高斯表示负责什么。
+
+论文还汇总数据集与公平比较设置。它的边界是应用综述覆盖随基础模型快速变化，不能把其中某个具体编辑或生成流程误读为所有 3DGS 方法的默认训练流程。
+\textbf{方法信息：} 综述论文；资料库：\url{https://github.com/heshuting555/Awesome-3DGS-Applications}。
+% METHOD: 2512.03422
+\paragraph{Robotics Scene Representation Survey（机器人场景表示选择）（2025）}
+What Is The Best 3D Scene Representation for Robotics?~\cite{2512_03422} 是比较型综述：它不把 3DGS 设为唯一答案，而是比较点云、体素、SDF、网格、场景图、NeRF、3DGS 与基础模型在机器人任务中的适配性。
+
+论文按感知、映射、定位、导航和操作五类机器人模块检查表示的取舍。例如点云直接但稀疏，网格有拓扑与碰撞接口，SDF 提供连续几何，NeRF 擅长外观，3DGS 在显式 primitive 与实时渲染之间折中；基础模型则带来跨场景先验。它因此提供的是选择矩阵：任务究竟需要可见性、可微渲染、几何距离、语义绑定还是物理交互，会决定表示选择。
+
+结论并非“3DGS 总是最好”。综述保留真实部署中的泛化、可扩展性、人机交互和模块化系统问题，适合用作本书机器人章节的表示选择背景。
+\textbf{方法信息：} 综述论文；本地 paper pack 记录其覆盖几何表示到基础模型的机器人比较。
+% METHOD: 2412.04457
+\paragraph{Monocular Dynamic 3DGS Benchmark（快但脆弱的动态基准）（2024）}
+Monocular Dynamic Gaussian Splatting: Fast, Brittle, and Scene Complexity Rules~\cite{2412_04457} 不提出新的动态高斯模型，而是回答现有单目动态方法能否被公平比较。论文指出单目问题本身高度病态，不同数据集、切分和相机运动足以淹没很小的方法差异。
+
+基准将代表方法放在统一训练和评估协议下，并用受控合成场景分别改变相机基线、物体速度、纹理和反射等因素。它按运动表示比较低维场/变形模型与逐 primitive 的高自由度运动表示，同时将静态与动态区域分开评测，避免背景主导单一图像指标。
+
+结论是高斯方法的渲染速度优势并不消除优化脆弱性；窄基线、快速运动和高光会显著影响结果，场景复杂度常比细小架构差异更重要。其边界是覆盖的方法和数据集受发表时间限制，合成控制实验也不能完全代替真实采集。
+\textbf{方法信息：} benchmark 论文；本地 source 提供统一比较动机、受控场景与方法分类。
+% METHOD: 2505.20126
+\paragraph{OB3D（全景 3D 重建基准）（2025）}
+OB3D~\cite{2505_20126} 是为等距柱状投影全景图像设计的合成三维重建数据集。它解决的是普通透视 benchmark 缺少全景相机几何、像素对齐深度和法线真值的问题，因此不能可靠比较全景 3DGS 或其他重建方法。
+
+数据由 Blender 场景生成，提供全景 RGB、精确相机参数以及与 ERP 像素对齐的深度和法线。评测协议将图像/几何重建与网格精度分开测量，使研究者能观察极区拉伸和纬度相关畸变如何影响投影、匹配和表面恢复。
+
+OB3D 的贡献是受控评测基础设施，不是新的高斯优化流程。其主要边界是合成到真实的域差，以及场景种类不能穷尽真实全景采集条件。
+\textbf{方法信息：} 代码：\url{https://github.com/gsisaoki/omnidirectional_blender_3d_dataset}。
+% METHOD: 2506.02380
+\paragraph{EyeNavGS（VR 中 6-DoF 导航数据集）（2025）}
+EyeNavGS~\cite{2506_02380} 面向真实用户在 3DGS 场景中的 VR 导航，而非固定相机的新视角测试。论文通过经过校准的真实场景和头显采集，把用户的六自由度位姿、视场与眼动轨迹变成可重放的评测输入。
+
+数据采集在两个站点进行，参与者使用启用眼动追踪的 Meta Quest Pro 在场景中自由导航；配套 record--replay 软件基于 SIBR viewer 分支，使同一轨迹可在不同渲染、压缩或传输方案上重复播放。这样可评估观察行为、交互路径和显示策略，而不仅是离线随机相机的图像质量。
+
+它是数据集和工具接口：可服务 foveated rendering、预取、视口预测与交互延迟研究，但不规定这些方法的模型或损失。边界是参与者、场景和设备覆盖仍有限。
+\textbf{方法信息：} 代码：\url{https://github.com/symmru/eyenavgs_software}。
+% METHOD: 2512.24742
+\paragraph{Splatwizard（压缩方法统一基准）（2025）}
+Splatwizard~\cite{2512_24742} 是压缩方法的可执行 benchmark，而不是压缩算法。它把数据加载、基线训练、压缩执行、渲染评估和资源记录组织为统一 schedule，使不同方法不再各用一套训练次数、剪枝步骤和测量条件。
+
+论文给出所收录方法的执行计划，并在 Mip-NeRF 360、Tanks and Temples、Deep Blending、BungeeNeRF、NeRF Synthetic 和 DTU 等多视图数据上评估。除 PSNR、SSIM、LPIPS、模型大小、帧率和资源外，框架还将压缩后场景导出为几何并用 Chamfer distance 检查结构退化。
+
+它的接口价值在于可把新压缩器接入同一训练--压缩--评测链。覆盖的方法、网格提取质量和默认 schedule 都会影响结论，因此不应把基准的结果泛化为所有压缩场景的绝对排名。
+\textbf{方法信息：} 代码：\url{https://github.com/splatwizard/splatwizard}。
+% METHOD: 2604.23803
+\paragraph{Egocentric Dynamic 3DGS Evaluation（第一视角动态评测）（2026）}
+Bringing a Personal Point of View~\cite{2604_23803} 评估现有动态单目 Gaussian Splatting 在 egocentric 场景中的失效模式。第一视角具有快速头动、手物遮挡和近距离交互，不能直接把外部相机数据上的结论迁移过来。
+
+论文利用 EgoExo4D 的配对 ego/exo 观测，在相同场景上比较代表性动态高斯方法；评估时把静态和动态区域分开，并以图像质量指标分析两种视角的差异。结果表明第一视角相对外部视角的主要退化来自静态背景重建，而不是所有动态区域都同等恶化。
+
+该工作提供的是评测诊断：它说明相机主体性改变了采集条件和优化难点，却不提出新的 egocentric 3DGS 训练器。结论受 EgoExo4D 场景与所选方法集合限制。
+\textbf{方法信息：} 代码：\url{https://github.com/jaswar/evaluating-3dgs-egocentric}。
+% METHOD: 2403.19632
+\paragraph{GauStudio（模块化研究框架）（2024）}
+GauStudio~\cite{2403_19632} 是面向 Gaussian Splatting 研究的模块化软件框架，不提出新的单一渲染方程。它解决的是研究代码难以复用的问题：初始化、前景/背景表示、外观编码、优化器、正则、压缩和几何提取常被分别实现，导致同一方法组合无法公平比较。
+
+框架把训练管线拆成可替换组件。场景可由 SfM 或其他 splatting 先验初始化；前景可用高斯表示，背景可选择环境贴图或天空类表示；外观模块可接球谐、神经特征或缓存结构。组件仍通过标准可微高斯光栅化输出图像，并由任务所选的重建或正则目标共同优化。其 GauS 流程属于后处理接口：从已优化的场景渲染多视角几何观测，再融合为体积表示并提取网格，而不是声称每个高斯天然具有网格拓扑。
+
+因此 GauStudio 与 gsplat 的关系是层次不同：gsplat 提供底层 PyTorch/CUDA rasterization 接口，GauStudio 管理可组合的研究 pipeline。它适合复现实验和替换模块；具体模块的效果、损失和输入条件仍应由所选方法本身决定。
+\textbf{方法信息：} 代码：\url{https://github.com/gap-lab-cuhk-sz/gaustudio}。
+% METHOD: 2409.06765
+\paragraph{gsplat（PyTorch/CUDA 开源核心库）（2024）}
+gsplat~\cite{2409_06765} 是 Gaussian Splatting 的底层库，而非新的场景表示方法。它把三维高斯投影、tile 处理、深度排序、前向光栅化和反向梯度实现为 CUDA 内核，并通过 PyTorch 接口暴露给上层训练代码；同时保留原生 PyTorch 路径，便于研究者先验证新操作再优化为内核。
+
+调用方输入高斯属性和相机参数，库输出颜色、透明度或所需的中间渲染量，并将梯度传回高斯参数。设计重点是模块化 API、CUDA 实现与测试/文档，而不是改变原始 3DGS 的优化目标；上层论文可以在此接口上替换 antialiasing、densification、属性或损失，却必须自行定义这些方法的训练语义。
+
+相对原始 3DGS 参考实现，gsplat 提供可导入、可组合的软件边界，使算法论文不必重复维护 rasterizer。它的适用边界也相应是工程基础设施：具体速度、显存和功能取决于所调用的 kernel、硬件、场景规模和上层方法，不能把库本身的接口能力写成统一算法改进。
+\textbf{方法信息：} 代码：\url{https://github.com/nerfstudio-project/gsplat}。
+% METHOD: 2503.21364
+\paragraph{LandMarkSystem（大规模分布式训练框架）（2025）}
+LandMarkSystem~\cite{2503_21364} 处理的是大规模 NeRF/3DGS 场景在单机训练与推理框架中难以容纳的问题。论文将模型适配、数据与场景划分、分布式并行和运行时加载作为系统接口，使不同表示可以复用同一套大规模执行基础设施。
+
+对于 3DGS，系统关注的是如何把显式 primitive 的训练和渲染组织进分布式资源，而不是修改单个高斯的投影或 alpha 合成。它以算法适配层连接不同 NeRF/3DGS 变体，再由系统层处理计算、通信和大场景访问；因此读者应把它理解为扩展性框架，具体画质与损失仍属于接入方法本身。
+
+边界是系统收益依赖场景分块、硬件与所适配算法；它不构成所有大规模高斯方法的共同训练协议。
+\textbf{方法信息：} 技术报告；本地 source 描述面向 NeRF 与 3DGS 的系统化训练/渲染加速接口。
+% METHOD: 2601.15431
+\paragraph{SplatBus（GPU IPC 查看器框架）（2026）}
+SplatBus~\cite{2601_15431} 将 Gaussian Splatting rasterizer 与交互式应用解耦。其问题不是如何重建场景，而是 Python/CUDA renderer 如何被 Unity、Blender 或 OpenGL 客户端低延迟使用，而不用为每个应用改写核心渲染器。
+
+方法采用客户端--服务器结构：Python renderer 作为服务器维护 GPU 颜色与深度帧缓冲，通过 CUDA IPC 共享缓冲区；客户端通过统一轻量消息协议发送相机与交互命令，并以共享深度同传统图形内容进行合成。该结构允许多个不同客户端复用同一 rasterizer 和通信约定。
+
+它是部署接口而非新的高斯优化器。CUDA IPC、客户端插件与受支持的交互命令限定了可移植性和功能范围；阴影、光照和更复杂的动态交互仍是后续系统问题。
+\textbf{方法信息：} 本地 source 记录 Unity 插件、Blender 插件与 OpenGL viewer 客户端。
+% METHOD: 2602.03207
+\paragraph{WebSplatter（WebGPU 浏览器渲染）（2026）}
+WebSplatter~\cite{2602_03207} 面向浏览器端 Gaussian Splatting。它的约束来自 WebGPU：网页运行时不具备 CUDA 式全局同步和原子能力，传统 GPU 排序与 CPU--GPU 往返会让大场景交互不稳定。方法因此保持 splat 的投影、深度次序和 alpha 合成语义，但重写浏览器侧的执行管线。
+
+核心步骤是无等待的层次化基数排序和不透明度感知的几何剔除。前者在 WebGPU 的局部并行限制下组织多个排序层级，避免依赖全局等待；后者在光栅化前估计 primitive 的透明度贡献，跳过几乎不影响最终像素的 splat，以降低 overdraw 和峰值内存。排序、剔除和渲染在 GPU 侧连续执行，浏览器只负责加载场景与交互相机输入。
+
+它与 gsplat 的区别是部署目标：gsplat 服务 PyTorch/CUDA 训练和研究，WebSplatter 服务跨浏览器、跨设备的运行时查看。论文的机制重点是 WebGPU 约束下的排序与剔除；不应把其他 IPC viewer 的客户端--服务器设计归给该方法。
+\textbf{方法信息：} 本地 paper pack 记录其为 WebGPU 浏览器渲染工作；代码与性能数字须以项目发布材料复核后再写入。
+% METHOD: 2606.11129
+\paragraph{WorldOlympiad（世界模型三项评测）（2026）}
+WorldOlympiad~\cite{2606_11129} 是视频世界模型 benchmark。它针对只看单帧视觉质量的评测不足，提出物理可信度、几何一致性和交互保真度三条评测轨道；Gaussian Splatting 在其中用于把生成视频转为可诊断的三维几何，而不是作为被训练的世界模型表示。
+
+评测将规则化物理判断、基于三维重建的几何诊断，以及片段级和长程交互检查组合成统一协议，并在多类公开视频生成管线上运行。3DGS 的角色是几何轨的分析工具：通过重建和视角/结构检查暴露视频是否具有稳定三维一致性。
+
+因此结果应被读作 world-model 诊断，而非 3DGS 算法性能。基准的范围由所选生成模型、规则和重建可靠性共同限定。
+\textbf{方法信息：} benchmark 论文；本地 source 明确其三轨评测协议与 3D 重建几何诊断用途。
+% METHOD: 2606.11529
+\paragraph{XPR（跨平台点基可微渲染框架）（2026）}
+XPR~\cite{2606_11529} 把点基可微渲染拆成共享管线与方法特定逻辑，目标是让 3DGS、3DGUT、LinPrim 等变体不必各自重写全部 renderer。框架公开 primitive 参数结构和可扩展属性字段，并把公共的 tile 处理、合成与反向流程保留为复用部分。
+
+实现一个 3DGS 变体时，开发者只需定义 primitive 的投影、像素响应求值和 tile culling；其余管线模块沿用。这样方法层明确表达“如何投影、如何评价、如何剔除”，系统层负责跨平台调度和共享执行，便于比较不同点基渲染器的最小差异。
+
+XPR 是框架接口，不承诺某种 primitive 的统一质量提升。可表达性和运行表现仍取决于后端、平台及所实现的 project/evaluate/cull 逻辑。
+\textbf{方法信息：} 本地 source 明确 PrimitiveParams、project、evaluate 与 tile\_cull 接口。
